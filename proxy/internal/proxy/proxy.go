@@ -1,9 +1,9 @@
 // Package proxy is a transparent PostgreSQL wire-protocol proxy.
 //
 // It relays messages between client and upstream unchanged (authentication
-// included) and shows each message to an Observer. It fails open: the proxy
-// never rejects a query on its own, so a bug in attribution cannot take the
-// application's database traffic down with it.
+// included) and shows each message to an Observer. It fails open: an observer
+// that panics is ignored, and a query is only ever rejected when the Observer
+// is also a Gate and says so explicitly (see Gate).
 package proxy
 
 import (
@@ -175,7 +175,7 @@ func (s *Server) handle(client net.Conn) {
 	s.track(up, true)
 	defer s.track(up, false)
 
-	sess := &Session{ID: id, User: startup.Parameters["user"], DB: startup.Parameters["database"], Params: startup.Parameters}
+	sess := &Session{ID: id, User: startup.Parameters["user"], DB: startup.Parameters["database"], Params: startup.Parameters, gs: &gateState{}}
 	log = log.With("user", sess.User, "db", sess.DB)
 	log.Debug("session open")
 	defer log.Debug("session closed")
@@ -192,6 +192,10 @@ func (s *Server) handle(client net.Conn) {
 	go func() { // client -> upstream
 		defer wg.Done()
 		defer up.Close()
+		if gate, ok := s.obs.(Gate); ok {
+			s.pumpClientGated(log, sess, gate, backend, frontend)
+			return
+		}
 		s.pumpClient(log, sess, backend, frontend)
 	}()
 	go func() { // upstream -> client
@@ -242,9 +246,12 @@ func (s *Server) pumpUpstream(log *slog.Logger, sess *Session, backend *pgproto3
 		case *pgproto3.AuthenticationSASLFinal:
 			backend.SetAuthType(pgproto3.AuthTypeSASLFinal)
 		}
+		if rfq, ok := msg.(*pgproto3.ReadyForQuery); ok {
+			sess.gs.tx.Store(uint32(rfq.TxStatus))
+			sess.gs.ready.Store(true)
+		}
 		s.safeObserve(log, func() { s.obs.OnBackend(sess, msg) })
-		backend.Send(msg)
-		if err := backend.Flush(); err != nil {
+		if err := writeClient(sess, backend, msg); err != nil {
 			logRelayErr(log, "client write", err)
 			return
 		}

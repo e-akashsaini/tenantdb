@@ -12,6 +12,8 @@ type Session struct {
 	// State is private storage for the Observer, one value per connection.
 	// Guard it yourself: both observer callbacks may run concurrently.
 	State any
+
+	gs *gateState
 }
 
 // Observer sees every protocol message crossing the proxy. It is how tenant

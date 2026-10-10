@@ -57,6 +57,11 @@ type Event struct {
 	// Conflict is set when the statement belongs to a different tenant than
 	// the one the connection declared or the transaction already established.
 	Conflict bool
+	// Violation is set when strict mode objects to the statement: "unknown",
+	// "scan" or "conflict". Blocked is set when the statement was not forwarded
+	// to the database (block mode only).
+	Violation string
+	Blocked   bool
 }
 
 // Options configures an Attributor.
@@ -74,6 +79,9 @@ type Options struct {
 	// e.g. `SET tenantdb.tenant = 'acme'` or the startup option
 	// `-c tenantdb.tenant=acme`. Default "tenantdb.tenant".
 	TagVar string
+	// Strict configures what happens to statements that cannot be pinned to a
+	// tenant. The zero value only logs.
+	Strict StrictOptions
 }
 
 const (
@@ -90,6 +98,10 @@ type Attributor struct {
 	cat     *Catalog
 	lk      rowLookup
 	tagVar  string
+
+	strict    StrictMode
+	exempt    map[string]bool
+	allowScan map[string]bool
 }
 
 func New(opt Options, onEvent func(Event)) *Attributor {
@@ -101,6 +113,11 @@ func New(opt Options, onEvent func(Event)) *Attributor {
 		cat:     opt.Catalog,
 		tagVar:  strings.ToLower(opt.TagVar),
 	}
+	a.strict = opt.Strict.Mode
+	if a.strict == "" {
+		a.strict = StrictOff
+	}
+	a.exempt, a.allowScan = nameSet(opt.Strict.Exempt), nameSet(opt.Strict.AllowScan)
 	if a.tagVar == "" {
 		a.tagVar = "tenantdb.tenant"
 	}
@@ -174,6 +191,13 @@ type state struct {
 
 	path, localPath []string // search_path: session value and SET LOCAL value
 	tag, localTag   string   // declared tenant: session value and SET LOCAL value
+
+	gather   bool    // Gate is collecting events instead of emitting them
+	gathered []Event // events produced while gathering
+
+	// Names registered since the last Sync/Flush, so a rejected batch can be
+	// forgotten (the database never saw it).
+	batchParsed, batchBound []string
 }
 
 func (st *state) searchPath() []string {
@@ -251,6 +275,7 @@ func (a *Attributor) OnFrontend(s *proxy.Session, msg pgproto3.FrontendMessage) 
 			return
 		}
 		st.prepared[m.Name] = &prepared{stmts: stmts}
+		st.batchParsed = append(st.batchParsed, m.Name)
 	case *pgproto3.Bind:
 		st := a.st(s)
 		st.mu.Lock()
@@ -267,6 +292,12 @@ func (a *Attributor) OnFrontend(s *proxy.Session, msg pgproto3.FrontendMessage) 
 			}
 		}
 		st.portals[m.DestinationPortal] = pt
+		st.batchBound = append(st.batchBound, m.DestinationPortal)
+	case *pgproto3.Sync, *pgproto3.Flush:
+		st := a.st(s)
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		st.batchParsed, st.batchBound = nil, nil
 	case *pgproto3.Execute:
 		st := a.st(s)
 		st.mu.Lock()
@@ -536,7 +567,13 @@ func (a *Attributor) handle(s *proxy.Session, st *state, x Stmt, pt *portal) {
 			// Ask the database, off the query path; the event is emitted when
 			// the answer arrives.
 			if tcol, _ := a.scopeOf(ti); tcol != "" && hasCols(ti, need) {
-				go a.resolveAsync(st, ev, ti, tcol, have, need, st.txnGen)
+				if a.strict == StrictBlock {
+					// The decision must be made before the statement is forwarded.
+					found, failed := a.lookupMissing(ti, tcol, have, need)
+					a.finishLookup(st, ev, found, failed, true)
+				} else {
+					go a.resolveAsync(st, ev, ti, tcol, have, need, st.txnGen)
+				}
 				return
 			}
 		}
@@ -561,12 +598,21 @@ func hasCols(ti *TableInfo, need []keyReq) bool {
 }
 
 // resolveAsync finishes an event whose rows were not all cached by asking the
-// database for the missing ones.
+// database for the missing ones, without holding up the query.
 func (a *Attributor) resolveAsync(st *state, ev Event, ti *TableInfo, tcol string, have []string, need []keyReq, gen uint64) {
+	found, failed := a.lookupMissing(ti, tcol, have, need)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	// If the transaction ended while we waited, its tenant no longer applies.
+	a.finishLookup(st, ev, found, failed, gen == st.txnGen)
+}
+
+// lookupMissing asks the database about the keys the cache did not have. It
+// takes no locks. failed is set if any lookup errored.
+func (a *Attributor) lookupMissing(ti *TableInfo, tcol string, have []string, need []keyReq) (found []string, failed bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), lookupTimeout)
 	defer cancel()
-	found := append([]string(nil), have...)
-	failed := false
+	found = append([]string(nil), have...)
 	for _, k := range need {
 		ts, err := a.lk.tenants(ctx, ti, tcol, k.col, k.val)
 		if err != nil {
@@ -578,18 +624,18 @@ func (a *Attributor) resolveAsync(st *state, ev Event, ti *TableInfo, tcol strin
 		}
 		found = append(found, ts...)
 	}
-	found = dedupe(found)
+	return dedupe(found), failed
+}
 
-	st.mu.Lock()
-	defer st.mu.Unlock()
+// finishLookup turns lookup results into the event's source. st.mu must be held.
+func (a *Attributor) finishLookup(st *state, ev Event, found []string, failed bool, txnOK bool) {
 	switch {
 	case len(found) > 0:
 		ev.Tenants, ev.Source = found, SourceLookup
 	case !failed:
 		ev.Source = SourceNoMatch
 	}
-	// If the transaction ended while we waited, its tenant no longer applies.
-	a.settle(st, &ev, gen == st.txnGen)
+	a.settle(st, &ev, txnOK)
 }
 
 // settle fills in whatever the statement itself did not determine, in order of
@@ -622,7 +668,7 @@ func (a *Attributor) settle(st *state, ev *Event, txnOK bool) {
 			ev.Source = SourceUnknown
 		}
 	}
-	a.onEvent(*ev)
+	a.emit(st, *ev)
 }
 
 // keyTenants resolves a statement's key predicates through the row cache. ok
