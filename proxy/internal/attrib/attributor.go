@@ -258,6 +258,7 @@ type state struct {
 	txnGen    uint64   // bumped whenever a transaction ends
 
 	vars, localVars map[string]string // custom session variables (SET app.x = ..., set_config): current_setting() reads them
+	copyIn          *copyIn           // a COPY FROM STDIN waiting for its data
 	roleS, roleL    roleState         // SET ROLE / SET SESSION AUTHORIZATION: session and SET LOCAL
 	path, localPath []string          // search_path: session value and SET LOCAL value
 	tag, localTag   string            // declared tenant: session value and SET LOCAL value
@@ -418,6 +419,8 @@ func (a *Attributor) OnFrontend(s *proxy.Session, msg pgproto3.FrontendMessage) 
 		for _, x := range pt.stmts {
 			a.handle(s, st, x, pt)
 		}
+	case *pgproto3.CopyData, *pgproto3.CopyDone, *pgproto3.CopyFail:
+		a.onCopyFrontend(s, msg)
 	case *pgproto3.FunctionCall:
 		// The legacy fast-path protocol calls a function by OID with no SQL to
 		// read, so nothing about what it touches is known.
@@ -483,8 +486,10 @@ func (a *Attributor) OnBackend(s *proxy.Session, msg pgproto3.BackendMessage) {
 		st.pop()
 	case *pgproto3.ErrorResponse:
 		st.queue = nil
+		a.endCopy(st, false) // the load stopped: what it had named so far is what it addressed
 	case *pgproto3.ReadyForQuery:
 		st.queue = nil
+		a.endCopy(st, false)
 		if m.TxStatus == 'I' {
 			st.resetTxn()
 		} else {
@@ -1051,6 +1056,9 @@ func (a *Attributor) handle(s *proxy.Session, st *state, x Stmt, pt *portal) {
 			}()
 		}
 		return
+	}
+	if x.Copy != nil && a.beginCopy(st, ev, x) {
+		return // the event is completed when the rows have been read
 	}
 	a.settle(st, &ev, true)
 }

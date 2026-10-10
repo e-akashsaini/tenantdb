@@ -23,6 +23,8 @@ type TableInfo struct {
 	unique map[string]bool // columns with a single-column, non-partial unique index
 	rls    bool            // row-level security is enabled
 
+	hasGenerated bool // some column is a generated column
+
 	viewDef string    // a view's definition (schema-qualified), if it could be read
 	vp      viewParse // ... parsed once (views.go)
 }
@@ -121,7 +123,7 @@ const (
 // pg_catalog rather than information_schema: the latter hides columns the role
 // cannot read, which would make shared and tenant tables look the same.
 const catalogSQL = `
-SELECT n.nspname, c.relname, c.relkind::text, a.attname, c.relrowsecurity
+SELECT n.nspname, c.relname, c.relkind::text, a.attname, c.relrowsecurity, a.attgenerated <> ''
 FROM pg_attribute a
 JOIN pg_class c ON c.oid = a.attrelid
 JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -199,6 +201,7 @@ type colRow struct {
 	kind          byte // 0 means an ordinary table
 	col           string
 	rls           bool
+	generated     bool // a generated column: COPY data does not carry it
 }
 
 // snapshotData is everything one Load reads.
@@ -248,7 +251,7 @@ func (c *Catalog) Load(ctx context.Context) error {
 	for rows.Next() {
 		var r colRow
 		var kind string
-		if err := rows.Scan(&r.schema, &r.table, &kind, &r.col, &r.rls); err != nil {
+		if err := rows.Scan(&r.schema, &r.table, &kind, &r.col, &r.rls, &r.generated); err != nil {
 			rows.Close()
 			return err
 		}
@@ -458,6 +461,7 @@ func (c *Catalog) apply(d snapshotData) {
 			ti = &TableInfo{Schema: r.schema, Name: r.table, Kind: kind, rls: r.rls, unique: d.unique[key], viewDef: d.viewdefs[key]}
 			m[key] = ti
 		}
+		ti.hasGenerated = ti.hasGenerated || r.generated
 		ti.Cols = append(ti.Cols, strings.ToLower(r.col))
 		ti.raw = append(ti.raw, r.col)
 	}

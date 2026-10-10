@@ -48,6 +48,8 @@ type Stmt struct {
 
 	// Writes lists the tables the statement inserts into, updates or deletes from
 	// (including inside CTEs), with the trigger events that fire.
+	// Copy is set for COPY ... FROM STDIN: its rows arrive after the statement.
+	Copy       *CopySpec
 	Writes     []Write
 	Tables     []TableRef  // every table the statement names (CTE names excluded)
 	Funcs      []TableRef  // every function it calls

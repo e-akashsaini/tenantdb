@@ -45,6 +45,7 @@ func (e *Extractor) stmtFor(text string, node *pg_query.Node) Stmt {
 		st.DML = true
 	case *pg_query.Node_CopyStmt:
 		st.DML, st.Insert = true, n.CopyStmt.IsFrom // COPY FROM writes rows of unknown tenants
+		st.Copy = copySpecOf(n.CopyStmt)
 	case *pg_query.Node_CallStmt:
 		st.DML = true
 	case *pg_query.Node_DoStmt:

@@ -400,13 +400,22 @@ func TestStatementsThatRunAQueryAreAttributed(t *testing.T) {
 		`DECLARE c CURSOR FOR SELECT * FROM orders`:                   SourceScan,
 		`COPY orders TO STDOUT`:                                       SourceScan,
 		`COPY (SELECT * FROM orders WHERE tenant_id = 'a') TO STDOUT`: SourceExplicit,
-		`COPY orders FROM STDIN`:                                      SourceUnknown,
 		`COPY countries TO STDOUT`:                                    SourceUntenanted,
 	} {
 		h.query(sql)
 		if e := h.last(t); e.Source != want {
 			t.Errorf("%s: source = %s, want %s", sql, e.Source, want)
 		}
+	}
+	// a load from the client is attributed once its rows have been read
+	held := len(h.events)
+	h.query(`COPY orders FROM STDIN`)
+	if len(h.events) != held {
+		t.Error("COPY FROM STDIN waits for its rows")
+	}
+	h.front(&pgproto3.CopyFail{Message: "stop"})
+	if e := h.last(t); e.Source != SourceUnknown {
+		t.Errorf("a load that never named its tenants: %+v", e)
 	}
 	n := len(h.events)
 	h.query(`EXPLAIN SELECT * FROM orders`)
