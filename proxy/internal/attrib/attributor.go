@@ -53,6 +53,7 @@ type Event struct {
 	User, DB  string
 	SQL       string
 	Tenants   []string // more than one means the statement spans tenants
+	Tables    []string // the tables it touches, as the catalog names them (schema.table)
 	Source    Source
 	// Scan is set when the statement reads tenant data without any tenant or
 	// key filter, whether or not a tenant could still be attributed to it.
@@ -179,6 +180,7 @@ type pending struct {
 	dropKeys  []string // cache tables to forget when the statement succeeds (DROP, TRUNCATE)
 	dropTemps []string // temporary tables to forget when it succeeds
 	temp      *tempReg // a temporary table to remember when it succeeds
+	dropTable bool     // the statement may have moved rows between tenants: forget the table's owners
 }
 
 // tempReg is a temporary table created by a statement still awaiting its reply.
@@ -219,7 +221,13 @@ type rowShape struct {
 	keys   map[string]int
 }
 
-type keyReq struct{ col, val string }
+// keyReq is one row to look up: the value of a unique column of ti, whose
+// tenant column is tcol. For a foreign key, ti is the parent table.
+type keyReq struct {
+	col, val string
+	ti       *TableInfo
+	tcol     string
+}
 
 type state struct {
 	mu       sync.Mutex
@@ -406,7 +414,7 @@ func (a *Attributor) OnBackend(s *proxy.Session, msg pgproto3.BackendMessage) {
 			for _, k := range p.forget {
 				a.cache.Delete(k.table, k.col, k.val)
 			}
-			if p.stmt.SetsKey && p.table != "" {
+			if p.dropTable && p.table != "" {
 				a.cache.DropTable(p.table)
 			}
 			for _, k := range p.dropKeys {
@@ -446,7 +454,7 @@ func (st *state) pop() *pending {
 // trusts columns that come straight from one table (non-zero TableOID, same
 // OID for all of them) and are sent as text.
 func (a *Attributor) shapeOf(p *pending, rd *pgproto3.RowDescription) rowShape {
-	if p.table == "" || p.stmt.Delete || len(a.ex.keys) == 0 {
+	if p.table == "" || p.stmt.Delete || !a.ex.anyKey {
 		return rowShape{}
 	}
 	sh := rowShape{tenant: -1, keys: map[string]int{}}
@@ -459,7 +467,7 @@ func (a *Attributor) shapeOf(p *pending, rd *pgproto3.RowDescription) rowShape {
 		switch {
 		case a.tenants[name] && sh.tenant < 0:
 			sh.tenant = i
-		case a.ex.keys[name] && a.keyUsable(p.ti, name):
+		case a.keyUsable(p.ti, name):
 			sh.keys[name] = i
 		default:
 			continue
@@ -528,7 +536,7 @@ func (a *Attributor) hasTenantCol(ti *TableInfo) bool {
 // columns are trusted.
 func (a *Attributor) keyUsable(ti *TableInfo, col string) bool {
 	if ti == nil {
-		return a.cat == nil || !a.cat.Loaded()
+		return a.ex.keys[col] && (a.cat == nil || !a.cat.Loaded())
 	}
 	if ti.Schema == "pg_temp" {
 		return false
@@ -618,7 +626,7 @@ func (a *Attributor) analyze(st *state, x Stmt, pt *portal, depth int) analysis 
 	}
 	if direct {
 		r.tenantTouched = true
-		r.scan = !x.Filtered && !x.Insert
+		r.scan = !x.Filtered && !x.Insert && !a.identifies(st, x)
 	}
 	path := a.pathOf(st)
 	for _, c := range x.Calls {
@@ -831,6 +839,7 @@ func (a *Attributor) handle(s *proxy.Session, st *state, x Stmt, pt *portal) {
 
 	// INSERT without a column list: the schema says which position is the tenant.
 	x.Inserts = append(x.Inserts, a.rawInserts(x, ti)...)
+	p.dropTable = x.SetsKey || a.assignsKey(ti, x)
 
 	r := a.analyze(st, x, pt, 0)
 	tenants := dedupe(r.tenants)
@@ -867,7 +876,7 @@ func (a *Attributor) handle(s *proxy.Session, st *state, x Stmt, pt *portal) {
 	}
 
 	sc := r.scope()
-	ev := Event{SessionID: s.ID, User: s.User, DB: s.DB, SQL: x.SQL, Scan: r.scan}
+	ev := Event{SessionID: s.ID, User: s.User, DB: s.DB, SQL: x.SQL, Scan: r.scan, Tables: a.tableNames(st, x)}
 
 	switch {
 	case len(tenants) > 0:
@@ -877,38 +886,30 @@ func (a *Attributor) handle(s *proxy.Session, st *state, x Stmt, pt *portal) {
 	case sc == scopeDerived:
 		ev.Tenants, ev.Source = dedupe(r.derived), SourceDerived
 	default:
-		have, need, ok := a.keyTenants(p.table, ti, x, pt)
+		have, need, ok := a.keyTenants(st, p.table, x, pt)
 		switch {
 		case ok && len(need) == 0:
 			ev.Tenants, ev.Source = have, SourceCache
-		case ok && a.lk != nil && sc == scopeTenant && ti != nil && a.cat.CanRead(ti) && len(need) <= maxLookupKeys:
+		case ok && a.lk != nil && sc == scopeTenant && len(need) <= maxLookupKeys && a.lookupable(need):
 			// Ask the database, off the query path; the event is emitted when
 			// the answer arrives.
-			if tcol, _ := a.scopeOf(ti); tcol != "" && hasCols(ti, need) {
-				if a.strict == StrictBlock {
-					// The decision must be made before the statement is forwarded.
-					found, failed := a.lookupMissing(ti, tcol, have, need)
-					a.finishLookup(st, ev, found, failed, true)
-				} else {
-					go a.resolveAsync(st, ev, ti, tcol, have, need, st.txnGen)
-				}
-				return
+			if a.strict == StrictBlock {
+				// The decision must be made before the statement is forwarded.
+				found, failed := a.lookupMissing(have, need)
+				a.finishLookup(st, ev, found, failed, true)
+			} else {
+				go a.resolveAsync(st, ev, have, need, st.txnGen)
 			}
+			return
 		}
 	}
 	a.settle(st, &ev, true)
 }
 
-func hasCols(ti *TableInfo, need []keyReq) bool {
+// lookupable: every row can be asked about, and the database role sees all of it.
+func (a *Attributor) lookupable(need []keyReq) bool {
 	for _, k := range need {
-		found := false
-		for _, c := range ti.Cols {
-			if c == k.col {
-				found = true
-				break
-			}
-		}
-		if !found {
+		if k.ti == nil || k.tcol == "" || !a.cat.CanRead(k.ti) {
 			return false
 		}
 	}
@@ -917,8 +918,8 @@ func hasCols(ti *TableInfo, need []keyReq) bool {
 
 // resolveAsync finishes an event whose rows were not all cached by asking the
 // database for the missing ones, without holding up the query.
-func (a *Attributor) resolveAsync(st *state, ev Event, ti *TableInfo, tcol string, have []string, need []keyReq, gen uint64) {
-	found, failed := a.lookupMissing(ti, tcol, have, need)
+func (a *Attributor) resolveAsync(st *state, ev Event, have []string, need []keyReq, gen uint64) {
+	found, failed := a.lookupMissing(have, need)
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	// If the transaction ended while we waited, its tenant no longer applies.
@@ -927,18 +928,18 @@ func (a *Attributor) resolveAsync(st *state, ev Event, ti *TableInfo, tcol strin
 
 // lookupMissing asks the database about the keys the cache did not have. It
 // takes no locks. failed is set if any lookup errored.
-func (a *Attributor) lookupMissing(ti *TableInfo, tcol string, have []string, need []keyReq) (found []string, failed bool) {
+func (a *Attributor) lookupMissing(have []string, need []keyReq) (found []string, failed bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), lookupTimeout)
 	defer cancel()
 	found = append([]string(nil), have...)
 	for _, k := range need {
-		ts, err := a.lk.tenants(ctx, ti, tcol, k.col, k.val)
+		ts, err := a.lk.tenants(ctx, k.ti, k.tcol, k.col, k.val)
 		if err != nil {
 			failed = true
 			continue
 		}
 		if len(ts) == 1 {
-			a.cache.Put(ti.Key(), k.col, k.val, ts[0])
+			a.cache.Put(k.ti.Key(), k.col, k.val, ts[0])
 		}
 		found = append(found, ts...)
 	}
@@ -989,17 +990,99 @@ func (a *Attributor) settle(st *state, ev *Event, txnOK bool) {
 	a.emit(st, *ev)
 }
 
-// keyTenants resolves a statement's key predicates through the row cache. ok
-// is false if the statement has no usable key predicate (including one on a
-// column that is not provably unique). need lists the keys that were not cached.
-func (a *Attributor) keyTenants(table string, ti *TableInfo, x Stmt, pt *portal) (have []string, need []keyReq, ok bool) {
-	if table == "" || len(x.Keys) == 0 {
+// target works out which row's tenant answers a lookup by ti.col: the row
+// itself if col is unique, or the parent row if col is a verified foreign key.
+// ok is false if neither (an ordinary column says nothing about one tenant).
+func (a *Attributor) target(ti *TableInfo, col string) (tgt *TableInfo, tcol, pcol string, ok bool) {
+	if ti == nil || a.cat == nil || ti.Schema == "pg_temp" {
+		return nil, "", "", false
+	}
+	if ti.IsUnique(col) && !a.tenants[col] {
+		if tc, _ := a.scopeOf(ti); tc != "" {
+			return ti, tc, col, true
+		}
+		return nil, "", "", false
+	}
+	if fk, found := a.cat.FK(ti, col); found {
+		if parent, found := a.cat.TableByKey(fk.ParentKey); found {
+			if tc, _ := a.scopeOf(parent); tc != "" {
+				return parent, tc, fk.ParentCol, true
+			}
+		}
+	}
+	return nil, "", "", false
+}
+
+// predTable finds the table a predicate's column belongs to: the one its
+// qualifier names (users.id, u.id), or the statement's only table. An
+// unqualified column in a join could be either table, so it names none.
+func (a *Attributor) predTable(st *state, x Stmt, pr Pred) (*TableInfo, bool) {
+	var ref TableRef
+	switch {
+	case pr.Qual != "":
+		r, ok := x.Aliases[pr.Qual]
+		if !ok {
+			return nil, false
+		}
+		ref = r
+	case x.Table.Name != "":
+		ref = x.Table
+	default:
+		return nil, false
+	}
+	ti, tmp, ok := a.tableFor(st, ref)
+	if !ok || tmp != nil || ti == nil {
+		return nil, false
+	}
+	return ti, true
+}
+
+// identifies reports whether a statement looks rows up by something that
+// belongs to one tenant (a unique column, or a foreign key to a parent row),
+// as opposed to reading tenant data wholesale. Such a statement is not a scan,
+// whether or not its tenant could be worked out.
+func (a *Attributor) identifies(st *state, x Stmt) bool {
+	for _, pr := range x.Keys {
+		if ti, ok := a.predTable(st, x, pr); ok {
+			if _, _, _, ok := a.target(ti, pr.Col); ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// keyTenants resolves a statement's lookups through the row cache. ok is false
+// if no predicate identifies a row. need lists the rows not cached yet. A
+// predicate that identifies nothing (WHERE status = 'open') is skipped, unless
+// the clause has an OR: then it is an alternative the others cannot vouch for.
+func (a *Attributor) keyTenants(st *state, table string, x Stmt, pt *portal) (have []string, need []keyReq, ok bool) {
+	if len(x.Keys) == 0 {
 		return nil, nil, false
 	}
-	n := 0
+	catalog := a.cat != nil && a.cat.Loaded()
+	n, skipped := 0, false
 	for _, pr := range x.Keys {
-		if !a.keyUsable(ti, pr.Col) {
-			return nil, nil, false
+		var tgt *TableInfo
+		var tcol, pcol, ckey string
+		if catalog {
+			pti, found := a.predTable(st, x, pr)
+			if !found {
+				skipped = true
+				continue
+			}
+			if tgt, tcol, pcol, found = a.target(pti, pr.Col); !found {
+				skipped = true
+				continue
+			}
+			ckey = tgt.Key()
+		} else {
+			// No catalog: only the configured key columns, on a single table.
+			if table == "" || !a.keyUsable(nil, pr.Col) {
+				skipped = true
+				continue
+			}
+			ckey, pcol = table, pr.Col
 		}
 		for _, o := range pr.Ops {
 			v, resolved := pt.resolve(o)
@@ -1007,12 +1090,15 @@ func (a *Attributor) keyTenants(table string, ti *TableInfo, x Stmt, pt *portal)
 				return nil, nil, false
 			}
 			n++
-			if t, hit := a.cache.Get(table, pr.Col, v); hit {
+			if t, hit := a.cache.Get(ckey, pcol, v); hit {
 				have = append(have, t)
 			} else {
-				need = append(need, keyReq{pr.Col, v})
+				need = append(need, keyReq{col: pcol, val: v, ti: tgt, tcol: tcol})
 			}
 		}
+	}
+	if x.Or && skipped {
+		return nil, nil, false
 	}
 	return dedupe(have), need, n > 0
 }
@@ -1103,7 +1189,7 @@ func (a *Attributor) rawInserts(x Stmt, ti *TableInfo) []InsRow {
 		switch {
 		case tIdx < 0 && a.tenants[c]:
 			tIdx = i
-		case a.ex.keys[c] && a.keyUsable(ti, c):
+		case !a.tenants[c] && a.keyUsable(ti, c):
 			keyIdx[c] = i
 		}
 	}
@@ -1191,4 +1277,30 @@ func dedupe(in []string) []string {
 		}
 	}
 	return out
+}
+
+// tableNames lists the tables a statement touches, schema-qualified where the
+// catalog resolved them.
+func (a *Attributor) tableNames(st *state, x Stmt) []string {
+	var out []string
+	for _, t := range x.Tables {
+		ti, tmp, _ := a.tableFor(st, t)
+		if tmp != nil {
+			out = append(out, "pg_temp."+t.Name)
+			continue
+		}
+		out = append(out, tableKey(t, ti))
+	}
+	return out
+}
+
+// assignsKey reports whether an UPDATE sets the tenant column or a unique column:
+// either can change which tenant a cached row belongs to.
+func (a *Attributor) assignsKey(ti *TableInfo, x Stmt) bool {
+	for _, c := range x.SetCols {
+		if a.tenants[c] || (ti != nil && ti.IsUnique(c)) {
+			return true
+		}
+	}
+	return false
 }

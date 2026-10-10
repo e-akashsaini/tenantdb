@@ -75,12 +75,33 @@ type Catalog struct {
 	loaded    bool
 	reloading atomic.Bool
 
+	// TenantColumns names the columns that hold the tenant. Set it before Load:
+	// foreign keys can only be verified when the tenant column is known.
+	TenantColumns []string
+	fks           map[string]map[string]FKRef // table key -> column -> the verified parent row it points at
+	fkMemo        map[string]fkVerdict        // verdicts kept across reloads
+
 	bypassRLS  bool                   // the loading role is not subject to row-level security
 	roleSearch map[[2]string][]string // (role, database) -> search_path from ALTER ROLE/DATABASE ... SET
 	baseSearch []string
 }
 
-func NewCatalog(dsn string) *Catalog { return &Catalog{dsn: dsn} }
+func NewCatalog(dsn string) *Catalog { return &Catalog{dsn: dsn, fkMemo: map[string]fkVerdict{}} }
+
+// FKRef says a column points at a column of a parent table.
+type FKRef struct{ ParentKey, ParentCol string }
+
+type fkVerdict struct {
+	ok           bool
+	inconclusive bool // no rows to judge by yet: look again soon
+	at           time.Time
+}
+
+const (
+	fkMemoTTL         = time.Hour
+	fkInconclusiveTTL = 30 * time.Second
+	fkSampleRows      = 5000
+)
 
 // pg_catalog rather than information_schema: the latter hides columns the role
 // cannot read, which would make shared and tenant tables look the same.
@@ -122,6 +143,16 @@ FROM pg_db_role_setting s
 LEFT JOIN pg_roles r ON r.oid = s.setrole
 LEFT JOIN pg_database d ON d.oid = s.setdatabase`
 
+// Declared single-column foreign keys.
+const fkSQL = `
+SELECT cn.nspname, c.relname, a.attname, pn.nspname, p.relname, pa.attname
+FROM pg_constraint k
+JOIN pg_class c ON c.oid = k.conrelid JOIN pg_namespace cn ON cn.oid = c.relnamespace
+JOIN pg_class p ON p.oid = k.confrelid JOIN pg_namespace pn ON pn.oid = p.relnamespace
+JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.conkey[1]
+JOIN pg_attribute pa ON pa.attrelid = p.oid AND pa.attnum = k.confkey[1]
+WHERE k.contype = 'f' AND array_length(k.conkey, 1) = 1`
+
 type colRow struct {
 	schema, table string
 	kind          byte // 0 means an ordinary table
@@ -137,6 +168,7 @@ type snapshotData struct {
 	bypassRLS  bool
 	roleSearch map[[2]string][]string
 	baseSearch []string
+	fks        map[string]map[string]FKRef // tests only; Load computes them itself
 }
 
 // Load replaces the snapshot with the current schema.
@@ -243,6 +275,7 @@ func (c *Catalog) Load(ctx context.Context) error {
 	}
 
 	c.apply(d)
+	c.loadFKs(ctx, conn)
 	return nil
 }
 
@@ -270,8 +303,172 @@ func (c *Catalog) apply(d snapshotData) {
 	c.mu.Lock()
 	c.tables, c.funcs, c.loaded = m, funcs, true
 	c.bypassRLS, c.roleSearch, c.baseSearch = d.bypassRLS, d.roleSearch, d.baseSearch
+	if d.fks != nil {
+		c.fks = d.fks
+	}
 	c.gen++
 	c.mu.Unlock()
+}
+
+type fkCand struct {
+	child    *TableInfo
+	ccol     string
+	parent   *TableInfo
+	pcol     string
+	inferred bool
+}
+
+func (f fkCand) id() string {
+	return f.child.Key() + "." + f.ccol + "->" + f.parent.Key() + "." + f.pcol
+}
+
+// loadFKs works out which columns point at a row of a tenant table, so a lookup
+// by that column (WHERE submission_id = 5) can be attributed through the parent
+// row's tenant. Candidates are the declared foreign keys plus, for the many
+// schemas (Rails among them) that declare none, columns named <thing>_id next
+// to a table called <thing> or <thing>s. A candidate is used only if both tables
+// carry the tenant column, the parent column is unique, and a sample of child
+// rows always has the same tenant as the parent row it points at: a wrong guess
+// would attribute queries to the wrong tenant, which is worse than none.
+func (c *Catalog) loadFKs(ctx context.Context, conn *pgx.Conn) {
+	if len(c.TenantColumns) == 0 {
+		return
+	}
+	tset := lowerSet(c.TenantColumns)
+	tcol := func(t *TableInfo) string {
+		for _, col := range t.Cols {
+			if tset[col] {
+				return col
+			}
+		}
+		return ""
+	}
+	c.mu.RLock()
+	tables := make(map[string]*TableInfo, len(c.tables))
+	for k, v := range c.tables {
+		tables[k] = v
+	}
+	c.mu.RUnlock()
+
+	var cands []fkCand
+	seen := map[string]bool{}
+	add := func(child *TableInfo, ccol string, parent *TableInfo, pcol string, inferred bool) {
+		if child == nil || parent == nil || child == parent || tset[ccol] || child.Schema == "pg_temp" ||
+			tcol(child) == "" || tcol(parent) == "" || !parent.IsUnique(pcol) {
+			return
+		}
+		f := fkCand{child, ccol, parent, pcol, inferred}
+		if !seen[f.id()] {
+			seen[f.id()] = true
+			cands = append(cands, f)
+		}
+	}
+	declared := map[string]bool{}
+	if rows, err := conn.Query(ctx, fkSQL); err == nil {
+		for rows.Next() {
+			var cs, ct, cc, ps, pt, pc string
+			if rows.Scan(&cs, &ct, &cc, &ps, &pt, &pc) != nil {
+				continue
+			}
+			child, parent := tables[strings.ToLower(cs+"."+ct)], tables[strings.ToLower(ps+"."+pt)]
+			declared[strings.ToLower(cs+"."+ct+"."+cc)] = true
+			add(child, strings.ToLower(cc), parent, strings.ToLower(pc), false)
+		}
+		rows.Close()
+	}
+	for _, child := range tables {
+		for _, col := range child.Cols {
+			if !strings.HasSuffix(col, "_id") || col == "_id" || declared[strings.ToLower(child.Key())+"."+col] {
+				continue
+			}
+			base := strings.TrimSuffix(col, "_id")
+			for _, name := range pluralForms(base) {
+				if parent := tables[strings.ToLower(child.Schema)+"."+name]; parent != nil && parent != child {
+					add(child, col, parent, "id", true)
+					break
+				}
+			}
+		}
+	}
+
+	out := map[string]map[string]FKRef{}
+	now := time.Now()
+	for _, f := range cands {
+		c.mu.RLock()
+		v, memo := c.fkMemo[f.id()]
+		c.mu.RUnlock()
+		ttl := fkMemoTTL
+		if memo && v.inconclusive {
+			ttl = fkInconclusiveTTL
+		}
+		if !memo || now.Sub(v.at) > ttl {
+			ok, inconclusive := verifyFK(ctx, conn, f, tcol(f.child), tcol(f.parent))
+			v = fkVerdict{ok: ok, inconclusive: inconclusive, at: now}
+			c.mu.Lock()
+			if c.fkMemo == nil {
+				c.fkMemo = map[string]fkVerdict{}
+			}
+			c.fkMemo[f.id()] = v
+			c.mu.Unlock()
+		}
+		if !v.ok {
+			continue
+		}
+		k := f.child.Key()
+		if out[k] == nil {
+			out[k] = map[string]FKRef{}
+		}
+		out[k][f.ccol] = FKRef{ParentKey: f.parent.Key(), ParentCol: f.pcol}
+	}
+	c.mu.Lock()
+	c.fks = out
+	c.mu.Unlock()
+}
+
+// verifyFK samples child rows and checks every one that points at a parent row
+// has that parent's tenant. At least one row must match, and none may differ.
+// inconclusive means there was nothing to judge by (empty tables), not that the
+// guess is wrong.
+func verifyFK(ctx context.Context, conn *pgx.Conn, f fkCand, childTenant, parentTenant string) (ok, inconclusive bool) {
+	q := fmt.Sprintf(`SELECT count(*) FILTER (WHERE c.t IS NOT NULL AND p.%[1]s IS NOT NULL),
+       count(*) FILTER (WHERE c.t IS DISTINCT FROM p.%[1]s)
+FROM (SELECT %[2]s AS k, %[3]s AS t FROM %[4]s WHERE %[2]s IS NOT NULL LIMIT %[5]d) c
+JOIN %[6]s p ON p.%[7]s = c.k`,
+		f.parent.quoted(parentTenant), f.child.quoted(f.ccol), f.child.quoted(childTenant), f.child.qualified(), fkSampleRows,
+		f.parent.qualified(), f.parent.quoted(f.pcol))
+	var matched, mismatched int64
+	if err := conn.QueryRow(ctx, q).Scan(&matched, &mismatched); err != nil {
+		return false, false // e.g. the column types do not even compare
+	}
+	if matched == 0 && mismatched == 0 {
+		return false, true
+	}
+	return matched > 0 && mismatched == 0, false
+}
+
+// pluralForms lists the table names a column "<base>_id" might point at.
+func pluralForms(base string) []string {
+	out := []string{base, base + "s", base + "es"}
+	if strings.HasSuffix(base, "y") {
+		out = append(out, strings.TrimSuffix(base, "y")+"ies")
+	}
+	return out
+}
+
+// FK returns the verified parent row a column of ti points at.
+func (c *Catalog) FK(ti *TableInfo, col string) (FKRef, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	ref, ok := c.fks[ti.Key()][col]
+	return ref, ok
+}
+
+// TableByKey finds a table by its schema.name key.
+func (c *Catalog) TableByKey(key string) (*TableInfo, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	ti, ok := c.tables[key]
+	return ti, ok
 }
 
 // ReloadAsync refreshes the snapshot in the background, e.g. after DDL. At

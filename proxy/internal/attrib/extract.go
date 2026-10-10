@@ -26,11 +26,16 @@ type Stmt struct {
 	Drops   []TableRef  // tables dropped or truncated
 
 	// Row-cache inputs, filled only for statements that touch a single table.
-	Table   TableRef // zero value when not a single-table statement
+	Table TableRef // zero value when not a single-table statement
+	// Aliases maps the name or alias a column can be qualified with to its table,
+	// for SELECT/UPDATE/DELETE, so `submissions.id = 5` can be tied to a table in a join.
+	Aliases map[string]TableRef
 	Keys    []Pred   // equality predicates on key columns in the WHERE clause
 	Inserts []InsRow // INSERT ... VALUES rows
 	Delete  bool     // a DELETE statement
 	SetsKey bool     // an UPDATE that assigns a key or tenant column
+	SetCols []string // every column an UPDATE assigns
+	Or      bool     // the WHERE clause has an OR: a predicate seen may be only one alternative
 
 	// Filtered is true when a WHERE or JOIN condition mentions a tenant or key
 	// column. A statement on tenant data where it is false reads every tenant.
@@ -61,10 +66,16 @@ type Extractor struct {
 	// is read as "the tenant is argument 1".
 	fname string
 	args  map[string]int
+
+	// anyKey: collect equality predicates on every column, not only the
+	// configured key columns. The catalog then decides which ones identify a row
+	// (a unique column, or a foreign key to one).
+	anyKey bool
 }
 
 func NewExtractor(tenantColumns, keyColumns []string) *Extractor {
 	e := &Extractor{cols: lowerSet(tenantColumns), keys: lowerSet(keyColumns)}
+	e.anyKey = len(e.keys) > 0
 	return e
 }
 
@@ -121,7 +132,7 @@ func (e *Extractor) collect(n *pg_query.Node, vals map[string]bool, params map[i
 }
 
 func (e *Extractor) aExpr(x *pg_query.A_Expr, vals map[string]bool, params map[int]bool) {
-	other, ok := eqOther(x, e.cols)
+	other, ok := eqOther(x, func(c string) bool { return e.cols[c] })
 	if !ok {
 		return
 	}
@@ -136,30 +147,30 @@ func (e *Extractor) aExpr(x *pg_query.A_Expr, vals map[string]bool, params map[i
 
 // eqOther returns the non-column side of `col = x` / `col IN (...)` when col
 // is one of cols, in either order.
-func eqOther(x *pg_query.A_Expr, cols map[string]bool) (*pg_query.Node, bool) {
+func eqOther(x *pg_query.A_Expr, match func(string) bool) (*pg_query.Node, bool) {
 	if x.Kind != pg_query.A_Expr_Kind_AEXPR_OP && x.Kind != pg_query.A_Expr_Kind_AEXPR_IN {
 		return nil, false
 	}
 	if len(x.Name) != 1 || x.Name[0].GetString_().GetSval() != "=" {
 		return nil, false // <>, <, LIKE, NOT IN ... do not select a row
 	}
-	if colName(x.Lexpr, cols) != "" {
+	if colName(x.Lexpr, match) != "" {
 		return x.Rexpr, true
 	}
-	if colName(x.Rexpr, cols) != "" {
+	if colName(x.Rexpr, match) != "" {
 		return x.Lexpr, true
 	}
 	return nil, false
 }
 
 // colName returns the lower-cased column name if n is a reference to one of cols.
-func colName(n *pg_query.Node, cols map[string]bool) string {
+func colName(n *pg_query.Node, match func(string) bool) string {
 	ref := unwrap(n).GetColumnRef()
 	if ref == nil || len(ref.Fields) == 0 {
 		return ""
 	}
 	name := strings.ToLower(ref.Fields[len(ref.Fields)-1].GetString_().GetSval())
-	if cols[name] {
+	if match(name) {
 		return name
 	}
 	return ""

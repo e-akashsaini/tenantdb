@@ -41,10 +41,11 @@ type Call struct {
 	Args []Operand
 }
 
-// Pred is `Col = op` (or `Col IN (ops)`) on a key column.
+// Pred is `Col = op` (or `Col IN (ops)`) on a column that might identify a row.
 type Pred struct {
-	Col string
-	Ops []Operand
+	Qual string // the table name or alias the column was qualified with, if any
+	Col  string
+	Ops  []Operand
 }
 
 // InsRow is one row of INSERT ... VALUES: its tenant operand and key operands.
@@ -97,18 +98,25 @@ func (e *Extractor) shape(n *pg_query.Node, st *Stmt) {
 	switch v := n.GetNode().(type) {
 	case *pg_query.Node_SelectStmt:
 		s := v.SelectStmt
-		if len(s.FromClause) == 1 && s.FromClause[0].GetRangeVar() != nil && s.WithClause == nil &&
-			s.Op == pg_query.SetOperation_SETOP_NONE {
-			st.Table = relRef(s.FromClause[0].GetRangeVar())
-			st.Keys = e.keyPreds(s.WhereClause)
+		if s.WithClause == nil && s.Op == pg_query.SetOperation_SETOP_NONE {
+			if len(s.FromClause) == 1 && s.FromClause[0].GetRangeVar() != nil {
+				st.Table = relRef(s.FromClause[0].GetRangeVar())
+			}
+			// Joins too: a predicate on a qualified column still names its table.
+			st.Aliases = aliasesOf(s.FromClause...)
+			st.Keys, st.Or = e.keyPreds(s.WhereClause)
+			e.confine(st, s.WhereClause)
 		}
 	case *pg_query.Node_UpdateStmt:
 		u := v.UpdateStmt
 		if len(u.FromClause) == 0 && u.WithClause == nil && u.Relation != nil {
 			st.Table = relRef(u.Relation)
-			st.Keys = e.keyPreds(u.WhereClause)
+			st.Aliases = aliasesOf(&pg_query.Node{Node: &pg_query.Node_RangeVar{RangeVar: u.Relation}})
+			st.Keys, st.Or = e.keyPreds(u.WhereClause)
+			e.confine(st, u.WhereClause)
 			for _, t := range u.TargetList {
 				name := strings.ToLower(t.GetResTarget().GetName())
+				st.SetCols = append(st.SetCols, name)
 				if e.keys[name] || e.cols[name] {
 					st.SetsKey = true
 				}
@@ -118,7 +126,9 @@ func (e *Extractor) shape(n *pg_query.Node, st *Stmt) {
 		d := v.DeleteStmt
 		if len(d.UsingClause) == 0 && d.WithClause == nil && d.Relation != nil {
 			st.Table = relRef(d.Relation)
-			st.Keys = e.keyPreds(d.WhereClause)
+			st.Aliases = aliasesOf(&pg_query.Node{Node: &pg_query.Node_RangeVar{RangeVar: d.Relation}})
+			st.Keys, st.Or = e.keyPreds(d.WhereClause)
+			e.confine(st, d.WhereClause)
 			st.Delete = true
 		}
 	case *pg_query.Node_InsertStmt:
@@ -130,45 +140,168 @@ func (e *Extractor) shape(n *pg_query.Node, st *Stmt) {
 	}
 }
 
+// aliasesOf maps every name a FROM clause gives its tables (the table name and
+// any alias) to the table. Subqueries and functions in FROM are not tables.
+func aliasesOf(from ...*pg_query.Node) map[string]TableRef {
+	m := map[string]TableRef{}
+	for _, f := range from {
+		walkTop(f, func(rv *pg_query.RangeVar) {
+			ref := relRef(rv)
+			m[ref.Name] = ref
+			if rv.Alias != nil {
+				m[strings.ToLower(rv.Alias.Aliasname)] = ref
+			}
+		})
+	}
+	return m
+}
+
+// walkTop visits the tables of a FROM item and of the joins under it, without
+// descending into subqueries.
+func walkTop(n *pg_query.Node, fn func(*pg_query.RangeVar)) {
+	switch {
+	case n == nil:
+	case n.GetRangeVar() != nil:
+		fn(n.GetRangeVar())
+	case n.GetJoinExpr() != nil:
+		walkTop(n.GetJoinExpr().Larg, fn)
+		walkTop(n.GetJoinExpr().Rarg, fn)
+	}
+}
+
+func qualOf(n *pg_query.Node) string {
+	ref := unwrap(n).GetColumnRef()
+	if ref == nil || len(ref.Fields) < 2 {
+		return ""
+	}
+	return strings.ToLower(ref.Fields[len(ref.Fields)-2].GetString_().GetSval())
+}
+
 func relRef(r *pg_query.RangeVar) TableRef {
 	return TableRef{Schema: strings.ToLower(r.Schemaname), Name: strings.ToLower(r.Relname)}
 }
 
-// keyPreds collects key-column equality predicates from a WHERE clause. It
-// does not descend into subqueries or under NOT.
-func (e *Extractor) keyPreds(where *pg_query.Node) []Pred {
-	if where == nil || len(e.keys) == 0 {
-		return nil
+// confine replaces the tenants found anywhere in a statement with the ones its
+// WHERE clause actually confines it to, when the clause has an OR. Without an OR
+// every tenant predicate is an AND-ed restriction and the plain scan is right.
+// With one, `tenant_id = 'a' OR amount > 5` names a tenant but also reads the
+// rows of every other.
+func (e *Extractor) confine(st *Stmt, where *pg_query.Node) {
+	if !st.Or {
+		return
 	}
-	var out []Pred
+	vals, params, ok := e.confined(where)
+	if !ok {
+		st.Tenants, st.Params = nil, nil
+		return
+	}
+	st.Tenants, st.Params = sortedKeys(vals), sortedInts(params)
+}
+
+// confined says which tenants a boolean expression restricts rows to. AND is
+// restricted by any one of its parts; OR only if every alternative is.
+func (e *Extractor) confined(n *pg_query.Node) (vals map[string]bool, params map[int]bool, ok bool) {
+	if n == nil {
+		return nil, nil, false
+	}
+	vals, params = map[string]bool{}, map[int]bool{}
+	merge := func(v map[string]bool, p map[int]bool) {
+		for k := range v {
+			vals[k] = true
+		}
+		for k := range p {
+			params[k] = true
+		}
+	}
+	switch {
+	case n.GetBoolExpr() != nil:
+		b := n.GetBoolExpr()
+		switch b.Boolop {
+		case pg_query.BoolExprType_AND_EXPR:
+			for _, arg := range b.Args {
+				if v, p, found := e.confined(arg); found {
+					merge(v, p)
+					ok = true
+				}
+			}
+			return vals, params, ok
+		case pg_query.BoolExprType_OR_EXPR:
+			for _, arg := range b.Args {
+				v, p, found := e.confined(arg)
+				if !found {
+					return nil, nil, false
+				}
+				merge(v, p)
+			}
+			return vals, params, len(b.Args) > 0
+		}
+		return nil, nil, false
+	case n.GetAExpr() != nil:
+		other, found := eqOther(n.GetAExpr(), func(c string) bool { return e.cols[c] })
+		if !found {
+			return nil, nil, false
+		}
+		if list := other.GetList(); list != nil {
+			for _, it := range list.Items {
+				e.addValue(it, vals, params)
+			}
+		} else {
+			e.addValue(other, vals, params)
+		}
+		return vals, params, len(vals)+len(params) > 0
+	}
+	return nil, nil, false
+}
+
+// isKeyish: could this column identify a row? Tenant columns never do. With
+// anyKey every other column might; the catalog decides which really do.
+func (e *Extractor) isKeyish(c string) bool {
+	return !e.cols[c] && (e.anyKey || e.keys[c])
+}
+
+// keyPreds collects equality predicates `col = value` / `col IN (values)` from a
+// WHERE clause, on columns that might identify a row. It does not descend into
+// subqueries or under NOT. or reports whether the clause contains an OR, in
+// which case a predicate found is only one alternative.
+func (e *Extractor) keyPreds(where *pg_query.Node) (preds []Pred, or bool) {
+	if where == nil || (!e.anyKey && len(e.keys) == 0) {
+		return nil, false
+	}
 	walk(where.ProtoReflect(), func(m proto.Message) bool {
 		switch v := m.(type) {
 		case *pg_query.BoolExpr:
+			if v.Boolop == pg_query.BoolExprType_OR_EXPR {
+				or = true
+			}
 			return v.Boolop != pg_query.BoolExprType_NOT_EXPR
 		case *pg_query.SubLink:
 			return false
 		case *pg_query.A_Expr:
-			other, ok := eqOther(v, e.keys)
+			other, ok := eqOther(v, e.isKeyish)
 			if !ok {
 				return true
 			}
-			col := colName(v.Lexpr, e.keys)
+			col, qual := colName(v.Lexpr, e.isKeyish), qualOf(v.Lexpr)
 			if col == "" {
-				col = colName(v.Rexpr, e.keys)
+				col, qual = colName(v.Rexpr, e.isKeyish), qualOf(v.Rexpr)
 			}
-			p := Pred{Col: col}
+			p := Pred{Qual: qual, Col: col}
 			if list := other.GetList(); list != nil {
 				for _, it := range list.Items {
-					p.Ops = append(p.Ops, e.operand(it))
+					if op := e.operand(it); op.Set {
+						p.Ops = append(p.Ops, op)
+					}
 				}
-			} else {
-				p.Ops = []Operand{e.operand(other)}
+			} else if op := e.operand(other); op.Set {
+				p.Ops = []Operand{op}
 			}
-			out = append(out, p)
+			if len(p.Ops) > 0 { // `a.x = b.y` compares two columns: nothing to look up
+				preds = append(preds, p)
+			}
 		}
 		return true
 	})
-	return out
+	return preds, or
 }
 
 func (e *Extractor) insertRows(s *pg_query.InsertStmt) []InsRow {
@@ -191,7 +324,7 @@ func (e *Extractor) insertRows(s *pg_query.InsertStmt) []InsRow {
 			switch {
 			case e.cols[name]:
 				r.Tenant = e.operand(items.Items[i])
-			case e.keys[name]:
+			case e.isKeyish(name):
 				r.Keys = append(r.Keys, KeyOp{Col: name, Op: e.operand(items.Items[i])})
 			}
 		}

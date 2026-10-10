@@ -106,7 +106,7 @@ func (a *Attributor) scopeOf(ti *TableInfo) (tenantCol string, keys []string) {
 		switch {
 		case tenantCol == "" && a.tenants[c]:
 			tenantCol = c
-		case a.ex.keys[c] && ti.IsUnique(c):
+		case !a.tenants[c] && ti.IsUnique(c):
 			keys = append(keys, c)
 		}
 	}

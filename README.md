@@ -43,7 +43,10 @@ Every event also carries `scan` (reads across tenants, even if a tag attributed 
 - **Statements that run a query without being a plain `SELECT`**: `CREATE TABLE ... AS`, `SELECT ... INTO`, `EXPLAIN ANALYZE`, cursors, `COPY`, `CALL`, `EXECUTE`. They are attributed like the query they run; otherwise they would be a way around the policy. A plain `EXPLAIN` executes nothing and isn't attributed.
 - **Temporary tables.** A temp table with its own tenant column is filtered like any tenant table. One filled from a query inherits the tenants of that query (`derived`); one filled from unattributed data stays `unknown`. They are per-session, shadow real tables the way Postgres does, and never enter the shared cache.
 - **`INSERT` without a column list**, using the real column order from the catalog.
-- **Cache hygiene.** Rows are learned only from successful `INSERT`s and from result columns that come straight from one table, and only for columns the catalog proves unique (a single-column primary key or unique index). `DELETE` evicts, an `UPDATE` that changes a key or tenant column drops that table's entries, and `TRUNCATE`/`DROP TABLE` forget the table. Entries also expire after `-cache-ttl`.
+- **Rows by any unique column, and through foreign keys.** A statement that names a row by a unique column (`id`, `slug`, `uuid`: anything with a single-column unique index) is attributed to that row's tenant. A lookup by a foreign key (`WHERE submission_id = 5`) is attributed through the parent row. Foreign keys are the declared ones plus columns named `<thing>_id` next to a table called `<thing>` or `<thing>s`; each is checked against a sample of real rows (the child must always have its parent's tenant) and discarded if it isn't, or if there are no rows to check yet.
+- **Joins and aliases.** `... FROM templates JOIN submissions ... WHERE submissions.id = $1` is read through the qualifier. An unqualified column in a join could belong to either table, so it names none.
+- **`OR`.** A WHERE clause confines a statement to a tenant only if every alternative does: `tenant_id = 'a' AND (x = 1 OR y = 2)` is `a`; `tenant_id = 'a' OR amount > 5` is not attributed to `a`.
+- **Cache hygiene.** Rows are learned only from successful `INSERT`s and from result columns that come straight from one table. `DELETE` evicts, an `UPDATE` that changes a unique or tenant column drops that table's entries, and `TRUNCATE`/`DROP TABLE` forget the table. Entries also expire after `-cache-ttl`.
 
 ### It fails closed
 These are `unknown`, never `untenanted`:
@@ -89,6 +92,52 @@ Prefer the environment variable over `-schema-dsn`: command-line flags show up i
 ./tenantdb -tls-cert server.crt -tls-key server.key -require-tls  # clients must
 ```
 The certificate is re-read when the file changes (checked every 30 s), so renewals need no restart. TLS to the upstream is separate: `-upstream-tls`.
+
+## Auditing a recorded workload: `tenantdb analyze`
+
+The same attribution, run over a recording instead of live traffic. Nothing sits in the path of a database; you need only read access to one with the same schema.
+
+```bash
+# Record what the app runs (staging, a canary, or CI), in postgresql.conf:
+#   log_statement = 'all'      log_line_prefix = '%m [%p] %u@%d '
+export TENANTDB_SCHEMA_DSN='postgres://tenantdb_ro:...@staging/mydb'
+tenantdb analyze -tenant-columns account_id postgres.log
+
+# or from pg_stat_statements:
+#   \copy (SELECT query, calls FROM pg_stat_statements) TO 'q.csv' CSV HEADER
+tenantdb analyze -tenant-columns account_id q.csv
+```
+
+Formats: `.log` (PostgreSQL log, including bound parameters), `.csv` (a `pg_stat_statements` export; statements are weighted by `calls`), `.sql` (plain statements); `-format` overrides. `-json` writes the full report for scripts.
+
+```
+tenantdb analysis
+=================
+5746 statements read; 4946 attributed, 800 need no attribution (SET, BEGIN, DDL, ...)
+
+How tenants were determined
+  explicit          1065   21.5%
+  cache             1402   28.3%
+  untenanted        1986   40.2%
+  scan               309    6.2%
+  unknown            184    3.7%
+
+What strict mode would flag: 493 of 4946 attributed statements (10.0%)
+
+Worst query shapes (statements that differ only in their literals are grouped)
+   1. [unknown] x152  public.access_tokens, public.users
+      SELECT "users".* FROM "users" INNER JOIN "access_tokens" ...
+```
+
+By default it warms the row cache from the database and looks up the rows a statement names (`-warm`, `-lookup`), so a statement-by-id in a log with literal values is attributed. A `pg_stat_statements` export has only `$1` placeholders, so statements by id stay `unknown` there: the report still tells you which queries have no tenant filter, which is the main thing an audit wants.
+
+### On a real Rails app
+
+[`bench/docuseal/`](bench/docuseal/README.md) runs DocuSeal (Rails 8, `account_id` on its tables) behind the proxy and drives it. 4,946 statements: 10.0% would be flagged, almost all of them authentication, polymorphic associations, global configuration reads and bootstrap checks; and in `block` mode the unmodified app stops at login. Read the caveats there before quoting any number: it is one app, one account, scripted traffic.
+
+### Running your own test suite through it
+
+Point the test database connection at tenantdb (alert mode, `-schema-dsn` at a database with the same schema) and run the suite. The tests exercise your real ORM and driver, so the log shows the SQL shapes you actually produce. Or skip the proxy: enable `log_statement = 'all'` on the test database, run the suite, and `tenantdb analyze` the log. Nothing is at risk either way, and it covers whatever your tests cover and no more.
 
 ## Strict mode
 
@@ -153,7 +202,7 @@ Each flag also has an environment variable where listed.
 | `-tls-cert`, `-tls-key` | `TENANTDB_TLS_CERT`, `TENANTDB_TLS_KEY` | | Let clients encrypt their connection to the proxy |
 | `-require-tls` | `TENANTDB_REQUIRE_TLS=1` | off | Refuse clients that don't use TLS |
 | `-tenant-columns` | `TENANTDB_TENANT_COLUMNS` | `tenant_id` | Column(s) holding the tenant, comma-separated |
-| `-key-columns` | `TENANTDB_KEY_COLUMNS` | `id` | Columns identifying a row (row cache). Used only where the catalog proves them unique. Empty disables the cache |
+| `-key-columns` | `TENANTDB_KEY_COLUMNS` | `id` | Columns that identify a row when there is no schema to consult. With `-schema-dsn`, every provably unique column identifies a row. Empty disables the row cache |
 | `-cache-size` | | `100000` | Max rows in the row-to-tenant cache |
 | `-cache-ttl` | | `1h` | How long a cached owner is trusted (`0`: until evicted) |
 | `-schema-dsn` | `TENANTDB_SCHEMA_DSN` | | Read-only role connection string (schema, function bodies, pre-warm, lookups) |
@@ -183,6 +232,9 @@ What is genuinely not handled:
 
 - **No connection pooling.** It's one upstream connection per client connection. Pooling changes how authentication works (the proxy would have to authenticate clients itself), so it is a design decision, not a patch.
 - **Code the proxy can't read stays `unknown`.** Dynamic SQL inside a function (`EXECUTE` of a computed string), and functions in languages other than SQL and PL/pgSQL. That's inherent: what such code touches is only decided at run time. Use a [connection tag](#connection-tag) for those paths, or an exempt role.
+- **Polymorphic associations aren't resolved.** A Rails `record_type` + `record_id` pair names its parent table at run time; tenantdb doesn't follow it yet, so those lookups are flagged.
+- **Lookups by credential can't be attributed.** An API-token or session lookup is how the application *finds out* the tenant. Give such connections a [connection tag](#connection-tag) or an exempt role.
+- **A foreign key can only be verified when there are rows.** A `<thing>_id` column on an empty table is not used until the table has data.
 - **Triggers and rules aren't analysed.** A trigger fired by a statement can touch other tables; the proxy only sees the statement itself.
 - **A function is attributed from its arguments only where its body compares the tenant column to a parameter** (or hardcodes the tenant). Anything subtler is `unknown`.
 - **A cached row owner can be stale for up to `-cache-ttl`** after a delete the proxy didn't see (a cascade, or another path to the database) followed by key reuse. Primary keys that are never reused (serials, UUIDs) are unaffected. Lower the TTL, or set `-key-columns=` to turn the cache off and resolve every row from the database.
@@ -209,7 +261,8 @@ TENANTDB_TEST_DSN=postgres://postgres:pw@127.0.0.1:5432/postgres go test -race .
 
 ```
 proxy/
-  cmd/tenantdb/            flags, wiring, certificate reloading
+  cmd/tenantdb/            flags, wiring, certificate reloading; `analyze` subcommand
+  internal/analyze/        read a SQL file / pg_stat_statements / Postgres log, replay it, report
   internal/proxy/          wire-protocol relay: TLS, Observer (watch) and Gate (veto)
   internal/attrib/
     extract.go shape.go    parse a statement: tenants, keys, tables, calls, SET
@@ -221,4 +274,5 @@ proxy/
     lookup.go              ask the database who owns a row (de-duplicated)
     warm.go                background cache pre-warming
     strict.go              the policy and the blocking gate
+bench/docuseal/            run a real Rails app (DocuSeal) behind the proxy and drive it
 ```

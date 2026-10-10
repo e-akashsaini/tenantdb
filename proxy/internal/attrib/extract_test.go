@@ -125,3 +125,35 @@ func TestSetStatements(t *testing.T) {
 		}
 	}
 }
+
+func TestOrOnlyConfinesIfEveryAlternativeDoes(t *testing.T) {
+	e := NewExtractor([]string{"tenant_id"}, []string{"id"})
+	for sql, want := range map[string][]string{
+		`SELECT * FROM t WHERE tenant_id = 'a'`:                                            {"a"},
+		`SELECT * FROM t WHERE tenant_id = 'a' AND (x = 1 OR y = 2)`:                       {"a"}, // the OR is inside the restriction
+		`SELECT * FROM t WHERE (tenant_id = 'a' AND x = 1) OR (tenant_id = 'b' AND x = 2)`: {"a", "b"},
+		`SELECT * FROM t WHERE tenant_id = 'a' OR tenant_id = 'b'`:                         {"a", "b"},
+		`SELECT * FROM t WHERE tenant_id IN ('a', 'b') AND (x = 1 OR y = 2)`:               {"a", "b"},
+		`SELECT * FROM t WHERE tenant_id = 'a' OR amount > 5`:                              nil, // the other alternative reads every tenant
+		`SELECT * FROM t WHERE tenant_id = 'a' OR true`:                                    nil,
+		`SELECT * FROM t WHERE (tenant_id = 'a' OR x = 1) AND y = 2`:                       nil,
+		`UPDATE t SET x = 1 WHERE tenant_id = 'a' OR id = 5`:                               nil,
+		`DELETE FROM t WHERE tenant_id = 'a' OR tenant_id IS NULL`:                         nil,
+	} {
+		stmts, err := e.Parse(sql)
+		if err != nil || len(stmts) != 1 {
+			t.Fatalf("%s: %v", sql, err)
+		}
+		if !reflect.DeepEqual(stmts[0].Tenants, want) {
+			t.Errorf("%s: tenants = %v, want %v", sql, stmts[0].Tenants, want)
+		}
+	}
+	p, _ := e.Parse(`SELECT * FROM t WHERE tenant_id = $1 OR x = 1`)
+	if len(p[0].Params) != 0 {
+		t.Errorf("a bound tenant under an unconfined OR must not count: %v", p[0].Params)
+	}
+	p, _ = e.Parse(`SELECT * FROM t WHERE tenant_id = $1 AND (x = 1 OR y = 2)`)
+	if !reflect.DeepEqual(p[0].Params, []int{1}) {
+		t.Errorf("params = %v", p[0].Params)
+	}
+}

@@ -17,6 +17,9 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "analyze" {
+		os.Exit(runAnalyze(os.Args[2:]))
+	}
 	var (
 		listen       = flag.String("listen", env("TENANTDB_LISTEN", ":6432"), "address to accept clients on")
 		upstream     = flag.String("upstream", env("TENANTDB_UPSTREAM", "127.0.0.1:5432"), "host:port of the PostgreSQL server")
@@ -88,6 +91,7 @@ func main() {
 	var catalog *attrib.Catalog
 	if *schemaDSN != "" {
 		catalog = attrib.NewCatalog(*schemaDSN)
+		catalog.TenantColumns = strings.Split(*tenantCols, ",") // foreign keys are verified against it
 		lctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		if err := catalog.Load(lctx); err != nil {
 			// Fail open: the proxy still relays and attributes without the schema.
