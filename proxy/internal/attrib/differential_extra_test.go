@@ -166,7 +166,28 @@ func (g *dgen) viewQuery() dquery {
 // extraQuery generates one of the statement shapes above.
 func (g *dgen) extraQuery() dquery {
 	tid := func() string { return g.tid() }
-	switch g.r.Intn(21) {
+	switch g.r.Intn(23) {
+	case 21, 22: // EXISTS over a correlated table, through a relationship the schema does not declare
+		f, sa := g.newAlias(), g.newAlias()
+		var sub, corr string
+		switch g.r.Intn(3) {
+		case 0:
+			sub, corr = "folders", fmt.Sprintf("%s.up = %s.id", sa, f)
+		case 1:
+			sub, corr = "folders", fmt.Sprintf("%s.id = %s.up", sa, f)
+		default:
+			sub, corr = "folders", fmt.Sprintf("%s.up = %s.id AND %s.label = 'f%d'", sa, f, sa, g.r.Intn(5))
+		}
+		pred := g.pred(f, dTables["folders"], 1)
+		op := g.pick("EXISTS", "EXISTS", "NOT EXISTS")
+		join := g.pick(" OR "+g.pred(f, dTables["folders"], 1), " AND "+g.pred(f, dTables["folders"], 1), "")
+		where := fmt.Sprintf("%s AND %s (SELECT 1 FROM tdbdiff.%s %s WHERE %s)%s", pred, op, sub, sa, corr, join)
+		return dquery{
+			sql: fmt.Sprintf("SELECT %s.* FROM tdbdiff.folders %s WHERE %s", f, f, where),
+			// the data keeps a folder and its parent or children in one tenant, so the rows returned say whose data was read
+			truth:  []string{fmt.Sprintf("SELECT DISTINCT %s.tenant_id FROM tdbdiff.folders %s WHERE %s", f, f, where)},
+			tenant: true,
+		}
 	case 16, 17, 18:
 		return g.viewQuery()
 	case 19:

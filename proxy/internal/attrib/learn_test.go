@@ -93,3 +93,53 @@ func TestRelationshipsAreLearnedFromJoinsAndVerified(t *testing.T) {
 		t.Error("a reload forgot what had been learned")
 	}
 }
+
+// A table that points at itself (folders, comments, categories): the join of two
+// occurrences of it reveals the relationship, and it is checked like any other.
+func TestSelfReferencingRelationshipsAreLearned(t *testing.T) {
+	dsn := os.Getenv("TENANTDB_TEST_DSN")
+	if dsn == "" {
+		t.Skip("TENANTDB_TEST_DSN not set")
+	}
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+	cleanup := `DROP TABLE IF EXISTS ln_tree, ln_tree_bad CASCADE`
+	for _, q := range []string{
+		cleanup,
+		`CREATE TABLE ln_tree (id bigint PRIMARY KEY, tenant_id text, up bigint)`,
+		`CREATE TABLE ln_tree_bad (id bigint PRIMARY KEY, tenant_id text, other bigint)`,
+		`INSERT INTO ln_tree SELECT g, 't' || ((g - 1) / 10), CASE WHEN g % 10 = 1 THEN NULL ELSE g - 1 END FROM generate_series(1, 40) g`,
+		// `other` happens to hold ids, but of rows in other tenants
+		`INSERT INTO ln_tree_bad SELECT g, 't' || ((g - 1) / 10), (g % 40) + 11 FROM generate_series(1, 40) g`,
+	} {
+		if _, err := conn.Exec(ctx, q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	defer conn.Exec(ctx, cleanup)
+
+	cat := NewCatalog(dsn)
+	cat.TenantColumns = []string{"tenant_id"}
+	if err := cat.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	h := &harness{s: &proxy.Session{ID: 1, User: "app", DB: "d"}}
+	h.a = New(Options{TenantColumns: []string{"tenant_id"}, KeyColumns: []string{"id"}, Catalog: cat}, h.record)
+	good := `SELECT c.* FROM ln_tree c WHERE c.tenant_id = 't1' AND EXISTS (SELECT 1 FROM ln_tree s WHERE s.up = c.id)`
+	bad := `SELECT c.* FROM ln_tree_bad c WHERE c.tenant_id = 't1' AND EXISTS (SELECT 1 FROM ln_tree_bad s WHERE s.other = c.id)`
+	if e := h.attributed(t, good); e.Source == SourceExplicit {
+		t.Fatalf("the subquery reads a table nothing confines yet: %+v", e)
+	}
+	h.attributed(t, bad)
+	cat.DrainSuggestions(15 * time.Second)
+	if e := h.attributed(t, good); e.Source != SourceExplicit || !reflect.DeepEqual(e.Tenants, []string{"t1"}) {
+		t.Errorf("after learning that up points at the same table: %+v", e)
+	}
+	if e := h.attributed(t, bad); e.Source == SourceExplicit {
+		t.Errorf("a column whose values match rows of other tenants is not a relationship: %+v", e)
+	}
+}

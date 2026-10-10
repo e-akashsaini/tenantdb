@@ -39,6 +39,8 @@ var dTables = map[string]*dtable{
 	"countries": {"countries", false, []dcol{{"code", "text"}, {"name", "text"}}},
 	// a credential table: no tenant column, a unique token, and an owner pointer that nothing names
 	"tokens": {"tokens", false, []dcol{{"id", "int"}, {"owner", "int"}, {"token", "text"}}},
+	// a tree: up points at folders.id (same tenant), under no name the naming rule would find
+	"folders": {"folders", true, []dcol{{"id", "int"}, {"tenant_id", "text"}, {"up", "int"}, {"label", "text"}}},
 	// ord points at orders.id but nothing in its name says so: only the joins reveal it
 	"shipments": {"shipments", true, []dcol{{"id", "int"}, {"tenant_id", "text"}, {"ord", "int"}, {"carrier", "text"}}},
 }
@@ -47,6 +49,7 @@ var dTables = map[string]*dtable{
 var dJoins = [][4]string{
 	{"orders", "customer_id", "customers", "id"}, {"items", "order_id", "orders", "id"},
 	{"shipments", "ord", "orders", "id"}, // a real relationship the naming rule cannot see
+	{"folders", "up", "folders", "id"},   // ... and a table that points at itself
 	{"items", "qty", "orders", "id"},     // NOT a relationship: equal values across tenants; must never be learned
 }
 
@@ -60,6 +63,8 @@ CREATE TABLE tdbdiff.countries (code text PRIMARY KEY, name text);
 CREATE TABLE tdbdiff.tokens (id bigint PRIMARY KEY, owner bigint, token text UNIQUE);
 INSERT INTO tdbdiff.tokens SELECT n, ((n*7)%48)+1, 'k'||n FROM generate_series(1,48) n;
 CREATE TABLE tdbdiff.shipments (id bigint PRIMARY KEY, tenant_id text, ord bigint, carrier text);
+CREATE TABLE tdbdiff.folders (id bigint PRIMARY KEY, tenant_id text, up bigint, label text);
+INSERT INTO tdbdiff.folders SELECT id, 't'||((id-1)/15), CASE WHEN id%15 = 1 THEN NULL ELSE id-1 END, 'f'||(id%5) FROM generate_series(1,60) id;
 INSERT INTO tdbdiff.shipments SELECT id, 't'||((id-1)/50), ((id-1)/50)*40 + (id%40) + 1, (ARRAY['dhl','ups'])[id%2+1] FROM generate_series(1,200) id;
 INSERT INTO tdbdiff.customers SELECT t*12+i, 't'||t, 'n'||i, 's'||(t*12+i), CASE WHEN i%2=0 THEN 'eu' ELSE 'us' END
   FROM generate_series(0,3) t, generate_series(1,12) i;
@@ -205,7 +210,7 @@ type dquery struct {
 }
 
 func (g *dgen) selectQuery() dquery {
-	names := []string{"customers", "orders", "items", "countries", "shipments"}
+	names := []string{"customers", "orders", "items", "countries", "shipments", "folders"}
 	switch g.r.Intn(14) {
 	case 12, 13: // x IN (SELECT y ...): the subquery's confinement may carry to the outer table
 		j := dJoins[g.r.Intn(len(dJoins))]
