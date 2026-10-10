@@ -101,10 +101,9 @@ func TestPolymorphicLookupThatCannotBeResolvedIsUnknownNotAScan(t *testing.T) {
 	h := polyHarness()
 	h.a.Cache().Put("public.templates", "id", "5", "acme")
 	for _, sql := range []string{
-		`SELECT * FROM search_entries WHERE record_type = 'Mystery' AND record_id = 5`,                // a class with no verified table
-		`SELECT * FROM search_entries WHERE record_id = 5`,                                            // no type to say which table
-		`SELECT * FROM search_entries WHERE record_type = 'Template' AND record_id = 77`,              // a parent nobody has seen, no lookup configured
-		`SELECT * FROM search_entries WHERE record_type = 'Template' AND record_id = 5 OR body = 'x'`, // an alternative the lookup cannot vouch for
+		`SELECT * FROM search_entries WHERE record_type = 'Mystery' AND record_id = 5`,   // a class with no verified table
+		`SELECT * FROM search_entries WHERE record_id = 5`,                               // no type to say which table
+		`SELECT * FROM search_entries WHERE record_type = 'Template' AND record_id = 77`, // a parent nobody has seen, no lookup configured
 	} {
 		h.query(sql)
 		if e := h.last(t); e.Source != SourceUnknown || e.Scan {

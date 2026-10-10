@@ -115,6 +115,7 @@ func (e *Extractor) stmtFor(text string, node *pg_query.Node) Stmt {
 		e.collect(node, vals, params)
 		st.Tenants, st.Params = sortedKeys(vals), sortedInts(params)
 		e.shape(node, &st)
+		st.Q = e.buildQuery(node)
 		st.Tables, st.Funcs, st.Calls = e.tablesOf(node)
 		st.Filtered = e.filtered(node)
 		if sv := e.selectSetConfig(node); sv != nil {

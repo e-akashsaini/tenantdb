@@ -134,6 +134,9 @@ func (e *Extractor) shape(n *pg_query.Node, st *Stmt) {
 	case *pg_query.Node_InsertStmt:
 		if v.InsertStmt.Relation != nil && v.InsertStmt.WithClause == nil {
 			st.Table = relRef(v.InsertStmt.Relation)
+			if sel := v.InsertStmt.SelectStmt.GetSelectStmt(); sel != nil {
+				st.InsertRows = len(sel.ValuesLists)
+			}
 			st.Inserts = e.insertRows(v.InsertStmt)
 			st.RawInserts = e.rawInsertRows(v.InsertStmt)
 		}
@@ -328,7 +331,7 @@ func (e *Extractor) insertRows(s *pg_query.InsertStmt) []InsRow {
 				r.Keys = append(r.Keys, KeyOp{Col: name, Op: e.operand(items.Items[i])})
 			}
 		}
-		if r.Tenant.Set && len(r.Keys) > 0 {
+		if r.Tenant.Set {
 			out = append(out, r)
 		}
 	}

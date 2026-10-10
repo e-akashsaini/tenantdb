@@ -27,6 +27,11 @@ type Stmt struct {
 
 	// Row-cache inputs, filled only for statements that touch a single table.
 	Table TableRef // zero value when not a single-table statement
+	// Q is the structural model of the tables the statement reads and the
+	// conditions over them: what decides which tenants it is confined to.
+	Q *QueryNode
+	// InsertRows counts the VALUES rows of an INSERT, to tell whether every row names a tenant.
+	InsertRows int
 	// Aliases maps the name or alias a column can be qualified with to its table,
 	// for SELECT/UPDATE/DELETE, so `submissions.id = 5` can be tied to a table in a join.
 	Aliases map[string]TableRef

@@ -1,6 +1,8 @@
 package attrib
 
 import (
+	"io"
+	"log/slog"
 	"strings"
 
 	"github.com/akashsaini/tenantdb/internal/proxy"
@@ -69,3 +71,5 @@ func specHarness(sp catSpec, opt StrictOptions) *harness {
 	h.a = New(Options{TenantColumns: []string{"tenant_id"}, KeyColumns: []string{"id"}, Catalog: sp.build(), Strict: opt}, h.record)
 	return h
 }
+
+func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }

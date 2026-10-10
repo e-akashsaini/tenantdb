@@ -559,14 +559,17 @@ type analysis struct {
 	unsure        bool     // touches something the proxy cannot vouch for
 	scan          bool     // tenant data with no tenant or key filter at all
 	unresolvedFn  bool     // a called function reads tenant data nothing says the tenant of
-	tenants       []string // tenants named by the statement, or by its function calls' arguments
+	tenants       []string // tenants the statement is confined to (itself, or through its function calls' arguments)
 	derived       []string // tenants whose data a temporary table holds
+	unconfined    bool     // a tenant table is read that nothing confines: no set of tenants can vouch for the statement
+	cr            confResult
 }
 
 func (r *analysis) merge(o analysis) {
 	r.tenantTouched = r.tenantTouched || o.tenantTouched
 	r.unsure = r.unsure || o.unsure
 	r.scan = r.scan || o.scan
+	r.unconfined = r.unconfined || o.unconfined
 	r.unresolvedFn = r.unresolvedFn || o.unresolvedFn
 	r.tenants = append(r.tenants, o.tenants...)
 	r.derived = append(r.derived, o.derived...)
@@ -597,7 +600,22 @@ const maxCallDepth = 6
 // the tenant the caller passed. Dynamic SQL cannot be read and stays unsure.
 func (a *Attributor) analyze(st *state, x Stmt, pt *portal, depth int) analysis {
 	var r analysis
-	r.tenants = tenantValues(x, pt)
+	r.cr = a.confine(st, x, pt, nil)
+	switch {
+	case x.Insert:
+		// The tenants are those of the rows being written, and every row must name one.
+		r.tenants = insertTenants(x, pt)
+		if r.cr.tenantOccs > 0 && !r.cr.confined {
+			r.tenants, r.unconfined = nil, true
+		}
+	case r.cr.tenantOccs > 0 && !r.cr.confined:
+		r.unconfined = true
+	case r.cr.confined && r.cr.tenantOccs > 0:
+		r.tenants = r.cr.tenants
+	}
+	if a.assignsTenant(x) {
+		r.tenants, r.unconfined = nil, true // rows may move to a tenant the statement does not name
+	}
 	if a.cat == nil || !a.cat.Loaded() {
 		// Without the schema nothing can be vouched for.
 		r.unsure = true
@@ -626,7 +644,7 @@ func (a *Attributor) analyze(st *state, x Stmt, pt *portal, depth int) analysis 
 	}
 	if direct {
 		r.tenantTouched = true
-		r.scan = !x.Filtered && !x.Insert && !a.identifies(st, x)
+		r.scan = r.cr.scan
 	}
 	path := a.pathOf(st)
 	for _, c := range x.Calls {
@@ -703,21 +721,32 @@ func (a *Attributor) funcBody(def *FuncDef) *FuncBody {
 	return b
 }
 
-// tenantValues returns the tenant values a statement names itself: literals,
-// bound parameters and INSERT rows.
-func tenantValues(x Stmt, pt *portal) []string {
-	out := append([]string(nil), x.Tenants...)
-	for _, n := range x.Params {
-		if v, ok := pt.resolve(Operand{Param: n, Set: true}); ok {
-			out = append(out, v)
-		}
+// insertTenants returns the tenants an INSERT writes rows for. Every row must
+// name one, as a literal or a bound value; otherwise nothing is claimed.
+func insertTenants(x Stmt, pt *portal) []string {
+	if len(x.Inserts) == 0 || len(x.Inserts) != x.InsertRows {
+		return nil
 	}
+	var out []string
 	for _, r := range x.Inserts {
-		if v, ok := pt.resolve(r.Tenant); ok {
-			out = append(out, v)
+		v, ok := pt.resolve(r.Tenant)
+		if !ok {
+			return nil
 		}
+		out = append(out, v)
 	}
 	return dedupe(out)
+}
+
+// assignsTenant: does an UPDATE set the tenant column? The rows then move to a
+// tenant the statement's own predicates say nothing about.
+func (a *Attributor) assignsTenant(x Stmt) bool {
+	for _, c := range x.SetCols {
+		if a.tenants[c] {
+			return true
+		}
+	}
+	return false
 }
 
 // registerTemp remembers a temporary table once its CREATE succeeded.
@@ -842,10 +871,15 @@ func (a *Attributor) handle(s *proxy.Session, st *state, x Stmt, pt *portal) {
 	p.dropTable = x.SetsKey || a.assignsKey(ti, x)
 
 	r := a.analyze(st, x, pt, 0)
+	catalog := a.cat != nil && a.cat.Loaded()
+	// Can the tenants found be trusted for the whole statement? Not if a tenant
+	// table is read unconfined, a function reads tenant data nothing attributes, or
+	// something it touches cannot be vouched for (an unknown table, a view that
+	// hides its tenant column, ...).
+	sound := !r.unresolvedFn && !(r.unsure && catalog) // nothing in it is beyond the proxy's sight
+	trusted := sound && !r.unconfined
 	tenants := dedupe(r.tenants)
-	if r.unresolvedFn {
-		// A function in this statement reads tenant data nothing attributes, so
-		// the tenants the statement does name cannot vouch for all of it.
+	if !trusted {
 		tenants = nil
 	}
 	if x.Temp != nil {
@@ -878,32 +912,55 @@ func (a *Attributor) handle(s *proxy.Session, st *state, x Stmt, pt *portal) {
 	sc := r.scope()
 	ev := Event{SessionID: s.ID, User: s.User, DB: s.DB, SQL: x.SQL, Scan: r.scan, Tables: a.tableNames(st, x)}
 
+	// The statement's own tenants are trustworthy, and either name some, or the
+	// predicates contradict each other so it reads nothing at all.
+	confinedToNothing := trusted && !x.Insert && r.cr.confined && r.cr.tenantOccs > 0 && len(tenants) == 0
+
 	switch {
-	case len(tenants) > 0:
-		ev.Tenants, ev.Source = tenants, SourceExplicit
+	case len(tenants) > 0 || confinedToNothing:
+		claimEvent(&ev, tenants, r.cr, x.Insert)
 	case sc == scopeUntenanted:
 		ev.Source = SourceUntenanted
 	case sc == scopeDerived:
 		ev.Tenants, ev.Source = dedupe(r.derived), SourceDerived
-	default:
-		have, need, ok := a.keyTenants(st, p.table, x, pt)
-		switch {
-		case ok && len(need) == 0:
-			ev.Tenants, ev.Source = have, SourceCache
-		case ok && a.lk != nil && sc == scopeTenant && len(need) <= maxLookupKeys && a.lookupable(need):
-			// Ask the database, off the query path; the event is emitted when
-			// the answer arrives.
-			if a.strict == StrictBlock {
-				// The decision must be made before the statement is forwarded.
-				found, failed := a.lookupMissing(have, need)
-				a.finishLookup(st, ev, found, failed, true)
-			} else {
-				go a.resolveAsync(st, ev, have, need, st.txnGen)
-			}
-			return
+	case sound && len(r.cr.needs) > 0 && a.lk != nil && sc == scopeTenant && len(r.cr.needs) <= maxLookupKeys && a.lookupable(r.cr.needs):
+		// Some rows' owners are not cached. Ask the database, off the query path;
+		// the event is emitted when the answer arrives.
+		if a.strict == StrictBlock {
+			// The decision must be made before the statement is forwarded.
+			owners, failed := a.lookupOwners(r.cr.needs)
+			a.finishLookup(st, ev, x, pt, owners, failed, true)
+		} else {
+			gen := st.txnGen
+			needs := r.cr.needs
+			go func() {
+				owners, failed := a.lookupOwners(needs)
+				st.mu.Lock()
+				defer st.mu.Unlock()
+				// If the transaction ended while we waited, its tenant no longer applies.
+				a.finishLookup(st, ev, x, pt, owners, failed, gen == st.txnGen)
+			}()
 		}
+		return
 	}
 	a.settle(st, &ev, true)
+}
+
+// claimEvent fills in an event for a statement whose tenants are known.
+func claimEvent(ev *Event, tenants []string, cr confResult, insert bool) {
+	if len(tenants) > 0 {
+		ev.Tenants = tenants
+	}
+	switch {
+	case len(tenants) == 0:
+		ev.Source = SourceNoMatch // its predicates leave no row it could read
+	case !insert && cr.viaLookup:
+		ev.Source = SourceLookup
+	case !insert && cr.viaKeys:
+		ev.Source = SourceCache
+	default:
+		ev.Source = SourceExplicit
+	}
 }
 
 // lookupable: every row can be asked about, and the database role sees all of it.
@@ -916,43 +973,33 @@ func (a *Attributor) lookupable(need []keyReq) bool {
 	return true
 }
 
-// resolveAsync finishes an event whose rows were not all cached by asking the
-// database for the missing ones, without holding up the query.
-func (a *Attributor) resolveAsync(st *state, ev Event, have []string, need []keyReq, gen uint64) {
-	found, failed := a.lookupMissing(have, need)
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	// If the transaction ended while we waited, its tenant no longer applies.
-	a.finishLookup(st, ev, found, failed, gen == st.txnGen)
-}
-
-// lookupMissing asks the database about the keys the cache did not have. It
-// takes no locks. failed is set if any lookup errored.
-func (a *Attributor) lookupMissing(have []string, need []keyReq) (found []string, failed bool) {
+// lookupOwners asks the database who owns the rows the cache did not know. It
+// takes no locks. A row whose lookup failed is simply absent from the result,
+// so it is never mistaken for a row that does not exist.
+func (a *Attributor) lookupOwners(need []keyReq) (owners ownerSet, failed bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), lookupTimeout)
 	defer cancel()
-	found = append([]string(nil), have...)
+	owners = ownerSet{}
 	for _, k := range need {
 		ts, err := a.lk.tenants(ctx, k.ti, k.tcol, k.col, k.val)
 		if err != nil {
 			failed = true
 			continue
 		}
+		owners[ownerKey{k.ti.Key(), k.col, normVal(k.val)}] = ts
 		if len(ts) == 1 {
 			a.cache.Put(k.ti.Key(), k.col, k.val, ts[0])
 		}
-		found = append(found, ts...)
 	}
-	return dedupe(found), failed
+	return owners, failed
 }
 
-// finishLookup turns lookup results into the event's source. st.mu must be held.
-func (a *Attributor) finishLookup(st *state, ev Event, found []string, failed bool, txnOK bool) {
-	switch {
-	case len(found) > 0:
-		ev.Tenants, ev.Source = found, SourceLookup
-	case !failed:
-		ev.Source = SourceNoMatch
+// finishLookup re-reads the statement with the owners the database named.
+// st.mu must be held.
+func (a *Attributor) finishLookup(st *state, ev Event, x Stmt, pt *portal, owners ownerSet, failed bool, txnOK bool) {
+	cr := a.confine(st, x, pt, owners)
+	if cr.confined && cr.tenantOccs > 0 {
+		claimEvent(&ev, cr.tenants, cr, false)
 	}
 	a.settle(st, &ev, txnOK)
 }
@@ -1011,101 +1058,6 @@ func (a *Attributor) target(ti *TableInfo, col string) (tgt *TableInfo, tcol, pc
 		}
 	}
 	return nil, "", "", false
-}
-
-// predTable finds the table a predicate's column belongs to: the one its
-// qualifier names (users.id, u.id), or the statement's only table. An
-// unqualified column in a join could be either table, so it names none.
-func (a *Attributor) predTable(st *state, x Stmt, pr Pred) (*TableInfo, bool) {
-	var ref TableRef
-	switch {
-	case pr.Qual != "":
-		r, ok := x.Aliases[pr.Qual]
-		if !ok {
-			return nil, false
-		}
-		ref = r
-	case x.Table.Name != "":
-		ref = x.Table
-	default:
-		return nil, false
-	}
-	ti, tmp, ok := a.tableFor(st, ref)
-	if !ok || tmp != nil || ti == nil {
-		return nil, false
-	}
-	return ti, true
-}
-
-// identifies reports whether a statement looks rows up by something that
-// belongs to one tenant (a unique column, or a foreign key to a parent row),
-// as opposed to reading tenant data wholesale. Such a statement is not a scan,
-// whether or not its tenant could be worked out.
-func (a *Attributor) identifies(st *state, x Stmt) bool {
-	for _, pr := range x.Keys {
-		if ti, ok := a.predTable(st, x, pr); ok {
-			if _, _, _, ok := a.target(ti, pr.Col); ok || ti.HasPolyID(pr.Col) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// keyTenants resolves a statement's lookups through the row cache. ok is false
-// if no predicate identifies a row. need lists the rows not cached yet. A
-// predicate that identifies nothing (WHERE status = 'open') is skipped, unless
-// the clause has an OR: then it is an alternative the others cannot vouch for.
-func (a *Attributor) keyTenants(st *state, table string, x Stmt, pt *portal) (have []string, need []keyReq, ok bool) {
-	if len(x.Keys) == 0 {
-		return nil, nil, false
-	}
-	catalog := a.cat != nil && a.cat.Loaded()
-	n, skipped := 0, false
-	for _, pr := range x.Keys {
-		var tgt *TableInfo
-		var tcol, pcol, ckey string
-		if catalog {
-			pti, found := a.predTable(st, x, pr)
-			if !found {
-				skipped = true
-				continue
-			}
-			if tgt, tcol, pcol, found = a.target(pti, pr.Col); !found {
-				if tgt, tcol, pcol, found = a.polyTarget(st, x, pti, pr, pt); !found {
-					// record_type = 'X' only qualifies its record_id; it is not an alternative.
-					if !a.polyTypePart(x, pti, pr) {
-						skipped = true
-					}
-					continue
-				}
-			}
-			ckey = tgt.Key()
-		} else {
-			// No catalog: only the configured key columns, on a single table.
-			if table == "" || !a.keyUsable(nil, pr.Col) {
-				skipped = true
-				continue
-			}
-			ckey, pcol = table, pr.Col
-		}
-		for _, o := range pr.Ops {
-			v, resolved := pt.resolve(o)
-			if !resolved {
-				return nil, nil, false
-			}
-			n++
-			if t, hit := a.cache.Get(ckey, pcol, v); hit {
-				have = append(have, t)
-			} else {
-				need = append(need, keyReq{col: pcol, val: v, ti: tgt, tcol: tcol})
-			}
-		}
-	}
-	if x.Or && skipped {
-		return nil, nil, false
-	}
-	return dedupe(have), need, n > 0
 }
 
 // applySet records changes to the variables the attributor cares about.
@@ -1304,52 +1256,6 @@ func (a *Attributor) tableNames(st *state, x Stmt) []string {
 func (a *Attributor) assignsKey(ti *TableInfo, x Stmt) bool {
 	for _, c := range x.SetCols {
 		if a.tenants[c] || (ti != nil && ti.IsUnique(c)) {
-			return true
-		}
-	}
-	return false
-}
-
-// polyTarget resolves `X_type = 'Class' AND X_id = n`: the class names the parent
-// table (verified against real rows), and n is a row of it.
-func (a *Attributor) polyTarget(st *state, x Stmt, ti *TableInfo, pr Pred, pt *portal) (tgt *TableInfo, tcol, pcol string, ok bool) {
-	base, found := strings.CutSuffix(pr.Col, "_id")
-	if !found || a.cat == nil || !ti.HasPolyID(pr.Col) {
-		return nil, "", "", false
-	}
-	for _, sib := range x.Keys {
-		if sib.Col != base+"_type" || sib.Qual != pr.Qual || len(sib.Ops) != 1 {
-			continue
-		}
-		class, resolved := pt.resolve(sib.Ops[0])
-		if !resolved {
-			return nil, "", "", false
-		}
-		ref, verified := a.cat.Poly(ti, base, class)
-		if !verified {
-			return nil, "", "", false
-		}
-		parent, found := a.cat.TableByKey(ref.ParentKey)
-		if !found {
-			return nil, "", "", false
-		}
-		tc, _ := a.scopeOf(parent)
-		if tc == "" {
-			return nil, "", "", false
-		}
-		return parent, tc, ref.ParentCol, true
-	}
-	return nil, "", "", false
-}
-
-// polyTypePart: is pr the X_type half of a pair whose X_id is also in the statement?
-func (a *Attributor) polyTypePart(x Stmt, ti *TableInfo, pr Pred) bool {
-	base, found := strings.CutSuffix(pr.Col, "_type")
-	if !found || !ti.HasPolyID(base+"_id") {
-		return false
-	}
-	for _, sib := range x.Keys {
-		if sib.Col == base+"_id" && sib.Qual == pr.Qual {
 			return true
 		}
 	}
