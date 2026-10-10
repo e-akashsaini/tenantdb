@@ -25,7 +25,7 @@ const suggestQueue = 256
 // SuggestFK offers a candidate foreign key child.ccol -> parent.pcol, as seen in
 // a join condition. It returns at once; the check runs in the background.
 func (c *Catalog) SuggestFK(child *TableInfo, ccol string, parent *TableInfo, pcol string) {
-	if c == nil || c.dsn == "" || len(c.TenantColumns) == 0 || child == nil || parent == nil || child == parent ||
+	if c == nil || c.dsn == "" || len(c.TenantColumns) == 0 || child == nil || parent == nil || (child == parent && ccol == pcol) ||
 		child.Schema == "pg_temp" || parent.Schema == "pg_temp" || !parent.IsUnique(pcol) {
 		return
 	}
