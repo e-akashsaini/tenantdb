@@ -38,7 +38,7 @@ func limitsSpec() catSpec {
 			fn("fixed_tenant", "sql", `SELECT * FROM orders WHERE tenant_id = 'acme'`),
 			fn("outer_fn", "sql", `SELECT * FROM orders_of(p_tenant)`, "p_tenant"),
 			fn("two_tenants", "sql", `SELECT * FROM orders WHERE tenant_id = a UNION ALL SELECT * FROM orders WHERE tenant_id = b`, "a", "b"),
-			fn("dyn", "plpgsql", `BEGIN EXECUTE 'SELECT 1'; END`),
+			fn("dyn", "plpgsql", `DECLARE q text := 'select 1'; BEGIN EXECUTE q; END`),
 			fn("py", "plpython3u", `return 1`),
 			proc,
 		},
@@ -127,8 +127,12 @@ func TestDoBlocks(t *testing.T) {
 		t.Errorf("unfiltered DO: %+v", e)
 	}
 	h.query(`DO $$ BEGIN EXECUTE 'DELETE FROM orders'; END $$`)
+	if e := h.last(t); e.Source != SourceScan {
+		t.Errorf("a literal EXECUTE is read: %+v", e)
+	}
+	h.query(`DO $$ DECLARE t text := 'orders'; BEGIN EXECUTE 'DELETE FROM ' || t; END $$`)
 	if e := h.last(t); e.Source != SourceUnknown {
-		t.Errorf("dynamic DO: %+v", e)
+		t.Errorf("computed dynamic DO: %+v", e)
 	}
 }
 

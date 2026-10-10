@@ -24,6 +24,14 @@ CREATE FUNCTION tdbdiff.plpg_orders(p text) RETURNS SETOF tdbdiff.orders LANGUAG
   BEGIN RETURN QUERY SELECT * FROM tdbdiff.orders WHERE tenant_id = p; END $$;
 CREATE FUNCTION tdbdiff.dyn_orders(p text) RETURNS SETOF tdbdiff.orders LANGUAGE plpgsql AS $$
   BEGIN RETURN QUERY EXECUTE 'SELECT * FROM tdbdiff.orders WHERE tenant_id = ' || quote_literal(p); END $$;
+CREATE FUNCTION tdbdiff.lit_fmt(p text) RETURNS SETOF tdbdiff.orders LANGUAGE plpgsql AS $$
+  BEGIN RETURN QUERY EXECUTE format('SELECT * FROM tdbdiff.orders WHERE tenant_id = %L', p); END $$;
+CREATE FUNCTION tdbdiff.lit_using(p text) RETURNS SETOF tdbdiff.orders LANGUAGE plpgsql AS $$
+  BEGIN RETURN QUERY EXECUTE 'SELECT * FROM tdbdiff.orders WHERE tenant_id = $1' USING p; END $$;
+CREATE FUNCTION tdbdiff.lit_all() RETURNS SETOF tdbdiff.orders LANGUAGE plpgsql AS $$
+  BEGIN RETURN QUERY EXECUTE 'SELECT * FROM tdbdiff.orders'; END $$;
+CREATE FUNCTION tdbdiff.lit_or(p text) RETURNS SETOF tdbdiff.orders LANGUAGE plpgsql AS $$
+  BEGIN RETURN QUERY EXECUTE format('SELECT * FROM tdbdiff.orders WHERE tenant_id = %L OR amount > 90', p); END $$;
 CREATE VIEW tdbdiff.orders_v AS SELECT * FROM tdbdiff.orders;
 CREATE VIEW tdbdiff.order_amounts AS SELECT id, amount FROM tdbdiff.orders;
 ` + diffViewSQL
@@ -158,9 +166,13 @@ func (g *dgen) viewQuery() dquery {
 // extraQuery generates one of the statement shapes above.
 func (g *dgen) extraQuery() dquery {
 	tid := func() string { return g.tid() }
-	switch g.r.Intn(19) {
+	switch g.r.Intn(21) {
 	case 16, 17, 18:
 		return g.viewQuery()
+	case 19:
+		return fnQuery(g.pick(fmt.Sprintf("tdbdiff.lit_fmt(%s)", tid()), fmt.Sprintf("tdbdiff.lit_using(%s)", tid()), "tdbdiff.lit_all()", fmt.Sprintf("tdbdiff.lit_or(%s)", tid())), g)
+	case 20:
+		return fnQuery(g.pick(fmt.Sprintf("tdbdiff.lit_fmt(%s)", tid()), fmt.Sprintf("tdbdiff.lit_using(%s)", tid())), g)
 	case 0:
 		f := fmt.Sprintf("tdbdiff.orders_of(%s)", tid())
 		return fnQuery(f, g)
