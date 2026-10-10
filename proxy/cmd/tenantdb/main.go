@@ -56,6 +56,7 @@ func main() {
 		adminPprof   = flag.Bool("admin-pprof", false, "also serve /debug/pprof on the admin address")
 		drainTimeout = flag.Duration("shutdown-timeout", 30*time.Second, "on SIGTERM/SIGINT: how long clients get to finish before their connections are closed (idle ones are sent away at once; a second signal stops immediately)")
 		configFile   = flag.String("config", env("TENANTDB_CONFIG", ""), "file of `name: value` settings, one per flag; the command line overrides it, it overrides environment variables")
+		cacheVerify  = flag.Float64("cache-verify", 0, "fraction (0 to 1) of cache hits re-checked against the database in the background; a cached owner that no longer matches is evicted and reported. Bounds how long a missed delete can mislead (needs -schema-dsn; 0 is off)")
 		scramCB      = flag.String("scram-channel-binding", env("TENANTDB_SCRAM_CHANNEL_BINDING", "auto"), "SCRAM-SHA-256-PLUS (channel binding) cannot pass through a proxy that ends TLS. auto: hide it from clients not using TLS to the proxy, offer it to those that are (works if the proxy has the database's certificate); strip: never offer it; passthrough: always offer it")
 		showVersion  = flag.Bool("version", false, "print the version and exit")
 	)
@@ -106,6 +107,10 @@ func main() {
 		os.Exit(2)
 	}
 
+	if *cacheVerify < 0 || *cacheVerify > 1 {
+		log.Error("bad -cache-verify (want a fraction from 0 to 1)", "value", *cacheVerify)
+		os.Exit(2)
+	}
 	if *scramCB != "auto" && *scramCB != "strip" && *scramCB != "passthrough" {
 		log.Error("bad -scram-channel-binding (want auto, strip or passthrough)", "value", *scramCB)
 		os.Exit(2)
@@ -217,6 +222,10 @@ func main() {
 		KeyColumns:    strings.Split(*keyCols, ","),
 		CacheSize:     *cacheSize,
 		CacheTTL:      *cacheTTL,
+		CacheVerify:   *cacheVerify,
+		OnStale: func(table, col, cached string, actual []string) {
+			log.Warn("a cached row owner no longer matches the database and was evicted", "table", table, "column", col, "cached", cached, "actual", actual)
+		},
 	}, func(e attrib.Event) {
 		o.event(e)
 		attrs := []any{"session", e.SessionID, "user", e.User, "db", e.DB,

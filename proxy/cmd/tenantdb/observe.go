@@ -166,6 +166,8 @@ func (o *observability) bind(srv *proxy.Server, a *attrib.Attributor, cat *attri
 	r.NewCounterFunc("tenantdb_cache_hits_total", "Row owners answered from the cache.", func() float64 { return float64(a.Stats().CacheHits) })
 	r.NewCounterFunc("tenantdb_cache_misses_total", "Row owners the cache did not know.", func() float64 { return float64(a.Stats().CacheMisses) })
 	r.NewCounterFunc("tenantdb_lookups_total", "Row owners asked of the database.", func() float64 { return float64(a.Stats().Lookups) })
+	r.NewCounterFunc("tenantdb_cache_verifications_total", "Cache hits re-checked against the database (-cache-verify).", func() float64 { return float64(a.Stats().Verifications) })
+	r.NewCounterFunc("tenantdb_cache_stale_total", "Cached row owners found to disagree with the database and evicted.", func() float64 { return float64(a.Stats().StaleFound) })
 	r.NewCounterFunc("tenantdb_lookup_failures_total", "Row-owner lookups that failed.", func() float64 { return float64(a.Stats().LookupFailures) })
 	if cat != nil {
 		r.NewGaugeFunc("tenantdb_schema_loaded", "1 once the schema has been read.", func() float64 {
