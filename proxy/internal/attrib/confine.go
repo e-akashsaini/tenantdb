@@ -84,6 +84,14 @@ type confResult struct {
 	needs     []keyReq            // rows whose owner was not cached; a lookup could settle them
 	viaKeys   bool                // some confinement came from a row's owner
 	viaLookup bool                // ... and some of those owners came from asking the database
+	hits      []cacheHit          // owners that came from the cache (for -cache-verify)
+}
+
+// cacheHit is an owner the cache supplied: a candidate for re-checking against the database.
+type cacheHit struct {
+	ti          *TableInfo
+	tcol, col   string
+	val, tenant string
 }
 
 type occRes struct {
@@ -136,6 +144,7 @@ type confEval struct {
 	needSeen   map[ownerKey]bool
 	viaKeys    bool
 	viaLookup  bool
+	hits       []cacheHit
 }
 
 // confine works out what statement x is confined to. owners, if non-nil, holds
@@ -617,6 +626,7 @@ func (ev *confEval) ownersIn(tgt *TableInfo, tcol, pcol string, vals []string) (
 		if t, hit := ev.a.cache.Get(tgt.Key(), pcol, v); hit {
 			set.m[t] = true
 			ev.viaKeys = true
+			ev.hits = append(ev.hits, cacheHit{tgt, tcol, pcol, v, t})
 			continue
 		}
 		all = false
@@ -679,7 +689,7 @@ func (ev *confEval) poly(c *Cond, out *condOut) {
 
 func (ev *confEval) result() confResult {
 	r := confResult{confined: true, needs: ev.needs, viaKeys: ev.viaKeys, viaLookup: ev.viaLookup,
-		unsure: ev.unsure, expanded: ev.expanded}
+		unsure: ev.unsure, expanded: ev.expanded, hits: ev.hits}
 	var all *tset
 	for id, o := range ev.occ {
 		if !o.tenant {

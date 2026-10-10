@@ -29,6 +29,7 @@ func runAnalyze(args []string) int {
 		allowScan  = fs.String("strict-allow-scan", "", "comma-separated roles allowed to read across all tenants")
 		tagVar     = fs.String("tag-var", "tenantdb.tenant", "session variable a connection sets to declare its tenant")
 		warm       = fs.Bool("warm", true, "fill the row cache from the database before replaying, so statements that name a row by id can be attributed")
+		learn      = fs.Bool("learn", true, "replay the workload twice: first to learn which joins are foreign keys the schema does not declare (checked against the data), then to report")
 		lookup     = fs.Bool("lookup", true, "resolve rows missing from the cache by asking the database")
 		asJSON     = fs.Bool("json", false, "write the full report as JSON")
 		top        = fs.Int("top", 20, "how many query shapes to list")
@@ -88,20 +89,41 @@ flags:`)
 			defer lk.Close()
 		}
 	}
-	run := analyze.NewRunner(analyze.Options{
-		User: *user, DB: *db, Lookup: lk,
-		Attrib: attrib.Options{
-			TenantColumns: strings.Split(*tenantCols, ","),
-			KeyColumns:    strings.Split(*keyCols, ","),
-			Catalog:       cat,
-			TagVar:        *tagVar,
-			Strict: attrib.StrictOptions{
-				Mode:      attrib.StrictAlert,
-				Exempt:    strings.Split(*exempt, ","),
-				AllowScan: strings.Split(*allowScan, ","),
+	newRun := func(lk *attrib.Lookup) *analyze.Runner {
+		return analyze.NewRunner(analyze.Options{
+			User: *user, DB: *db, Lookup: lk,
+			Attrib: attrib.Options{
+				TenantColumns: strings.Split(*tenantCols, ","),
+				KeyColumns:    strings.Split(*keyCols, ","),
+				Catalog:       cat,
+				TagVar:        *tagVar,
+				Strict: attrib.StrictOptions{
+					Mode:      attrib.StrictAlert,
+					Exempt:    strings.Split(*exempt, ","),
+					AllowScan: strings.Split(*allowScan, ","),
+				},
 			},
-		},
-	})
+		})
+	}
+	var all []analyze.Entry
+	for _, name := range files {
+		entries, code := readWorkload(name, f)
+		if code != 0 {
+			return code
+		}
+		all = append(all, entries...)
+	}
+	if *learn {
+		// First pass: the joins the application runs reveal relationships (a.x = b.y
+		// with b.y unique) that the schema does not declare. They are checked against
+		// the data in the background; the second pass uses the ones that hold.
+		first := newRun(nil)
+		for _, e := range all {
+			first.Feed(e)
+		}
+		cat.DrainSuggestions(2 * time.Minute)
+	}
+	run := newRun(lk)
 	if *warm {
 		wctx, wcancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -110,36 +132,8 @@ flags:`)
 		}
 		wcancel()
 	}
-	for _, name := range files {
-		var r io.Reader = os.Stdin
-		if name != "-" {
-			fh, err := os.Open(name)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "tenantdb analyze:", err)
-				return 1
-			}
-			defer fh.Close()
-			r = fh
-		}
-		ff := f
-		if ff == analyze.FormatAuto {
-			switch {
-			case strings.HasSuffix(name, ".sql"):
-				ff = analyze.FormatSQL
-			case strings.HasSuffix(name, ".csv"):
-				ff = analyze.FormatStatements
-			case strings.HasSuffix(name, ".log"):
-				ff = analyze.FormatLog
-			}
-		}
-		entries, err := analyze.Read(r, ff)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "tenantdb analyze: %s: %v\n", name, err)
-			return 1
-		}
-		for _, e := range entries {
-			run.Feed(e)
-		}
+	for _, e := range all {
+		run.Feed(e)
 	}
 	rep := run.Report()
 	if *asJSON {
@@ -151,4 +145,35 @@ flags:`)
 	}
 	rep.Text(os.Stdout, *top)
 	return 0
+}
+
+// readWorkload reads one workload file ("-" is standard input).
+func readWorkload(name string, f analyze.Format) ([]analyze.Entry, int) {
+	var r io.Reader = os.Stdin
+	if name != "-" {
+		fh, err := os.Open(name)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "tenantdb analyze:", err)
+			return nil, 1
+		}
+		defer fh.Close()
+		r = fh
+	}
+	ff := f
+	if ff == analyze.FormatAuto {
+		switch {
+		case strings.HasSuffix(name, ".sql"):
+			ff = analyze.FormatSQL
+		case strings.HasSuffix(name, ".csv"):
+			ff = analyze.FormatStatements
+		case strings.HasSuffix(name, ".log"):
+			ff = analyze.FormatLog
+		}
+	}
+	entries, err := analyze.Read(r, ff)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "tenantdb analyze:", name+":", err)
+		return nil, 1
+	}
+	return entries, 0
 }

@@ -89,6 +89,14 @@ type Options struct {
 	// e.g. `SET tenantdb.tenant = 'acme'` or the startup option
 	// `-c tenantdb.tenant=acme`. Default "tenantdb.tenant".
 	TagVar string
+	// CacheVerify is the fraction (0 to 1) of cache hits that are re-checked
+	// against the database in the background. A hit that disagrees (the row was
+	// deleted and its key reused, or moved to another tenant by something the
+	// proxy did not see) is evicted and reported to OnStale. 0 turns it off.
+	CacheVerify float64
+	// OnStale is called, from a background goroutine, with the owner the cache
+	// held and what the database says.
+	OnStale func(table, col, cached string, actual []string)
 	// CacheTTL bounds how long a cached row owner is trusted (0: forever). Row
 	// owners almost never change, but a delete the proxy did not see (a
 	// cascade, another path to the database) followed by key reuse would
@@ -123,6 +131,10 @@ type Attributor struct {
 	fgen uint64
 
 	lookups, lookupFailures atomic.Uint64
+	verifyRate              float64
+	onStale                 func(table, col, cached string, actual []string)
+	verifies, stale         atomic.Uint64
+	verifyN                 atomic.Uint64
 	fcache                  map[*FuncDef]*FuncBody
 	tcache                  map[*FuncDef]*FuncBody // trigger functions, read with NEW/OLD bound
 }
@@ -132,13 +144,15 @@ type Stats struct {
 	CacheEntries, BridgeEntries int
 	CacheHits, CacheMisses      uint64
 	Lookups, LookupFailures     uint64
+	Verifications, StaleFound   uint64
 }
 
 // Stats returns the row cache and lookup counters.
 func (a *Attributor) Stats() Stats {
 	h, m := a.cache.Counts()
 	return Stats{CacheEntries: a.cache.Len(), BridgeEntries: a.bridge.Len(), CacheHits: h, CacheMisses: m,
-		Lookups: a.lookups.Load(), LookupFailures: a.lookupFailures.Load()}
+		Lookups: a.lookups.Load(), LookupFailures: a.lookupFailures.Load(),
+		Verifications: a.verifies.Load(), StaleFound: a.stale.Load()}
 }
 
 func New(opt Options, onEvent func(Event)) *Attributor {
@@ -151,6 +165,7 @@ func New(opt Options, onEvent func(Event)) *Attributor {
 		tagVar:  strings.ToLower(opt.TagVar),
 	}
 	a.bridge = NewRowCacheTTL(opt.CacheSize, bridgeTTL(opt.CacheTTL))
+	a.verifyRate, a.onStale = opt.CacheVerify, opt.OnStale
 	a.strict = opt.Strict.Mode
 	if a.strict == "" {
 		a.strict = StrictOff
@@ -1039,6 +1054,8 @@ func (a *Attributor) handle(s *proxy.Session, st *state, x Stmt, pt *portal) {
 		}
 	}
 
+	a.verifyHits(r.cr.hits)
+
 	sc := r.scope()
 	ev := Event{SessionID: s.ID, User: s.User, DB: s.DB, SQL: x.SQL, Scan: r.scan, Tables: a.tableNames(st, x)}
 
@@ -1094,6 +1111,40 @@ func claimEvent(ev *Event, tenants []string, cr confResult, insert bool) {
 		ev.Source = SourceCache
 	default:
 		ev.Source = SourceExplicit
+	}
+}
+
+// verifyHits re-checks a sample of the owners the cache supplied. The sampling
+// is deterministic (every 1/rate-th hit), so behaviour does not depend on chance;
+// the check runs in the background and never delays the statement.
+func (a *Attributor) verifyHits(hits []cacheHit) {
+	if a.verifyRate <= 0 || a.lk == nil || len(hits) == 0 {
+		return
+	}
+	for _, h := range hits {
+		n := a.verifyN.Add(1)
+		if a.verifyRate < 1 && float64(n%1000) >= a.verifyRate*1000 {
+			continue
+		}
+		go a.verifyOne(h)
+	}
+}
+
+func (a *Attributor) verifyOne(h cacheHit) {
+	ctx, cancel := context.WithTimeout(context.Background(), lookupTimeout)
+	defer cancel()
+	ts, err := a.lk.tenants(ctx, h.ti, h.tcol, h.col, h.val)
+	if err != nil {
+		return
+	}
+	a.verifies.Add(1)
+	if len(ts) == 1 && ts[0] == h.tenant {
+		return
+	}
+	a.stale.Add(1)
+	a.cache.Delete(h.ti.Key(), h.col, h.val)
+	if a.onStale != nil {
+		a.onStale(h.ti.Key(), h.col, h.tenant, ts)
 	}
 }
 
