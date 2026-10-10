@@ -217,6 +217,7 @@ func (ev *confEval) level(q *QueryNode) {
 					continue
 				}
 				if !ev.related(src, sc, dst, dc) {
+					ev.suggest(src, sc, dst, dc)
 					continue
 				}
 				n := inter(ev.conf[dstID], ev.conf[srcID])
@@ -232,6 +233,20 @@ func (ev *confEval) level(q *QueryNode) {
 	}
 	for _, s := range q.Subs {
 		ev.level(s)
+	}
+}
+
+// suggest offers the catalog a relationship the join between two tenant tables
+// hints at: whichever side's column is unique is the parent.
+func (ev *confEval) suggest(a *occRes, ac string, b *occRes, bc string) {
+	if ev.a.cat == nil || a.ti == nil || b.ti == nil || !a.tenant || !b.tenant {
+		return
+	}
+	switch {
+	case b.ti.IsUnique(bc) && !ev.a.tenants[ac]:
+		ev.a.cat.SuggestFK(a.ti, ac, b.ti, bc)
+	case a.ti.IsUnique(ac) && !ev.a.tenants[bc]:
+		ev.a.cat.SuggestFK(b.ti, bc, a.ti, ac)
 	}
 }
 

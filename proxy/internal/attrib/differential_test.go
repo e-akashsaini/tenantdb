@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/akashsaini/tenantdb/internal/proxy"
 	"github.com/jackc/pgx/v5"
@@ -36,10 +37,16 @@ var dTables = map[string]*dtable{
 	"orders":    {"orders", true, []dcol{{"id", "int"}, {"tenant_id", "text"}, {"customer_id", "int"}, {"status", "text"}, {"amount", "int"}}},
 	"items":     {"items", true, []dcol{{"id", "int"}, {"tenant_id", "text"}, {"order_id", "int"}, {"sku", "text"}, {"qty", "int"}}},
 	"countries": {"countries", false, []dcol{{"code", "text"}, {"name", "text"}}},
+	// ord points at orders.id but nothing in its name says so: only the joins reveal it
+	"shipments": {"shipments", true, []dcol{{"id", "int"}, {"tenant_id", "text"}, {"ord", "int"}, {"carrier", "text"}}},
 }
 
 // foreign-key joins that exist in the data: child.col = parent.id
-var dJoins = [][4]string{{"orders", "customer_id", "customers", "id"}, {"items", "order_id", "orders", "id"}}
+var dJoins = [][4]string{
+	{"orders", "customer_id", "customers", "id"}, {"items", "order_id", "orders", "id"},
+	{"shipments", "ord", "orders", "id"}, // a real relationship the naming rule cannot see
+	{"items", "qty", "orders", "id"},     // NOT a relationship: equal values across tenants; must never be learned
+}
 
 const diffSchemaSQL = `
 DROP SCHEMA IF EXISTS tdbdiff CASCADE;
@@ -48,6 +55,8 @@ CREATE TABLE tdbdiff.customers (id bigint PRIMARY KEY, tenant_id text, name text
 CREATE TABLE tdbdiff.orders (id bigint PRIMARY KEY, tenant_id text, customer_id bigint, status text, amount int);
 CREATE TABLE tdbdiff.items (id bigint PRIMARY KEY, tenant_id text, order_id bigint, sku text, qty int);
 CREATE TABLE tdbdiff.countries (code text PRIMARY KEY, name text);
+CREATE TABLE tdbdiff.shipments (id bigint PRIMARY KEY, tenant_id text, ord bigint, carrier text);
+INSERT INTO tdbdiff.shipments SELECT id, 't'||((id-1)/50), ((id-1)/50)*40 + (id%40) + 1, (ARRAY['dhl','ups'])[id%2+1] FROM generate_series(1,200) id;
 INSERT INTO tdbdiff.customers SELECT t*12+i, 't'||t, 'n'||i, 's'||(t*12+i), CASE WHEN i%2=0 THEN 'eu' ELSE 'us' END
   FROM generate_series(0,3) t, generate_series(1,12) i;
 INSERT INTO tdbdiff.orders SELECT id, 't'||((id-1)/40), ((id-1)/40)*12 + (id%12) + 1,
@@ -192,7 +201,7 @@ type dquery struct {
 }
 
 func (g *dgen) selectQuery() dquery {
-	names := []string{"customers", "orders", "items", "countries"}
+	names := []string{"customers", "orders", "items", "countries", "shipments"}
 	switch g.r.Intn(10) {
 	case 0, 1: // join along a foreign key
 		j := dJoins[g.r.Intn(len(dJoins))]
@@ -347,6 +356,9 @@ func TestDifferentialSoundness(t *testing.T) {
 	stats := map[string]map[Source]int{}
 	ran := 0
 	for i := 0; i < n; i++ {
+		if i%250 == 249 {
+			cat.DrainSuggestions(10 * time.Second)
+		}
 		var q dquery
 		switch k := g.r.Intn(10); {
 		case k < 1:

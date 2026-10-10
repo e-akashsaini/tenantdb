@@ -82,6 +82,13 @@ type Catalog struct {
 	fkMemo        map[string]fkVerdict                   // verdicts kept across reloads
 	polys         map[string]map[string]map[string]FKRef // table -> association -> type value -> parent
 
+	// relationships learned from joins in traffic, checked in the background (learn.go)
+	learned map[string]map[string]FKRef
+	sugMu   sync.Mutex
+	sugSeen map[string]time.Time
+	sugQ    chan fkCand
+	sugWG   sync.WaitGroup
+
 	bypassRLS  bool                   // the loading role is not subject to row-level security
 	roleSearch map[[2]string][]string // (role, database) -> search_path from ALTER ROLE/DATABASE ... SET
 	baseSearch []string
@@ -427,7 +434,7 @@ func (c *Catalog) loadFKs(ctx context.Context, conn *pgx.Conn) {
 	}
 	polys := c.verifyPolys(ctx, conn, tables, tcol)
 	c.mu.Lock()
-	c.fks, c.polys = out, polys
+	c.fks, c.polys = c.mergeLearned(out), polys
 	c.mu.Unlock()
 }
 
