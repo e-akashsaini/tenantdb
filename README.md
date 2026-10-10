@@ -212,6 +212,9 @@ Each flag also has an environment variable where listed.
 | `-upstream-tls-insecure` | | off | Skip upstream cert verification (testing only) |
 | `-tls-cert`, `-tls-key` | `TENANTDB_TLS_CERT`, `TENANTDB_TLS_KEY` | | Let clients encrypt their connection to the proxy |
 | `-require-tls` | `TENANTDB_REQUIRE_TLS=1` | off | Refuse clients that don't use TLS |
+| `-tls-client-ca` | `TENANTDB_TLS_CLIENT_CA` | | Verify client certificates against this CA bundle (mutual TLS); needs `-tls-cert` |
+| `-tls-client-auth` | `TENANTDB_TLS_CLIENT_AUTH` | `require` | With `-tls-client-ca`: `require` or `verify-if-given` |
+| `-scram-channel-binding` | `TENANTDB_SCRAM_CHANNEL_BINDING` | `auto` | What to do with `SCRAM-SHA-256-PLUS`: `auto`, `strip`, `passthrough` (see [docs/OPERATIONS.md](docs/OPERATIONS.md#tls-client-certificates-and-scram-channel-binding)) |
 | `-tenant-columns` | `TENANTDB_TENANT_COLUMNS` | `tenant_id` | Column(s) holding the tenant, comma-separated |
 | `-key-columns` | `TENANTDB_KEY_COLUMNS` | `id` | Columns that identify a row when there is no schema to consult. With `-schema-dsn`, every provably unique column identifies a row. Empty disables the row cache |
 | `-cache-size` | | `100000` | Max rows in the row-to-tenant cache |
