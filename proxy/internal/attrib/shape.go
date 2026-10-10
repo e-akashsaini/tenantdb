@@ -35,6 +35,12 @@ type Operand struct {
 	Set   bool
 }
 
+// Call is a call to a function or procedure, with its argument operands.
+type Call struct {
+	Ref  TableRef
+	Args []Operand
+}
+
 // Pred is `Col = op` (or `Col IN (ops)`) on a key column.
 type Pred struct {
 	Col string
@@ -52,7 +58,7 @@ type KeyOp struct {
 	Op  Operand
 }
 
-func operand(n *pg_query.Node) Operand {
+func (e *Extractor) operand(n *pg_query.Node) Operand {
 	n = unwrap(n)
 	if p := n.GetParamRef(); p != nil {
 		return Operand{Param: int(p.Number), Set: true}
@@ -65,6 +71,20 @@ func operand(n *pg_query.Node) Operand {
 			return Operand{Lit: strconv.Itoa(int(c.GetIval().Ival)), Set: true}
 		case c.GetFval() != nil:
 			return Operand{Lit: c.GetFval().Fval, Set: true}
+		}
+	}
+	if ref := n.GetColumnRef(); ref != nil && len(e.args) > 0 {
+		name := ""
+		switch len(ref.Fields) {
+		case 1:
+			name = ref.Fields[0].GetString_().GetSval()
+		case 2: // function_name.param
+			if strings.EqualFold(ref.Fields[0].GetString_().GetSval(), e.fname) {
+				name = ref.Fields[1].GetString_().GetSval()
+			}
+		}
+		if pos, ok := e.args[strings.ToLower(name)]; ok {
+			return Operand{Param: pos, Set: true}
 		}
 	}
 	return Operand{}
@@ -105,7 +125,7 @@ func (e *Extractor) shape(n *pg_query.Node, st *Stmt) {
 		if v.InsertStmt.Relation != nil && v.InsertStmt.WithClause == nil {
 			st.Table = relRef(v.InsertStmt.Relation)
 			st.Inserts = e.insertRows(v.InsertStmt)
-			st.RawInserts = rawInsertRows(v.InsertStmt)
+			st.RawInserts = e.rawInsertRows(v.InsertStmt)
 		}
 	}
 }
@@ -139,10 +159,10 @@ func (e *Extractor) keyPreds(where *pg_query.Node) []Pred {
 			p := Pred{Col: col}
 			if list := other.GetList(); list != nil {
 				for _, it := range list.Items {
-					p.Ops = append(p.Ops, operand(it))
+					p.Ops = append(p.Ops, e.operand(it))
 				}
 			} else {
-				p.Ops = []Operand{operand(other)}
+				p.Ops = []Operand{e.operand(other)}
 			}
 			out = append(out, p)
 		}
@@ -170,9 +190,9 @@ func (e *Extractor) insertRows(s *pg_query.InsertStmt) []InsRow {
 			name := strings.ToLower(c.GetResTarget().GetName())
 			switch {
 			case e.cols[name]:
-				r.Tenant = operand(items.Items[i])
+				r.Tenant = e.operand(items.Items[i])
 			case e.keys[name]:
-				r.Keys = append(r.Keys, KeyOp{Col: name, Op: operand(items.Items[i])})
+				r.Keys = append(r.Keys, KeyOp{Col: name, Op: e.operand(items.Items[i])})
 			}
 		}
 		if r.Tenant.Set && len(r.Keys) > 0 {
@@ -184,7 +204,7 @@ func (e *Extractor) insertRows(s *pg_query.InsertStmt) []InsRow {
 
 // rawInsertRows returns the operands of each VALUES row of an INSERT that has
 // no column list. Which position is the tenant needs the table schema.
-func rawInsertRows(s *pg_query.InsertStmt) [][]Operand {
+func (e *Extractor) rawInsertRows(s *pg_query.InsertStmt) [][]Operand {
 	sel := s.SelectStmt.GetSelectStmt()
 	if sel == nil || len(sel.ValuesLists) == 0 || len(s.Cols) != 0 {
 		return nil
@@ -197,7 +217,7 @@ func rawInsertRows(s *pg_query.InsertStmt) [][]Operand {
 		}
 		ops := make([]Operand, len(items.Items))
 		for i, it := range items.Items {
-			ops[i] = operand(it)
+			ops[i] = e.operand(it)
 		}
 		out = append(out, ops)
 	}
@@ -206,7 +226,7 @@ func rawInsertRows(s *pg_query.InsertStmt) [][]Operand {
 
 // tablesOf lists every table and function a statement names. Names that are
 // really CTEs are left out.
-func tablesOf(n *pg_query.Node) (tables, funcs []TableRef) {
+func (e *Extractor) tablesOf(n *pg_query.Node) (tables, funcs []TableRef, calls []Call) {
 	ctes := map[string]bool{}
 	walk(n.ProtoReflect(), func(m proto.Message) bool {
 		if c, ok := m.(*pg_query.CommonTableExpr); ok {
@@ -217,6 +237,8 @@ func tablesOf(n *pg_query.Node) (tables, funcs []TableRef) {
 	tset, fset := map[TableRef]bool{}, map[TableRef]bool{}
 	walk(n.ProtoReflect(), func(m proto.Message) bool {
 		switch v := m.(type) {
+		case *pg_query.IntoClause:
+			return false // the table being created is not one being read
 		case *pg_query.RangeVar:
 			if r := relRef(v); r.Schema != "" || !ctes[r.Name] {
 				tset[r] = true
@@ -226,17 +248,25 @@ func tablesOf(n *pg_query.Node) (tables, funcs []TableRef) {
 			for _, p := range v.Funcname {
 				parts = append(parts, strings.ToLower(p.GetString_().GetSval()))
 			}
+			var ref TableRef
 			switch len(parts) {
 			case 0:
+				return true
 			case 1:
-				fset[TableRef{Name: parts[0]}] = true
+				ref = TableRef{Name: parts[0]}
 			default:
-				fset[TableRef{Schema: parts[len(parts)-2], Name: parts[len(parts)-1]}] = true
+				ref = TableRef{Schema: parts[len(parts)-2], Name: parts[len(parts)-1]}
 			}
+			fset[ref] = true
+			c := Call{Ref: ref}
+			for _, a := range v.Args {
+				c.Args = append(c.Args, e.operand(a))
+			}
+			calls = append(calls, c)
 		}
 		return true
 	})
-	return sortedRefs(tset), sortedRefs(fset)
+	return sortedRefs(tset), sortedRefs(fset), calls
 }
 
 func sortedRefs(m map[TableRef]bool) []TableRef {
@@ -294,12 +324,12 @@ func (e *Extractor) filtered(n *pg_query.Node) bool {
 
 // setVar reads a SET / RESET statement. It returns nil for forms it does not
 // need to track.
-func setVar(v *pg_query.VariableSetStmt) *SetVar {
+func (e *Extractor) setVar(v *pg_query.VariableSetStmt) *SetVar {
 	sv := &SetVar{Name: strings.ToLower(v.Name), Local: v.IsLocal}
 	switch v.Kind {
 	case pg_query.VariableSetKind_VAR_SET_VALUE:
 		for _, a := range v.Args {
-			if op := operand(a); op.Set {
+			if op := e.operand(a); op.Set {
 				sv.Values = append(sv.Values, op.Lit)
 			}
 		}
@@ -315,7 +345,7 @@ func setVar(v *pg_query.VariableSetStmt) *SetVar {
 
 // selectSetConfig recognises `SELECT set_config('name', 'value', is_local)`,
 // the form most drivers and ORMs use to set a session variable.
-func selectSetConfig(n *pg_query.Node) *SetVar {
+func (e *Extractor) selectSetConfig(n *pg_query.Node) *SetVar {
 	sel := n.GetSelectStmt()
 	if sel == nil {
 		return nil
@@ -326,7 +356,7 @@ func selectSetConfig(n *pg_query.Node) *SetVar {
 			strings.ToLower(fc.Funcname[len(fc.Funcname)-1].GetString_().GetSval()) != "set_config" {
 			continue
 		}
-		name, val := operand(fc.Args[0]), operand(fc.Args[1])
+		name, val := e.operand(fc.Args[0]), e.operand(fc.Args[1])
 		if !name.Set || name.Param != 0 || !val.Set || val.Param != 0 {
 			continue
 		}

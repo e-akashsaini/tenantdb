@@ -113,7 +113,9 @@ func (s *Server) pumpClientGated(log *slog.Logger, sess *Session, gate Gate, bac
 		}
 
 		var rej *Rejection
-		s.safeObserve(log, func() { rej = gate.Gate(sess, msg) }) // a panic leaves rej nil: fail open
+		if s.safeObserve(log, func() { rej = gate.Gate(sess, msg) }) && s.cfg.GateFailClosed {
+			rej = &Rejection{Code: "XX000", Message: "tenantdb: internal error while checking the statement; refusing to run it"}
+		}
 
 		if rej != nil {
 			soft := sess.gs.idle() && !partial

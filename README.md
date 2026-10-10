@@ -5,17 +5,17 @@ A PostgreSQL proxy that works out **which tenant every SQL statement belongs to*
 It sits between your application and Postgres, speaks the real wire protocol, and needs **no changes to the application**. You tell it which column holds the tenant (`tenant_id`, `org_id`, ...) and it parses each statement to find the tenant, with the actual Postgres parser (`pg_query_go`).
 
 ```
-app ──▶ tenantdb :6432 ──▶ PostgreSQL :5432
-          │  parses every statement, attributes it to a tenant,
-          │  logs it, and (optionally) blocks what it can't attribute
-          └─ read-only connection ──▶ schema, row ownership, cache warm-up
+app ──TLS──▶ tenantdb :6432 ──▶ PostgreSQL :5432
+               │  parses every statement, attributes it to a tenant,
+               │  logs it, and (optionally) blocks what it can't attribute
+               └─ read-only connection ──▶ schema, function bodies, row ownership, cache warm-up
 ```
 
 ## Why
 
 Multi-tenant apps on a shared database depend on every query remembering `WHERE tenant_id = ...`. One forgotten filter leaks another customer's data. tenantdb makes that visible, and optionally impossible, without touching application code.
 
-Authentication, TLS to the upstream, and query cancel are relayed untouched. The proxy is transparent to clients and fails open: if its own attribution code panics, the statement still goes through.
+Authentication, TLS to the upstream, and query cancel are relayed untouched. Clients can encrypt their connection to the proxy too (`-tls-cert`).
 
 ## How a tenant is found
 
@@ -23,8 +23,9 @@ Each statement gets a **source** saying how its tenant was determined, tried rou
 
 | Source | Meaning |
 |---|---|
-| `explicit` | The statement names it: `tenant_id = 'acme'`, `IN (...)`, `INSERT` values, bound parameters (`$1`), also `UPDATE`/`DELETE` filters. |
+| `explicit` | The statement names it: `tenant_id = 'acme'`, `IN (...)`, `INSERT` values, bound parameters (`$1`), `UPDATE`/`DELETE` filters, or a function call whose body filters on the tenant you pass it. |
 | `untenanted` | Every table touched has no tenant column (shared reference data, `SELECT 1`). Nothing to attribute. |
+| `derived` | Reads a temporary table that was filled from one tenant's data, so that tenant is whose data it is. |
 | `cache` | The statement names a row (`WHERE id = 42`) whose owner was learned earlier from an `INSERT`, from result rows, or from start-up pre-warming. |
 | `lookup` | Not cached, so the proxy asked the database (`SELECT tenant_id FROM t WHERE id = $1`) over its read-only connection. |
 | `nomatch` | The statement names a row that doesn't exist. |
@@ -36,16 +37,22 @@ Each statement gets a **source** saying how its tenant was determined, tried rou
 Every event also carries `scan` (reads across tenants, even if a tag attributed it) and `conflict` (disagrees with the connection's tag or the transaction's tenant).
 
 ### Things it understands
-- Prepared statements: `$n` is mapped to the tenant column at `Parse` time and read at `Bind` time (text and binary UUID/integer values).
-- Schemas: tables are resolved the way Postgres does, through `search_path` (`SET`, `SET LOCAL`, `RESET`, `DISCARD ALL`, startup `options`). The same table name in two schemas is not ambiguous.
-- `INSERT` without a column list, using the real column order from the catalog.
-- Cache hygiene: rows are learned only from successful `INSERT`s and from result columns that come straight from one table. `DELETE` evicts, and an `UPDATE` that changes a key or tenant column drops that table's entries.
+- **Prepared statements**, both protocol-level (`$n` mapped at `Parse`, read at `Bind`; text and binary UUID/integer values) and SQL-level (`PREPARE`/`EXECUTE`/`DEALLOCATE`).
+- **Schemas.** Tables are resolved the way Postgres does, through `search_path`: `SET`, `SET LOCAL`, `RESET`, `DISCARD ALL`, startup `options`, and the role/database defaults from `ALTER ROLE/DATABASE ... SET search_path`.
+- **Functions and procedures.** A call to an application-defined function is analysed by reading its body (SQL and PL/pgSQL). Each statement in the body is attributed with the call's arguments bound to the function's parameters, so `SELECT * FROM orders_of('acme')` is attributed to `acme` if the function filters on that argument. Arguments pass through nested calls. A function that reads tenant data without saying whose is `unknown` (or `scan` if it reads everything). `DO` blocks are read the same way.
+- **Statements that run a query without being a plain `SELECT`**: `CREATE TABLE ... AS`, `SELECT ... INTO`, `EXPLAIN ANALYZE`, cursors, `COPY`, `CALL`, `EXECUTE`. They are attributed like the query they run; otherwise they would be a way around the policy. A plain `EXPLAIN` executes nothing and isn't attributed.
+- **Temporary tables.** A temp table with its own tenant column is filtered like any tenant table. One filled from a query inherits the tenants of that query (`derived`); one filled from unattributed data stays `unknown`. They are per-session, shadow real tables the way Postgres does, and never enter the shared cache.
+- **`INSERT` without a column list**, using the real column order from the catalog.
+- **Cache hygiene.** Rows are learned only from successful `INSERT`s and from result columns that come straight from one table, and only for columns the catalog proves unique (a single-column primary key or unique index). `DELETE` evicts, an `UPDATE` that changes a key or tenant column drops that table's entries, and `TRUNCATE`/`DROP TABLE` forget the table. Entries also expire after `-cache-ttl`.
 
 ### It fails closed
 These are `unknown`, never `untenanted`:
-- a table the schema snapshot doesn't know (e.g. a temp table),
+- a table the schema snapshot doesn't know,
 - a view that hides its tenant column (it may wrap tenant tables),
-- a call to an **application-defined** function (its body may read tenant tables). Built-in and extension functions are ignored.
+- a temp table filled from data that couldn't be attributed,
+- a call to a function whose code can't be read: dynamic SQL (`EXECUTE` of a computed string), `plpython`, C, and so on.
+
+Built-in and extension functions are ignored.
 
 ## Quick start
 
@@ -64,7 +71,7 @@ go build -o tenantdb ./cmd/tenantdb
 For the full feature set, give it a **read-only role** to read the schema, pre-warm the cache and look up rows:
 
 ```sql
-CREATE ROLE tenantdb_ro LOGIN PASSWORD '...';
+CREATE ROLE tenantdb_ro LOGIN PASSWORD '...' BYPASSRLS;       -- BYPASSRLS only lets it *read* every row for lookups
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO tenantdb_ro;   -- needed to pre-warm and look up rows
 ```
 ```bash
@@ -73,6 +80,15 @@ export TENANTDB_SCHEMA_DSN='postgres://tenantdb_ro:...@127.0.0.1:5432/mydb'
 ```
 
 Prefer the environment variable over `-schema-dsn`: command-line flags show up in process lists. The role needs `SELECT` only to pre-warm and look up rows; it sees the full schema through `pg_catalog` either way.
+
+**Row-level security.** A role subject to RLS can't see all rows, so lookups and pre-warming through it would silently miss some. The proxy detects this at start-up, warns, and skips those tables (their statements fall back to `unknown`). Give the schema role `BYPASSRLS` (it stays read-only) to fix it.
+
+### Encrypting client connections
+```bash
+./tenantdb -tls-cert server.crt -tls-key server.key            # clients may use TLS
+./tenantdb -tls-cert server.crt -tls-key server.key -require-tls  # clients must
+```
+The certificate is re-read when the file changes (checked every 30 s), so renewals need no restart. TLS to the upstream is separate: `-upstream-tls`.
 
 ## Strict mode
 
@@ -89,10 +105,10 @@ A statement **violates** when it is:
 - `scan`: tenant data with no tenant or key filter,
 - a `conflict`: a different tenant than the connection's tag or the transaction's.
 
-`untenanted` statements and `nomatch` rows never violate.
+`untenanted` statements and `nomatch` rows never violate. Things that can't be inspected are `unknown`: `COPY ... FROM STDIN` (tenants in the data stream), and legacy fast-path function calls (large-object calls such as `\lo_import`).
 
 Two role lists relax the policy:
-- `-strict-exempt=migrator,admin`: never held to the policy (migrations, admin tools).
+- `-strict-exempt=migrator,admin`: never held to the policy (migrations, admin tools, bulk `COPY` loads).
 - `-strict-allow-scan=reports`: may read across all tenants, but must still be attributable.
 
 ### What blocking does to the client
@@ -100,6 +116,7 @@ Two role lists relax the policy:
 - **Extended protocol (prepared statements):** the proxy holds `Parse/Bind/Describe/Execute` until `Sync`, so a refused batch never reaches the database. The client gets the error and a normal `ReadyForQuery`.
 - **Inside a transaction (or any case where the database may already hold work):** the proxy sends a `FATAL` error and **closes the connection**, so Postgres rolls everything back. It can't fake an aborted transaction faithfully, and it won't leave one half-done. Clients will see a dropped connection.
 - **Lookups** are finished before deciding, so a first-time row lookup can add latency in `block` mode. If the lookup fails, the statement is blocked (nothing is known, so nothing is allowed).
+- **If the check itself fails** (a bug in the gate), the statement is refused with `XX000` by default (`-strict-on-error=block`). Use `-strict-on-error=allow` to let such statements through instead.
 
 ### Rolling it out
 1. Run with `-strict=off` and read the logs.
@@ -133,10 +150,13 @@ Each flag also has an environment variable where listed.
 | `-upstream` | `TENANTDB_UPSTREAM` | `127.0.0.1:5432` | PostgreSQL `host:port` |
 | `-upstream-tls` | `TENANTDB_UPSTREAM_TLS=1` | off | Dial the upstream with TLS |
 | `-upstream-tls-insecure` | | off | Skip upstream cert verification (testing only) |
+| `-tls-cert`, `-tls-key` | `TENANTDB_TLS_CERT`, `TENANTDB_TLS_KEY` | | Let clients encrypt their connection to the proxy |
+| `-require-tls` | `TENANTDB_REQUIRE_TLS=1` | off | Refuse clients that don't use TLS |
 | `-tenant-columns` | `TENANTDB_TENANT_COLUMNS` | `tenant_id` | Column(s) holding the tenant, comma-separated |
-| `-key-columns` | `TENANTDB_KEY_COLUMNS` | `id` | Columns identifying a row (row cache). Empty disables the cache |
+| `-key-columns` | `TENANTDB_KEY_COLUMNS` | `id` | Columns identifying a row (row cache). Used only where the catalog proves them unique. Empty disables the cache |
 | `-cache-size` | | `100000` | Max rows in the row-to-tenant cache |
-| `-schema-dsn` | `TENANTDB_SCHEMA_DSN` | | Read-only role connection string (schema, pre-warm, lookups) |
+| `-cache-ttl` | | `1h` | How long a cached owner is trusted (`0`: until evicted) |
+| `-schema-dsn` | `TENANTDB_SCHEMA_DSN` | | Read-only role connection string (schema, function bodies, pre-warm, lookups) |
 | `-schema-refresh` | | `5m` | How often to re-read the schema (it also reloads after DDL) |
 | `-prewarm` | | on | Fill the cache from the database at start-up (background) |
 | `-lookup` | | on | Ask the database about rows missing from the cache |
@@ -144,6 +164,7 @@ Each flag also has an environment variable where listed.
 | `-strict` | `TENANTDB_STRICT` | `off` | `off`, `alert` or `block` |
 | `-strict-exempt` | `TENANTDB_STRICT_EXEMPT` | | Roles never held to the policy |
 | `-strict-allow-scan` | `TENANTDB_STRICT_ALLOW_SCAN` | | Roles allowed to scan |
+| `-strict-on-error` | `TENANTDB_STRICT_ON_ERROR` | `block` | In block mode, what to do with a statement the check itself failed on: `block` or `allow` |
 | `-debug` | | off | Verbose logging |
 
 Pre-warming gives each table an equal share of the `-cache-size` budget, so one huge table can't starve the rest.
@@ -152,20 +173,21 @@ Pre-warming gives each table an equal share of the `-cache-size` budget, so one 
 
 ```
 level=INFO msg=query     session=7 user=app db=shop tenants=[acme] source=explicit scan=false conflict=false sql="SELECT ..."
-level=WARN msg=violation session=9 ... source=unknown violation=unknown sql="SELECT my_fn()"
+level=WARN msg=violation session=9 ... source=unknown violation=unknown sql="SELECT dyn_fn()"
 level=WARN msg=blocked   session=9 ... source=scan scan=true violation=scan sql="UPDATE orders SET amount = -1"
 ```
 
 ## Known limits
 
-- **Plaintext on the client side.** The proxy answers a client's TLS request with "no" and the client falls back to plaintext, so run it next to the app (same host/pod/private network). TLS **to the upstream** is supported (`-upstream-tls`).
-- **No connection pooling.** It's one upstream connection per client connection.
-- **Application-defined functions are opaque.** They are classed `unknown`, never `untenanted`, but the proxy can't see which tenants they read.
-- **Tables are matched by schema and name.** A table the catalog doesn't know (temp tables) is `unknown`. `ALTER ROLE ... SET search_path` isn't visible to the proxy; only `SET` statements and startup options are.
-- **Key columns are assumed unique** (default `id`). A non-unique key makes the row cache wrong.
-- **A cold or stale cache** costs a database lookup (`lookup` source), not correctness, as long as `-lookup` is on and the read-only role can `SELECT` the table.
-- `COPY` data and function-call messages aren't gated in `block` mode.
-- If the gate itself panics, the statement is let through and the panic is logged.
+What is genuinely not handled:
+
+- **No connection pooling.** It's one upstream connection per client connection. Pooling changes how authentication works (the proxy would have to authenticate clients itself), so it is a design decision, not a patch.
+- **Code the proxy can't read stays `unknown`.** Dynamic SQL inside a function (`EXECUTE` of a computed string), and functions in languages other than SQL and PL/pgSQL. That's inherent: what such code touches is only decided at run time. Use a [connection tag](#connection-tag) for those paths, or an exempt role.
+- **Triggers and rules aren't analysed.** A trigger fired by a statement can touch other tables; the proxy only sees the statement itself.
+- **A function is attributed from its arguments only where its body compares the tenant column to a parameter** (or hardcodes the tenant). Anything subtler is `unknown`.
+- **A cached row owner can be stale for up to `-cache-ttl`** after a delete the proxy didn't see (a cascade, or another path to the database) followed by key reuse. Primary keys that are never reused (serials, UUIDs) are unaffected. Lower the TTL, or set `-key-columns=` to turn the cache off and resolve every row from the database.
+- **`COPY ... FROM STDIN` isn't inspected row by row.** In `block` mode it is refused unless the role is exempt.
+- **The role/database `search_path` defaults are read at schema-refresh time**, so a change takes up to `-schema-refresh` (or the next DDL) to be seen.
 
 ## Development
 
@@ -187,13 +209,15 @@ TENANTDB_TEST_DSN=postgres://postgres:pw@127.0.0.1:5432/postgres go test -race .
 
 ```
 proxy/
-  cmd/tenantdb/            flags, wiring
-  internal/proxy/          wire-protocol relay: Observer (watch) and Gate (veto)
+  cmd/tenantdb/            flags, wiring, certificate reloading
+  internal/proxy/          wire-protocol relay: TLS, Observer (watch) and Gate (veto)
   internal/attrib/
-    extract.go shape.go    parse a statement: tenants, keys, tables, functions, SET
-    attributor.go          per-connection state, sources, prepared statements
-    cache.go               shared, bounded row -> tenant cache (LRU)
-    catalog.go             schema snapshot: tables, columns, views, user functions
+    extract.go shape.go    parse a statement: tenants, keys, tables, calls, SET
+    utility.go             CREATE TABLE AS, EXPLAIN ANALYZE, COPY, PREPARE/EXECUTE, temp tables
+    funcs.go               read function and DO-block bodies (SQL and PL/pgSQL)
+    attributor.go          per-connection state, sources, analysis of calls and temp tables
+    cache.go               shared, bounded, expiring row -> tenant cache (LRU)
+    catalog.go             schema snapshot: tables, uniqueness, RLS, functions, search_path
     lookup.go              ask the database who owns a row (de-duplicated)
     warm.go                background cache pre-warming
     strict.go              the policy and the blocking gate

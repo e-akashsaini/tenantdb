@@ -30,6 +30,9 @@ const (
 	// SourceTransaction: the statement names no tenant, but an earlier
 	// statement in the same transaction did.
 	SourceTransaction Source = "transaction"
+	// SourceDerived: the statement reads a temporary table that was filled
+	// from one tenant's data, so that is whose data it reads.
+	SourceDerived Source = "derived"
 	// SourceUntenanted: every table the statement touches has no tenant
 	// column (shared reference data, SELECT 1, ...), so there is no tenant to
 	// attribute. Needs the schema catalog.
@@ -79,6 +82,11 @@ type Options struct {
 	// e.g. `SET tenantdb.tenant = 'acme'` or the startup option
 	// `-c tenantdb.tenant=acme`. Default "tenantdb.tenant".
 	TagVar string
+	// CacheTTL bounds how long a cached row owner is trusted (0: forever). Row
+	// owners almost never change, but a delete the proxy did not see (a
+	// cascade, another path to the database) followed by key reuse would
+	// leave a stale entry; the TTL caps how long that can last.
+	CacheTTL time.Duration
 	// Strict configures what happens to statements that cannot be pinned to a
 	// tenant. The zero value only logs.
 	Strict StrictOptions
@@ -102,12 +110,16 @@ type Attributor struct {
 	strict    StrictMode
 	exempt    map[string]bool
 	allowScan map[string]bool
+
+	fmu    sync.Mutex
+	fgen   uint64
+	fcache map[*FuncDef]*FuncBody
 }
 
 func New(opt Options, onEvent func(Event)) *Attributor {
 	a := &Attributor{
 		ex:      NewExtractor(opt.TenantColumns, opt.KeyColumns),
-		cache:   NewRowCache(opt.CacheSize),
+		cache:   NewRowCacheTTL(opt.CacheSize, opt.CacheTTL),
 		onEvent: onEvent,
 		tenants: lowerSet(opt.TenantColumns),
 		cat:     opt.Catalog,
@@ -162,6 +174,38 @@ type pending struct {
 	learn  []learned  // committed to the cache when the statement succeeds
 	forget []cacheKey // dropped from the cache when the statement succeeds
 	shape  rowShape   // how to read tenant and key columns out of result rows
+	ti     *TableInfo // the catalog's view of table, if known
+
+	dropKeys  []string // cache tables to forget when the statement succeeds (DROP, TRUNCATE)
+	dropTemps []string // temporary tables to forget when it succeeds
+	temp      *tempReg // a temporary table to remember when it succeeds
+}
+
+// tempReg is a temporary table created by a statement still awaiting its reply.
+type tempReg struct {
+	def     *TempDef
+	kind    tempKind
+	tenants []string
+}
+
+type tempKind int
+
+const (
+	// tempTainted: filled from data the proxy could not attribute; reading it is unknown.
+	tempTainted tempKind = iota
+	// tempUntenanted: filled from data that belongs to no tenant.
+	tempUntenanted
+	// tempDerived: filled from one set of tenants' data, which it inherits.
+	tempDerived
+	// tempTenant: it has a tenant column of its own, so it is filtered like any tenant table.
+	tempTenant
+)
+
+// tempTable is a temporary table of one session.
+type tempTable struct {
+	kind    tempKind
+	tenants []string
+	info    *TableInfo // columns, for tempTenant
 }
 
 type learned struct {
@@ -178,8 +222,11 @@ type rowShape struct {
 type keyReq struct{ col, val string }
 
 type state struct {
-	mu   sync.Mutex
-	user string
+	mu       sync.Mutex
+	user, db string
+
+	temps   map[string]*tempTable // this session's temporary tables
+	sqlPrep map[string]Stmt       // SQL-level PREPAREd statements
 
 	prepared map[string]*prepared
 	portals  map[string]*portal
@@ -200,12 +247,17 @@ type state struct {
 	batchParsed, batchBound []string
 }
 
-func (st *state) searchPath() []string {
+// pathOf is the search_path in force: SET LOCAL, then SET, then what the
+// database gives this role (ALTER ROLE / ALTER DATABASE ... SET), then the
+// built-in default.
+func (a *Attributor) pathOf(st *state) []string {
 	switch {
 	case st.localPath != nil:
 		return st.localPath
 	case st.path != nil:
 		return st.path
+	case a.cat != nil && a.cat.Loaded():
+		return a.cat.DefaultSearchPath(st.user, st.db)
 	}
 	return defaultSearchPath
 }
@@ -235,7 +287,8 @@ func (a *Attributor) st(s *proxy.Session) *state {
 	if v, ok := s.State.(*state); ok {
 		return v
 	}
-	v := &state{user: s.User, prepared: map[string]*prepared{}, portals: map[string]*portal{}}
+	v := &state{user: s.User, db: s.DB, temps: map[string]*tempTable{}, sqlPrep: map[string]Stmt{},
+		prepared: map[string]*prepared{}, portals: map[string]*portal{}}
 	opts := parseStartupOptions(s.Params["options"])
 	if sp, ok := opts["search_path"]; ok {
 		v.path = splitPath(sp)
@@ -309,6 +362,14 @@ func (a *Attributor) OnFrontend(s *proxy.Session, msg pgproto3.FrontendMessage) 
 		for _, x := range pt.stmts {
 			a.handle(s, st, x, pt)
 		}
+	case *pgproto3.FunctionCall:
+		// The legacy fast-path protocol calls a function by OID with no SQL to
+		// read, so nothing about what it touches is known.
+		st := a.st(s)
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		a.emit(st, Event{SessionID: s.ID, User: s.User, DB: s.DB, Source: SourceUnknown,
+			SQL: fmt.Sprintf("<fast-path function call, oid %d>", m.Function)})
 	case *pgproto3.Close:
 		st := a.st(s)
 		st.mu.Lock()
@@ -347,6 +408,15 @@ func (a *Attributor) OnBackend(s *proxy.Session, msg pgproto3.BackendMessage) {
 			}
 			if p.stmt.SetsKey && p.table != "" {
 				a.cache.DropTable(p.table)
+			}
+			for _, k := range p.dropKeys {
+				a.cache.DropTable(k)
+			}
+			for _, n := range p.dropTemps {
+				delete(st.temps, n)
+			}
+			if p.temp != nil {
+				a.registerTemp(st, p.temp)
 			}
 		}
 	case *pgproto3.PortalSuspended, *pgproto3.EmptyQueryResponse:
@@ -389,7 +459,7 @@ func (a *Attributor) shapeOf(p *pending, rd *pgproto3.RowDescription) rowShape {
 		switch {
 		case a.tenants[name] && sh.tenant < 0:
 			sh.tenant = i
-		case a.ex.keys[name]:
+		case a.ex.keys[name] && a.keyUsable(p.ti, name):
 			sh.keys[name] = i
 		default:
 			continue
@@ -415,12 +485,19 @@ func (a *Attributor) learnRow(p *pending, row *pgproto3.DataRow) {
 	}
 }
 
-// resolve finds the table a reference names, using the session search_path.
-func (a *Attributor) resolve(st *state, ref TableRef) (*TableInfo, bool) {
-	if a.cat == nil || !a.cat.Loaded() {
-		return nil, false
+// tableFor finds the table a reference names, the way Postgres would: this
+// session's temporary tables first, then the catalog along the search_path.
+func (a *Attributor) tableFor(st *state, ref TableRef) (ti *TableInfo, tmp *tempTable, ok bool) {
+	if ref.Schema == "" || ref.Schema == "pg_temp" {
+		if t := st.temps[ref.Name]; t != nil {
+			return t.info, t, true
+		}
 	}
-	return a.cat.Table(ref, st.searchPath(), st.user)
+	if a.cat == nil || !a.cat.Loaded() {
+		return nil, nil, false
+	}
+	ti, ok = a.cat.Table(ref, a.pathOf(st), st.user)
+	return ti, nil, ok
 }
 
 // tableKey is the cache's name for a table: schema-qualified when the catalog
@@ -433,6 +510,9 @@ func tableKey(ref TableRef, ti *TableInfo) string {
 }
 
 func (a *Attributor) hasTenantCol(ti *TableInfo) bool {
+	if ti == nil {
+		return false
+	}
 	for _, c := range ti.Cols {
 		if a.tenants[c] {
 			return true
@@ -441,46 +521,246 @@ func (a *Attributor) hasTenantCol(ti *TableInfo) bool {
 	return false
 }
 
+// keyUsable reports whether col can identify a row of ti. With the catalog, only
+// a column proven unique (a single-column unique index) can: otherwise one
+// value could belong to several rows of different tenants. Temporary tables are
+// private to a session and never cached. Without the catalog the configured key
+// columns are trusted.
+func (a *Attributor) keyUsable(ti *TableInfo, col string) bool {
+	if ti == nil {
+		return a.cat == nil || !a.cat.Loaded()
+	}
+	if ti.Schema == "pg_temp" {
+		return false
+	}
+	return ti.IsUnique(col)
+}
+
 type scope int
 
 const (
 	scopeUnknown    scope = iota // something the proxy cannot vouch for
 	scopeUntenanted              // provably touches no tenant data
 	scopeTenant                  // touches at least one tenant table
+	scopeDerived                 // reads only temporary tables filled from known tenants' data
 )
 
-// classify decides what kind of data a statement touches. It fails closed:
-// tables the catalog does not know, views without a tenant column (which may
-// wrap tenant tables), and calls to application-defined functions (whose
-// bodies the proxy cannot read) all make the answer "unknown", not "untenanted".
-func (a *Attributor) classify(st *state, x Stmt) scope {
-	if a.cat == nil || !a.cat.Loaded() {
-		return scopeUnknown
-	}
-	tenant, unsure := false, false
-	for _, t := range x.Tables {
-		ti, ok := a.cat.Table(t, st.searchPath(), st.user)
-		switch {
-		case !ok:
-			unsure = true
-		case a.hasTenantCol(ti):
-			tenant = true
-		case (ti.Kind == 'v' || ti.Kind == 'm') && !isSystemSchema(ti.Schema):
-			unsure = true
-		}
-	}
-	for _, f := range x.Funcs {
-		if a.cat.UserFunc(f, st.searchPath(), st.user) {
-			unsure = true
-		}
-	}
+// analysis is what a statement (or a function body it calls) touches.
+type analysis struct {
+	tenantTouched bool     // reads or writes a table that carries a tenant column
+	unsure        bool     // touches something the proxy cannot vouch for
+	scan          bool     // tenant data with no tenant or key filter at all
+	unresolvedFn  bool     // a called function reads tenant data nothing says the tenant of
+	tenants       []string // tenants named by the statement, or by its function calls' arguments
+	derived       []string // tenants whose data a temporary table holds
+}
+
+func (r *analysis) merge(o analysis) {
+	r.tenantTouched = r.tenantTouched || o.tenantTouched
+	r.unsure = r.unsure || o.unsure
+	r.scan = r.scan || o.scan
+	r.unresolvedFn = r.unresolvedFn || o.unresolvedFn
+	r.tenants = append(r.tenants, o.tenants...)
+	r.derived = append(r.derived, o.derived...)
+}
+
+func (r analysis) scope() scope {
 	switch {
-	case tenant:
+	case r.tenantTouched:
 		return scopeTenant
-	case unsure:
+	case r.unsure:
 		return scopeUnknown
+	case len(r.derived) > 0:
+		return scopeDerived
 	}
 	return scopeUntenanted
+}
+
+const maxCallDepth = 6
+
+// analyze decides what kind of data a statement touches. It fails closed:
+// tables the catalog does not know, views without a tenant column (which may
+// wrap tenant tables), temporary tables filled from unattributed data, and
+// functions whose code cannot be read all make the answer "unsure".
+//
+// A call to an application-defined function is analysed by reading its body:
+// each body statement is analysed with the call's arguments bound to the
+// function's parameters, so `tenant_id = p_tenant` inside the function yields
+// the tenant the caller passed. Dynamic SQL cannot be read and stays unsure.
+func (a *Attributor) analyze(st *state, x Stmt, pt *portal, depth int) analysis {
+	var r analysis
+	r.tenants = tenantValues(x, pt)
+	if a.cat == nil || !a.cat.Loaded() {
+		// Without the schema nothing can be vouched for.
+		r.unsure = true
+		return r
+	}
+	direct := false
+	for _, t := range x.Tables {
+		ti, tmp, ok := a.tableFor(st, t)
+		switch {
+		case !ok:
+			r.unsure = true
+		case tmp != nil:
+			switch tmp.kind {
+			case tempTenant:
+				direct = true
+			case tempDerived:
+				r.derived = append(r.derived, tmp.tenants...)
+			case tempTainted:
+				r.unsure = true
+			}
+		case a.hasTenantCol(ti):
+			direct = true
+		case (ti.Kind == 'v' || ti.Kind == 'm') && !isSystemSchema(ti.Schema):
+			r.unsure = true
+		}
+	}
+	if direct {
+		r.tenantTouched = true
+		r.scan = !x.Filtered && !x.Insert
+	}
+	path := a.pathOf(st)
+	for _, c := range x.Calls {
+		if defs := a.cat.Funcs(c.Ref, path, st.user); len(defs) > 0 {
+			r.merge(a.callEffect(st, c, defs, pt, depth))
+		}
+	}
+	if x.Body != nil {
+		r.merge(a.bodyEffect(st, x.Body, nil, depth+1))
+	}
+	return r
+}
+
+// callEffect analyses a call to an application-defined function.
+func (a *Attributor) callEffect(st *state, c Call, defs []*FuncDef, pt *portal, depth int) analysis {
+	var r analysis
+	if depth >= maxCallDepth {
+		r.unsure = true
+		return r
+	}
+	args := &portal{params: make([]string, len(c.Args)), valid: make([]bool, len(c.Args))}
+	for i, op := range c.Args {
+		args.params[i], args.valid[i] = pt.resolve(op)
+	}
+	matched := false
+	for _, def := range defs {
+		if def.NArgs < len(c.Args) {
+			continue // a different overload
+		}
+		matched = true
+		r.merge(a.bodyEffect(st, a.funcBody(def), args, depth+1))
+	}
+	if !matched {
+		r.unsure = true
+	}
+	return r
+}
+
+// bodyEffect analyses the statements of a function body. args holds the values
+// of the call's arguments (nil for a DO block).
+func (a *Attributor) bodyEffect(st *state, b *FuncBody, args *portal, depth int) analysis {
+	var r analysis
+	if b.Opaque {
+		r.unsure = true
+		return r
+	}
+	if b.NoArgs {
+		args = nil
+	}
+	for _, s := range b.Stmts {
+		br := a.analyze(st, s, args, depth)
+		if br.tenantTouched && len(br.tenants) == 0 {
+			// It reads tenant data and neither an argument nor the body says whose.
+			br.unresolvedFn = true
+		}
+		r.merge(br)
+	}
+	return r
+}
+
+// funcBody reads (and caches) a function's code.
+func (a *Attributor) funcBody(def *FuncDef) *FuncBody {
+	gen := a.cat.Generation()
+	a.fmu.Lock()
+	defer a.fmu.Unlock()
+	if a.fcache == nil || a.fgen != gen {
+		a.fcache, a.fgen = map[*FuncDef]*FuncBody{}, gen
+	}
+	if b, ok := a.fcache[def]; ok {
+		return b
+	}
+	b := a.ex.bodyOf(def)
+	a.fcache[def] = b
+	return b
+}
+
+// tenantValues returns the tenant values a statement names itself: literals,
+// bound parameters and INSERT rows.
+func tenantValues(x Stmt, pt *portal) []string {
+	out := append([]string(nil), x.Tenants...)
+	for _, n := range x.Params {
+		if v, ok := pt.resolve(Operand{Param: n, Set: true}); ok {
+			out = append(out, v)
+		}
+	}
+	for _, r := range x.Inserts {
+		if v, ok := pt.resolve(r.Tenant); ok {
+			out = append(out, v)
+		}
+	}
+	return dedupe(out)
+}
+
+// registerTemp remembers a temporary table once its CREATE succeeded.
+func (a *Attributor) registerTemp(st *state, reg *tempReg) {
+	def := reg.def
+	t := &tempTable{kind: reg.kind, tenants: reg.tenants}
+	cols := append([]string(nil), def.Cols...)
+	complete := true
+	for _, l := range def.Like {
+		li, ltmp, ok := a.tableFor(st, l)
+		switch {
+		case !ok:
+			complete = false
+		case ltmp != nil && ltmp.info != nil:
+			cols = append(cols, ltmp.info.Cols...)
+		case ltmp != nil:
+			complete = false
+		default:
+			cols = append(cols, li.Cols...)
+		}
+	}
+	hasTenant := false
+	for _, c := range cols {
+		hasTenant = hasTenant || a.tenants[c]
+	}
+	switch {
+	case hasTenant && (!def.FromQuery || len(def.Cols) > 0):
+		// It has a tenant column of its own, so it is filtered like any tenant table.
+		t.kind = tempTenant
+		t.info = &TableInfo{Schema: "pg_temp", Name: def.Name, Kind: 'r', Cols: cols, raw: cols}
+	case !def.FromQuery && complete:
+		t.kind = tempUntenanted
+	case !def.FromQuery:
+		t.kind = tempTainted
+	}
+	st.temps[def.Name] = t
+}
+
+// provenance says what a temporary table created from a query inherits.
+func (a *Attributor) provenance(st *state, r analysis, tenants []string) (tempKind, []string) {
+	switch {
+	case r.unresolvedFn || r.scan || r.unsure:
+		return tempTainted, nil
+	case len(tenants) > 0 || len(r.derived) > 0:
+		return tempDerived, dedupe(append(append([]string(nil), tenants...), r.derived...))
+	case !r.tenantTouched:
+		return tempUntenanted, nil
+	case st.curTag() != "":
+		return tempDerived, []string{st.curTag()}
+	}
+	return tempTainted, nil
 }
 
 // handle queues x for reply matching and attributes it. pt is nil for the
@@ -492,6 +772,16 @@ func (a *Attributor) handle(s *proxy.Session, st *state, x Stmt, pt *portal) {
 	if x.Set != nil {
 		a.applySet(st, x.Set)
 	}
+	if x.Dealloc != nil {
+		if *x.Dealloc == "" {
+			st.sqlPrep = map[string]Stmt{}
+		} else {
+			delete(st.sqlPrep, *x.Dealloc)
+		}
+	}
+	if x.Prepare != nil {
+		st.sqlPrep[x.Prepare.Name] = x.Prepare.Stmt
+	}
 	switch x.Txn {
 	case txnBegin:
 		st.inTxn = true
@@ -500,46 +790,73 @@ func (a *Attributor) handle(s *proxy.Session, st *state, x Stmt, pt *portal) {
 		st.resetTxn()
 		return
 	}
+	for _, ref := range x.Drops {
+		if _, tmp, ok := a.tableFor(st, ref); ok && tmp != nil {
+			p.dropTemps = append(p.dropTemps, ref.Name)
+			continue
+		}
+		ti, _, _ := a.tableFor(st, ref)
+		p.dropKeys = append(p.dropKeys, tableKey(ref, ti))
+	}
+	if x.Temp != nil && !x.DML {
+		p.temp = &tempReg{def: x.Temp}
+	}
+
+	if x.Exec != nil {
+		// SQL-level EXECUTE runs a statement PREPAREd earlier, with its own arguments.
+		prep, ok := st.sqlPrep[x.Exec.Name]
+		if !ok {
+			return
+		}
+		args := &portal{params: make([]string, len(x.Exec.Args)), valid: make([]bool, len(x.Exec.Args))}
+		for i, op := range x.Exec.Args {
+			args.params[i], args.valid[i] = pt.resolve(op)
+		}
+		prep.SQL = x.SQL
+		x, pt, p.stmt = prep, args, prep
+	}
 	if !x.DML {
 		return
 	}
 
 	var ti *TableInfo
 	if x.Table.Name != "" {
-		ti, _ = a.resolve(st, x.Table)
-		p.table = tableKey(x.Table, ti)
+		var tmp *tempTable
+		ti, tmp, _ = a.tableFor(st, x.Table)
+		if tmp == nil {
+			p.table = tableKey(x.Table, ti)
+		} // a temporary table is private to its session: never cached
+		p.ti = ti
 	}
 
 	// INSERT without a column list: the schema says which position is the tenant.
 	x.Inserts = append(x.Inserts, a.rawInserts(x, ti)...)
 
-	// Tenant values named by the statement, including bound parameters.
-	tenants := append([]string(nil), x.Tenants...)
-	for _, n := range x.Params {
-		if v, ok := pt.resolve(Operand{Param: n, Set: true}); ok {
-			tenants = append(tenants, v)
-		}
+	r := a.analyze(st, x, pt, 0)
+	tenants := dedupe(r.tenants)
+	if r.unresolvedFn {
+		// A function in this statement reads tenant data nothing attributes, so
+		// the tenants the statement does name cannot vouch for all of it.
+		tenants = nil
 	}
-	for _, r := range x.Inserts {
-		if v, ok := pt.resolve(r.Tenant); ok {
-			tenants = append(tenants, v)
-		}
+	if x.Temp != nil {
+		kind, ten := a.provenance(st, r, tenants)
+		p.temp = &tempReg{def: x.Temp, kind: kind, tenants: ten}
 	}
-	tenants = dedupe(tenants)
 
 	// What this statement teaches the cache once it succeeds.
-	for _, r := range x.Inserts {
-		tv, ok := pt.resolve(r.Tenant)
-		if !ok {
+	for _, row := range x.Inserts {
+		tv, ok := pt.resolve(row.Tenant)
+		if !ok || p.table == "" {
 			continue
 		}
-		for _, k := range r.Keys {
-			if kv, ok := pt.resolve(k.Op); ok {
+		for _, k := range row.Keys {
+			if kv, ok := pt.resolve(k.Op); ok && a.keyUsable(ti, k.Col) {
 				p.learn = append(p.learn, learned{cacheKey{p.table, k.Col, normVal(kv)}, tv})
 			}
 		}
 	}
-	if x.Delete {
+	if x.Delete && p.table != "" {
 		for _, pr := range x.Keys {
 			for _, o := range pr.Ops {
 				if v, ok := pt.resolve(o); ok {
@@ -549,21 +866,22 @@ func (a *Attributor) handle(s *proxy.Session, st *state, x Stmt, pt *portal) {
 		}
 	}
 
-	sc := a.classify(st, x)
-	ev := Event{SessionID: s.ID, User: s.User, DB: s.DB, SQL: x.SQL}
-	ev.Scan = sc == scopeTenant && !x.Filtered && !x.Insert
+	sc := r.scope()
+	ev := Event{SessionID: s.ID, User: s.User, DB: s.DB, SQL: x.SQL, Scan: r.scan}
 
 	switch {
 	case len(tenants) > 0:
 		ev.Tenants, ev.Source = tenants, SourceExplicit
 	case sc == scopeUntenanted:
 		ev.Source = SourceUntenanted
+	case sc == scopeDerived:
+		ev.Tenants, ev.Source = dedupe(r.derived), SourceDerived
 	default:
-		have, need, ok := a.keyTenants(p.table, x, pt)
+		have, need, ok := a.keyTenants(p.table, ti, x, pt)
 		switch {
 		case ok && len(need) == 0:
 			ev.Tenants, ev.Source = have, SourceCache
-		case ok && a.lk != nil && sc == scopeTenant && ti != nil && len(need) <= maxLookupKeys:
+		case ok && a.lk != nil && sc == scopeTenant && ti != nil && a.cat.CanRead(ti) && len(need) <= maxLookupKeys:
 			// Ask the database, off the query path; the event is emitted when
 			// the answer arrives.
 			if tcol, _ := a.scopeOf(ti); tcol != "" && hasCols(ti, need) {
@@ -646,7 +964,7 @@ func (a *Attributor) settle(st *state, ev *Event, txnOK bool) {
 	tag := st.curTag()
 	switch ev.Source {
 	case SourceUntenanted, SourceNoMatch:
-	case SourceExplicit, SourceCache, SourceLookup:
+	case SourceExplicit, SourceCache, SourceLookup, SourceDerived:
 		if tag != "" && !sameSet([]string{tag}, ev.Tenants) {
 			ev.Conflict = true
 		}
@@ -672,14 +990,17 @@ func (a *Attributor) settle(st *state, ev *Event, txnOK bool) {
 }
 
 // keyTenants resolves a statement's key predicates through the row cache. ok
-// is false if the statement has no usable key predicate. need lists the keys
-// that were not cached.
-func (a *Attributor) keyTenants(table string, x Stmt, pt *portal) (have []string, need []keyReq, ok bool) {
+// is false if the statement has no usable key predicate (including one on a
+// column that is not provably unique). need lists the keys that were not cached.
+func (a *Attributor) keyTenants(table string, ti *TableInfo, x Stmt, pt *portal) (have []string, need []keyReq, ok bool) {
 	if table == "" || len(x.Keys) == 0 {
 		return nil, nil, false
 	}
 	n := 0
 	for _, pr := range x.Keys {
+		if !a.keyUsable(ti, pr.Col) {
+			return nil, nil, false
+		}
 		for _, o := range pr.Ops {
 			v, resolved := pt.resolve(o)
 			if !resolved {
@@ -782,7 +1103,7 @@ func (a *Attributor) rawInserts(x Stmt, ti *TableInfo) []InsRow {
 		switch {
 		case tIdx < 0 && a.tenants[c]:
 			tIdx = i
-		case a.ex.keys[c]:
+		case a.ex.keys[c] && a.keyUsable(ti, c):
 			keyIdx[c] = i
 		}
 	}

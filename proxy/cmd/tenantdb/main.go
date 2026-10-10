@@ -3,11 +3,13 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"log/slog"
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/akashsaini/tenantdb/internal/attrib"
@@ -30,6 +32,11 @@ func main() {
 		strictFlag   = flag.String("strict", env("TENANTDB_STRICT", "off"), "what to do with statements that cannot be pinned to a tenant: off (just report sources), alert (flag violations in the log), block (refuse to forward them; needs -schema-dsn)")
 		strictExempt = flag.String("strict-exempt", env("TENANTDB_STRICT_EXEMPT", ""), "comma-separated roles never held to the policy (migrations, admin tools)")
 		strictScan   = flag.String("strict-allow-scan", env("TENANTDB_STRICT_ALLOW_SCAN", ""), "comma-separated roles allowed to read across all tenants (reports, analytics)")
+		cacheTTL     = flag.Duration("cache-ttl", time.Hour, "how long a cached row owner is trusted (0: until evicted); bounds staleness after deletes the proxy did not see")
+		tlsCert      = flag.String("tls-cert", env("TENANTDB_TLS_CERT", ""), "server certificate (PEM) so clients can encrypt their connection to the proxy; re-read when the file changes")
+		tlsKey       = flag.String("tls-key", env("TENANTDB_TLS_KEY", ""), "private key (PEM) for -tls-cert")
+		requireTLS   = flag.Bool("require-tls", env("TENANTDB_REQUIRE_TLS", "") == "1", "refuse clients that do not use TLS (needs -tls-cert)")
+		onError      = flag.String("strict-on-error", env("TENANTDB_STRICT_ON_ERROR", "block"), "in -strict=block, what to do with a statement the policy check itself failed on (a bug): block it, or allow it")
 		prewarm      = flag.Bool("prewarm", true, "fill the row cache from the database at startup (needs -schema-dsn)")
 		debug        = flag.Bool("debug", false, "verbose logging")
 	)
@@ -53,6 +60,28 @@ func main() {
 		os.Exit(2)
 	}
 
+	if *onError != "block" && *onError != "allow" {
+		log.Error("bad -strict-on-error (want block or allow)", "value", *onError)
+		os.Exit(2)
+	}
+	var tlsCfg *tls.Config
+	if *tlsCert != "" || *tlsKey != "" {
+		if *tlsCert == "" || *tlsKey == "" {
+			log.Error("-tls-cert and -tls-key go together")
+			os.Exit(2)
+		}
+		rl := &certReloader{certFile: *tlsCert, keyFile: *tlsKey}
+		if _, err := rl.get(nil); err != nil {
+			log.Error("cannot load TLS certificate", "err", err)
+			os.Exit(2)
+		}
+		tlsCfg = &tls.Config{MinVersion: tls.VersionTLS12, GetCertificate: rl.get}
+	}
+	if *requireTLS && tlsCfg == nil {
+		log.Error("-require-tls needs -tls-cert and -tls-key")
+		os.Exit(2)
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
@@ -72,6 +101,10 @@ func main() {
 			log.Error("schema load failed; running without catalog", "err", err)
 		} else {
 			log.Info("schema loaded")
+			if blind := catalog.BlindTables(); len(blind) > 0 {
+				log.Warn("row-level security hides rows from the schema role: row lookups and cache pre-warming skip these tables, so their statements fall back to unknown; give the role BYPASSRLS (read-only) to fix",
+					"tables", blind)
+			}
 		}
 		cancel()
 		go catalog.Refresh(ctx, *schemaEvery, func(err error) { log.Warn("schema refresh failed", "err", err) })
@@ -99,6 +132,7 @@ func main() {
 		TenantColumns: strings.Split(*tenantCols, ","),
 		KeyColumns:    strings.Split(*keyCols, ","),
 		CacheSize:     *cacheSize,
+		CacheTTL:      *cacheTTL,
 	}, func(e attrib.Event) {
 		attrs := []any{"session", e.SessionID, "user", e.User, "db", e.DB,
 			"tenants", e.Tenants, "source", e.Source, "scan", e.Scan, "conflict", e.Conflict, "sql", e.SQL}
@@ -114,6 +148,9 @@ func main() {
 
 	srv := proxy.New(proxy.Config{
 		Observer:            attributor.Observer(),
+		TLS:                 tlsCfg,
+		RequireTLS:          *requireTLS,
+		GateFailClosed:      mode == attrib.StrictBlock && *onError == "block",
 		Listen:              *listen,
 		Upstream:            *upstream,
 		UpstreamTLS:         *upTLS,
@@ -145,4 +182,40 @@ func env(k, def string) string {
 		return v
 	}
 	return def
+}
+
+// certReloader serves a certificate and picks up a renewed one without a
+// restart: the files are re-read when their modification time changes.
+type certReloader struct {
+	certFile, keyFile string
+
+	mu      sync.Mutex
+	cert    *tls.Certificate
+	modTime time.Time
+	checked time.Time
+}
+
+func (r *certReloader) get(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.cert != nil && time.Since(r.checked) < 30*time.Second {
+		return r.cert, nil
+	}
+	r.checked = time.Now()
+	fi, err := os.Stat(r.certFile)
+	if err == nil && r.cert != nil && fi.ModTime().Equal(r.modTime) {
+		return r.cert, nil
+	}
+	c, lerr := tls.LoadX509KeyPair(r.certFile, r.keyFile)
+	if lerr != nil {
+		if r.cert != nil {
+			return r.cert, nil // keep serving the last good certificate
+		}
+		return nil, lerr
+	}
+	r.cert = &c
+	if fi != nil {
+		r.modTime = fi.ModTime()
+	}
+	return r.cert, nil
 }

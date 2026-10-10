@@ -13,12 +13,17 @@ import (
 // Stmt is the tenant information found in one parsed statement.
 type Stmt struct {
 	SQL     string
-	DML     bool     // SELECT/INSERT/UPDATE/DELETE/MERGE: statements that should be attributed
-	Insert  bool     // an INSERT
-	Txn     txnKind  // transaction control, if any
-	Tenants []string // literal tenant values named by the statement (sorted, unique)
-	Params  []int    // 1-based $n parameters compared to the tenant column
-	Set     *SetVar  // a session variable change (SET, RESET, DISCARD ALL, set_config)
+	DML     bool        // SELECT/INSERT/UPDATE/DELETE/MERGE: statements that should be attributed
+	Insert  bool        // an INSERT
+	Txn     txnKind     // transaction control, if any
+	Tenants []string    // literal tenant values named by the statement (sorted, unique)
+	Params  []int       // 1-based $n parameters compared to the tenant column
+	Set     *SetVar     // a session variable change (SET, RESET, DISCARD ALL, set_config)
+	Temp    *TempDef    // creates a temporary table
+	Prepare *SQLPrepare // SQL-level PREPARE
+	Exec    *SQLExec    // SQL-level EXECUTE
+	Dealloc *string     // DEALLOCATE name ("" for ALL)
+	Drops   []TableRef  // tables dropped or truncated
 
 	// Row-cache inputs, filled only for statements that touch a single table.
 	Table   TableRef // zero value when not a single-table statement
@@ -33,6 +38,8 @@ type Stmt struct {
 
 	Tables     []TableRef  // every table the statement names (CTE names excluded)
 	Funcs      []TableRef  // every function it calls
+	Calls      []Call      // the same calls, with their arguments
+	Body       *FuncBody   // a DO block's code
 	RawInserts [][]Operand // INSERT ... VALUES without a column list: positions need the schema
 }
 
@@ -48,6 +55,12 @@ const (
 type Extractor struct {
 	cols map[string]bool // tenant columns
 	keys map[string]bool // columns that identify a row (e.g. id)
+
+	// Set while reading a function body: the function's name and its named
+	// parameters (lower-cased -> 1-based position), so `tenant_id = p_tenant`
+	// is read as "the tenant is argument 1".
+	fname string
+	args  map[string]int
 }
 
 func NewExtractor(tenantColumns, keyColumns []string) *Extractor {
@@ -73,40 +86,7 @@ func (e *Extractor) Parse(sql string) ([]Stmt, error) {
 	}
 	out := make([]Stmt, 0, len(tree.Stmts))
 	for _, raw := range tree.Stmts {
-		st := Stmt{SQL: stmtText(sql, raw)}
-		switch n := raw.Stmt.GetNode().(type) {
-		case *pg_query.Node_InsertStmt:
-			st.DML, st.Insert = true, true
-		case *pg_query.Node_SelectStmt, *pg_query.Node_UpdateStmt,
-			*pg_query.Node_DeleteStmt, *pg_query.Node_MergeStmt:
-			st.DML = true
-		case *pg_query.Node_VariableSetStmt:
-			st.Set = setVar(n.VariableSetStmt)
-		case *pg_query.Node_DiscardStmt:
-			if n.DiscardStmt.Target == pg_query.DiscardMode_DISCARD_ALL {
-				st.Set = &SetVar{ResetAll: true}
-			}
-		case *pg_query.Node_TransactionStmt:
-			switch n.TransactionStmt.Kind {
-			case pg_query.TransactionStmtKind_TRANS_STMT_BEGIN, pg_query.TransactionStmtKind_TRANS_STMT_START:
-				st.Txn = txnBegin
-			case pg_query.TransactionStmtKind_TRANS_STMT_COMMIT, pg_query.TransactionStmtKind_TRANS_STMT_ROLLBACK,
-				pg_query.TransactionStmtKind_TRANS_STMT_PREPARE:
-				st.Txn = txnEnd
-			}
-		}
-		if st.DML {
-			vals, params := map[string]bool{}, map[int]bool{}
-			e.collect(raw.Stmt, vals, params)
-			st.Tenants, st.Params = sortedKeys(vals), sortedInts(params)
-			e.shape(raw.Stmt, &st)
-			st.Tables, st.Funcs = tablesOf(raw.Stmt)
-			st.Filtered = e.filtered(raw.Stmt)
-			if sv := selectSetConfig(raw.Stmt); sv != nil {
-				st.Set = sv
-			}
-		}
-		out = append(out, st)
+		out = append(out, e.stmtFor(stmtText(sql, raw), raw.Stmt))
 	}
 	return out, nil
 }
@@ -147,11 +127,11 @@ func (e *Extractor) aExpr(x *pg_query.A_Expr, vals map[string]bool, params map[i
 	}
 	if list := other.GetList(); list != nil {
 		for _, item := range list.Items {
-			addValue(item, vals, params)
+			e.addValue(item, vals, params)
 		}
 		return
 	}
-	addValue(other, vals, params)
+	e.addValue(other, vals, params)
 }
 
 // eqOther returns the non-column side of `col = x` / `col IN (...)` when col
@@ -198,13 +178,13 @@ func (e *Extractor) insert(s *pg_query.InsertStmt, vals map[string]bool, params 
 	}
 	for _, row := range sel.ValuesLists {
 		if items := row.GetList(); items != nil && idx < len(items.Items) {
-			addValue(items.Items[idx], vals, params)
+			e.addValue(items.Items[idx], vals, params)
 		}
 	}
 }
 
-func addValue(n *pg_query.Node, vals map[string]bool, params map[int]bool) {
-	op := operand(n)
+func (e *Extractor) addValue(n *pg_query.Node, vals map[string]bool, params map[int]bool) {
+	op := e.operand(n)
 	switch {
 	case !op.Set:
 	case op.Param > 0:

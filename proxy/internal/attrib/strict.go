@@ -155,6 +155,18 @@ func (a *Attributor) gate(s *proxy.Session, msg pgproto3.FrontendMessage) *proxy
 	st.gather, st.gathered = true, nil
 	st.mu.Unlock()
 
+	// If attribution panics, put the bookkeeping back before the proxy decides
+	// what to do: the statement may be refused and never reach the database.
+	defer func() {
+		if r := recover(); r != nil {
+			st.mu.Lock()
+			st.gather, st.gathered = false, nil
+			st.reject(snap)
+			st.mu.Unlock()
+			panic(r)
+		}
+	}()
+
 	a.OnFrontend(s, msg)
 
 	st.mu.Lock()

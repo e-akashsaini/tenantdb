@@ -19,10 +19,18 @@ type TableInfo struct {
 	Kind   byte     // pg_class.relkind: r table, p partitioned, v view, m matview, f foreign
 	Cols   []string // lower-cased, in physical order, dropped columns excluded
 	raw    []string // original spelling of Cols, for quoting
+
+	unique map[string]bool // columns with a single-column, non-partial unique index
+	rls    bool            // row-level security is enabled
 }
 
 // Key is the name the row cache uses for this table.
 func (t *TableInfo) Key() string { return strings.ToLower(t.Schema + "." + t.Name) }
+
+// IsUnique reports whether col is provably unique in this table: it has a
+// single-column unique index (a primary key or unique constraint) that is not
+// partial. Only such a column can identify a row.
+func (t *TableInfo) IsUnique(col string) bool { return t.unique[col] }
 
 // quoted returns the column's original spelling, safe to use in SQL.
 func (t *TableInfo) quoted(lower string) string {
@@ -36,6 +44,17 @@ func (t *TableInfo) quoted(lower string) string {
 
 func (t *TableInfo) qualified() string { return pgx.Identifier{t.Schema, t.Name}.Sanitize() }
 
+// FuncDef is an application-defined function or procedure as stored in pg_proc.
+type FuncDef struct {
+	Schema, Name string
+	Lang         string
+	Kind         byte // f function, p procedure, a aggregate, w window
+	Src          string
+	ArgNames     []string
+	NArgs        int
+	HasModes     bool // some arguments are OUT/INOUT/VARIADIC/TABLE
+}
+
 // isSystemSchema holds relations that never contain tenant data.
 func isSystemSchema(s string) bool { return s == "pg_catalog" || s == "information_schema" }
 
@@ -44,15 +63,21 @@ var defaultSearchPath = []string{"$user", "public"}
 
 // Catalog is a snapshot of the database schema, loaded over its own
 // connection (a read-only role is enough). It answers "which tables carry a
-// tenant column", "what is the column order" and "which functions are user
-// code" without touching live traffic.
+// tenant column", "which columns are unique", "what is the column order",
+// "which functions are user code" and "what search_path does this role get"
+// without touching live traffic.
 type Catalog struct {
 	dsn       string
 	mu        sync.RWMutex
 	tables    map[string]*TableInfo // "schema.name", lower-cased
-	funcs     map[string]bool       // "schema.name" of user-defined functions
+	funcs     map[string][]*FuncDef // "schema.name" of user-defined functions
+	gen       uint64
 	loaded    bool
 	reloading atomic.Bool
+
+	bypassRLS  bool                   // the loading role is not subject to row-level security
+	roleSearch map[[2]string][]string // (role, database) -> search_path from ALTER ROLE/DATABASE ... SET
+	baseSearch []string
 }
 
 func NewCatalog(dsn string) *Catalog { return &Catalog{dsn: dsn} }
@@ -60,7 +85,7 @@ func NewCatalog(dsn string) *Catalog { return &Catalog{dsn: dsn} }
 // pg_catalog rather than information_schema: the latter hides columns the role
 // cannot read, which would make shared and tenant tables look the same.
 const catalogSQL = `
-SELECT n.nspname, c.relname, c.relkind::text, a.attname
+SELECT n.nspname, c.relname, c.relkind::text, a.attname, c.relrowsecurity
 FROM pg_attribute a
 JOIN pg_class c ON c.oid = a.attrelid
 JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -69,19 +94,49 @@ WHERE c.relkind IN ('r','p','v','m','f')
   AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp%'
 ORDER BY n.nspname, c.relname, a.attnum`
 
+// Single-column unique indexes, excluding partial and expression indexes: only
+// those make a column's value identify exactly one row.
+const uniqueSQL = `
+SELECT n.nspname, c.relname, a.attname
+FROM pg_index i
+JOIN pg_class c ON c.oid = i.indrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = i.indkey[0]
+WHERE i.indisunique AND i.indisvalid AND i.indnatts = 1 AND i.indpred IS NULL AND i.indexprs IS NULL
+  AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp%'`
+
 // Functions that belong to an extension (deptype 'e') are not user code.
 const funcSQL = `
-SELECT n.nspname, p.proname
+SELECT n.nspname, p.proname, l.lanname, p.prokind::text, p.prosrc,
+       COALESCE(p.proargnames, '{}'::text[]), p.pronargs::int, p.proargmodes IS NOT NULL
 FROM pg_proc p
 JOIN pg_namespace n ON n.oid = p.pronamespace
+JOIN pg_language l ON l.oid = p.prolang
 WHERE n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%'
   AND NOT EXISTS (SELECT 1 FROM pg_depend d
                   WHERE d.classid = 'pg_proc'::regclass AND d.objid = p.oid AND d.deptype = 'e')`
+
+const roleSettingSQL = `
+SELECT COALESCE(r.rolname, ''), COALESCE(d.datname, ''), s.setconfig
+FROM pg_db_role_setting s
+LEFT JOIN pg_roles r ON r.oid = s.setrole
+LEFT JOIN pg_database d ON d.oid = s.setdatabase`
 
 type colRow struct {
 	schema, table string
 	kind          byte // 0 means an ordinary table
 	col           string
+	rls           bool
+}
+
+// snapshotData is everything one Load reads.
+type snapshotData struct {
+	cols       []colRow
+	unique     map[string]map[string]bool // table key -> unique columns
+	funcs      []*FuncDef
+	bypassRLS  bool
+	roleSearch map[[2]string][]string
+	baseSearch []string
 }
 
 // Load replaces the snapshot with the current schema.
@@ -91,26 +146,47 @@ func (c *Catalog) Load(ctx context.Context) error {
 		return fmt.Errorf("catalog connect: %w", err)
 	}
 	defer conn.Close(ctx)
+	d := snapshotData{unique: map[string]map[string]bool{}, roleSearch: map[[2]string][]string{}}
 
 	rows, err := conn.Query(ctx, catalogSQL)
 	if err != nil {
 		return fmt.Errorf("catalog query: %w", err)
 	}
-	var all []colRow
 	for rows.Next() {
 		var r colRow
 		var kind string
-		if err := rows.Scan(&r.schema, &r.table, &kind, &r.col); err != nil {
+		if err := rows.Scan(&r.schema, &r.table, &kind, &r.col, &r.rls); err != nil {
 			rows.Close()
 			return err
 		}
 		if kind != "" {
 			r.kind = kind[0]
 		}
-		all = append(all, r)
+		d.cols = append(d.cols, r)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	urows, err := conn.Query(ctx, uniqueSQL)
+	if err != nil {
+		return fmt.Errorf("catalog unique indexes: %w", err)
+	}
+	for urows.Next() {
+		var s, t, col string
+		if err := urows.Scan(&s, &t, &col); err != nil {
+			urows.Close()
+			return err
+		}
+		k := strings.ToLower(s + "." + t)
+		if d.unique[k] == nil {
+			d.unique[k] = map[string]bool{}
+		}
+		d.unique[k][strings.ToLower(col)] = true
+	}
+	urows.Close()
+	if err := urows.Err(); err != nil {
 		return err
 	}
 
@@ -118,26 +194,61 @@ func (c *Catalog) Load(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("catalog functions: %w", err)
 	}
-	funcs := map[string]bool{}
 	for frows.Next() {
-		var s, n string
-		if err := frows.Scan(&s, &n); err != nil {
+		f := &FuncDef{}
+		var kind string
+		if err := frows.Scan(&f.Schema, &f.Name, &f.Lang, &kind, &f.Src, &f.ArgNames, &f.NArgs, &f.HasModes); err != nil {
 			frows.Close()
 			return err
 		}
-		funcs[strings.ToLower(s+"."+n)] = true
+		if kind != "" {
+			f.Kind = kind[0]
+		}
+		d.funcs = append(d.funcs, f)
 	}
 	frows.Close()
 	if err := frows.Err(); err != nil {
 		return err
 	}
-	c.set(all, funcs)
+
+	// Row-level security can blind the lookup role; know whether it is subject to it.
+	if err := conn.QueryRow(ctx, `SELECT COALESCE((SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname = current_user), false)`).Scan(&d.bypassRLS); err != nil {
+		return fmt.Errorf("catalog rls: %w", err)
+	}
+
+	srows, err := conn.Query(ctx, roleSettingSQL)
+	if err != nil {
+		return fmt.Errorf("catalog role settings: %w", err)
+	}
+	for srows.Next() {
+		var role, db string
+		var conf []string
+		if err := srows.Scan(&role, &db, &conf); err != nil {
+			srows.Close()
+			return err
+		}
+		for _, kv := range conf {
+			if k, v, ok := strings.Cut(kv, "="); ok && strings.EqualFold(k, "search_path") {
+				d.roleSearch[[2]string{role, db}] = splitPath(v)
+			}
+		}
+	}
+	srows.Close()
+	if err := srows.Err(); err != nil {
+		return err
+	}
+	var base string
+	if err := conn.QueryRow(ctx, `SELECT reset_val FROM pg_settings WHERE name = 'search_path'`).Scan(&base); err == nil {
+		d.baseSearch = splitPath(base)
+	}
+
+	c.apply(d)
 	return nil
 }
 
-func (c *Catalog) set(rows []colRow, funcs map[string]bool) {
+func (c *Catalog) apply(d snapshotData) {
 	m := map[string]*TableInfo{}
-	for _, r := range rows {
+	for _, r := range d.cols {
 		key := strings.ToLower(r.schema + "." + r.table)
 		ti := m[key]
 		if ti == nil {
@@ -145,17 +256,21 @@ func (c *Catalog) set(rows []colRow, funcs map[string]bool) {
 			if kind == 0 {
 				kind = 'r'
 			}
-			ti = &TableInfo{Schema: r.schema, Name: r.table, Kind: kind}
+			ti = &TableInfo{Schema: r.schema, Name: r.table, Kind: kind, rls: r.rls, unique: d.unique[key]}
 			m[key] = ti
 		}
 		ti.Cols = append(ti.Cols, strings.ToLower(r.col))
 		ti.raw = append(ti.raw, r.col)
 	}
-	if funcs == nil {
-		funcs = map[string]bool{}
+	funcs := map[string][]*FuncDef{}
+	for _, f := range d.funcs {
+		k := strings.ToLower(f.Schema + "." + f.Name)
+		funcs[k] = append(funcs[k], f)
 	}
 	c.mu.Lock()
 	c.tables, c.funcs, c.loaded = m, funcs, true
+	c.bypassRLS, c.roleSearch, c.baseSearch = d.bypassRLS, d.roleSearch, d.baseSearch
+	c.gen++
 	c.mu.Unlock()
 }
 
@@ -197,6 +312,13 @@ func (c *Catalog) Loaded() bool {
 	return c.loaded
 }
 
+// Generation changes every time the snapshot is replaced.
+func (c *Catalog) Generation() uint64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.gen
+}
+
 // Table finds the table ref names, the way Postgres would: a schema-qualified
 // name is looked up directly; an unqualified one is searched for along
 // searchPath (with pg_catalog implicitly first), "$user" standing for user.
@@ -221,23 +343,72 @@ func (c *Catalog) Table(ref TableRef, searchPath []string, user string) (*TableI
 	return nil, false
 }
 
-// UserFunc reports whether ref is a function written by the application (not
-// built in, not from an extension), resolved like Table.
-func (c *Catalog) UserFunc(ref TableRef, searchPath []string, user string) bool {
+// Funcs returns the application-defined functions ref could name (every
+// overload), resolved like Table.
+func (c *Catalog) Funcs(ref TableRef, searchPath []string, user string) []*FuncDef {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if ref.Schema != "" {
 		return c.funcs[ref.Schema+"."+ref.Name]
 	}
+	var out []*FuncDef
 	for _, s := range searchPath {
 		if s == "$user" {
 			s = strings.ToLower(user)
 		}
-		if c.funcs[s+"."+ref.Name] {
-			return true
+		out = append(out, c.funcs[s+"."+ref.Name]...)
+	}
+	return out
+}
+
+// UserFunc reports whether ref is a function written by the application (not
+// built in, not from an extension).
+func (c *Catalog) UserFunc(ref TableRef, searchPath []string, user string) bool {
+	return len(c.Funcs(ref, searchPath, user)) > 0
+}
+
+// DefaultSearchPath is the search_path a new connection of user to db starts
+// with: ALTER ROLE ... IN DATABASE ... SET, then ALTER ROLE, then ALTER
+// DATABASE, then the server-wide ALTER ... ALL SET, then the server default.
+func (c *Catalog) DefaultSearchPath(user, db string) []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, k := range [][2]string{{user, db}, {user, ""}, {"", db}, {"", ""}} {
+		if p, ok := c.roleSearch[k]; ok {
+			return p
 		}
 	}
-	return false
+	if len(c.baseSearch) > 0 {
+		return c.baseSearch
+	}
+	return defaultSearchPath
+}
+
+// CanRead reports whether the catalog's role sees every row of ti. Row-level
+// security hides rows from a role that does not bypass it, so a lookup or a
+// warm-up against such a table would silently miss rows.
+func (c *Catalog) CanRead(ti *TableInfo) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return !ti.rls || c.bypassRLS
+}
+
+// BlindTables lists tables the catalog's role cannot fully read because of
+// row-level security, for a start-up warning.
+func (c *Catalog) BlindTables() []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.bypassRLS {
+		return nil
+	}
+	var out []string
+	for _, t := range c.tables {
+		if t.rls {
+			out = append(out, t.Key())
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // all returns the tables in a stable order.

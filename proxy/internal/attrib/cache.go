@@ -4,13 +4,15 @@ import (
 	"container/list"
 	"strings"
 	"sync"
+	"time"
 )
 
 type cacheKey struct{ table, col, val string }
 
 type cacheEntry struct {
-	key    cacheKey
-	tenant string
+	key     cacheKey
+	tenant  string
+	expires time.Time // zero: never
 }
 
 // RowCache remembers which tenant owns a row, keyed by (table, key column,
@@ -18,15 +20,30 @@ type cacheEntry struct {
 type RowCache struct {
 	mu  sync.Mutex
 	max int
+	ttl time.Duration
+	now func() time.Time
 	ll  *list.List
 	m   map[cacheKey]*list.Element
 }
 
-func NewRowCache(max int) *RowCache {
+func NewRowCache(max int) *RowCache { return NewRowCacheTTL(max, 0) }
+
+// NewRowCacheTTL returns a cache whose entries are trusted for ttl after they
+// were last written (0: until evicted). A row's tenant almost never changes,
+// but the proxy cannot see every delete; the TTL bounds how long a stale entry
+// can survive.
+func NewRowCacheTTL(max int, ttl time.Duration) *RowCache {
 	if max <= 0 {
 		max = 100_000
 	}
-	return &RowCache{max: max, ll: list.New(), m: map[cacheKey]*list.Element{}}
+	return &RowCache{max: max, ttl: ttl, now: time.Now, ll: list.New(), m: map[cacheKey]*list.Element{}}
+}
+
+func (c *RowCache) deadline() time.Time {
+	if c.ttl <= 0 {
+		return time.Time{}
+	}
+	return c.now().Add(c.ttl)
 }
 
 // normVal makes equal values compare equal: UUIDs are case-insensitive.
@@ -40,12 +57,19 @@ func normVal(v string) string {
 func (c *RowCache) Get(table, col, val string) (string, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	el, ok := c.m[cacheKey{table, col, normVal(val)}]
+	k := cacheKey{table, col, normVal(val)}
+	el, ok := c.m[k]
 	if !ok {
 		return "", false
 	}
+	e := el.Value.(*cacheEntry)
+	if !e.expires.IsZero() && c.now().After(e.expires) {
+		delete(c.m, k)
+		c.ll.Remove(el)
+		return "", false
+	}
 	c.ll.MoveToFront(el)
-	return el.Value.(*cacheEntry).tenant, true
+	return e.tenant, true
 }
 
 func (c *RowCache) Put(table, col, val, tenant string) {
@@ -53,11 +77,12 @@ func (c *RowCache) Put(table, col, val, tenant string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if el, ok := c.m[k]; ok {
-		el.Value.(*cacheEntry).tenant = tenant
+		e := el.Value.(*cacheEntry)
+		e.tenant, e.expires = tenant, c.deadline()
 		c.ll.MoveToFront(el)
 		return
 	}
-	c.m[k] = c.ll.PushFront(&cacheEntry{k, tenant})
+	c.m[k] = c.ll.PushFront(&cacheEntry{key: k, tenant: tenant, expires: c.deadline()})
 	for c.ll.Len() > c.max {
 		last := c.ll.Back()
 		delete(c.m, last.Value.(*cacheEntry).key)

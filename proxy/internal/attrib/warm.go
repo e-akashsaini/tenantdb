@@ -31,6 +31,11 @@ func (a *Attributor) Warm(ctx context.Context, dsn string, maxRows int, log *slo
 	}
 	var jobs []job
 	for _, ti := range a.cat.all() {
+		// A table the role cannot fully read (row-level security) would warm a
+		// partial picture; leave it to be resolved row by row.
+		if !a.cat.CanRead(ti) {
+			continue
+		}
 		if tcol, keys := a.scopeOf(ti); tcol != "" && len(keys) > 0 {
 			jobs = append(jobs, job{ti, tcol, keys})
 		}
@@ -101,7 +106,7 @@ func (a *Attributor) scopeOf(ti *TableInfo) (tenantCol string, keys []string) {
 		switch {
 		case tenantCol == "" && a.tenants[c]:
 			tenantCol = c
-		case a.ex.keys[c]:
+		case a.ex.keys[c] && ti.IsUnique(c):
 			keys = append(keys, c)
 		}
 	}

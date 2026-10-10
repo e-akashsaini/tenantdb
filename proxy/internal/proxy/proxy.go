@@ -31,6 +31,17 @@ type Config struct {
 	DialTimeout         time.Duration
 	Observer            Observer
 	Logger              *slog.Logger
+
+	// TLS, if set, lets clients encrypt their connection to the proxy (the
+	// server certificate and key). Without it the proxy answers a client's TLS
+	// request with "no" and the client falls back to plaintext.
+	TLS *tls.Config
+	// RequireTLS refuses clients that do not encrypt. Needs TLS.
+	RequireTLS bool
+	// GateFailClosed makes a Gate that panics reject the statement instead of
+	// letting it through. For block mode: a statement nobody could check is not
+	// one anybody should run.
+	GateFailClosed bool
 }
 
 // Server accepts client connections and relays them to the upstream.
@@ -141,6 +152,7 @@ func (s *Server) handle(client net.Conn) {
 	backend := pgproto3.NewBackend(client, client)
 
 	var startup *pgproto3.StartupMessage
+	secure := false
 	for startup == nil {
 		msg, err := backend.ReceiveStartupMessage()
 		if err != nil {
@@ -152,8 +164,27 @@ func (s *Server) handle(client net.Conn) {
 		switch m := msg.(type) {
 		case *pgproto3.StartupMessage:
 			startup = m
-		case *pgproto3.SSLRequest, *pgproto3.GSSEncRequest:
-			// The client-facing side is plaintext for now; the client falls back.
+		case *pgproto3.SSLRequest:
+			if s.cfg.TLS == nil || secure {
+				// No certificate configured (or already encrypted): the client falls back.
+				if _, err := client.Write([]byte{'N'}); err != nil {
+					return
+				}
+				continue
+			}
+			if _, err := client.Write([]byte{'S'}); err != nil {
+				return
+			}
+			tc := tls.Server(client, s.cfg.TLS)
+			_ = tc.SetDeadline(time.Now().Add(s.cfg.DialTimeout))
+			if err := tc.Handshake(); err != nil {
+				log.Debug("client TLS handshake failed", "err", err)
+				return
+			}
+			_ = tc.SetDeadline(time.Time{})
+			client, secure = tc, true
+			backend = pgproto3.NewBackend(tc, tc)
+		case *pgproto3.GSSEncRequest:
 			if _, err := client.Write([]byte{'N'}); err != nil {
 				return
 			}
@@ -164,6 +195,11 @@ func (s *Server) handle(client net.Conn) {
 			log.Debug("unexpected startup message", "type", fmt.Sprintf("%T", msg))
 			return
 		}
+	}
+
+	if s.cfg.RequireTLS && !secure {
+		sendFatal(backend, "28000", "tenantdb: this server requires an encrypted (TLS) connection")
+		return
 	}
 
 	up, err := s.dialUpstream()
@@ -259,13 +295,15 @@ func (s *Server) pumpUpstream(log *slog.Logger, sess *Session, backend *pgproto3
 }
 
 // safeObserve keeps a panicking observer from killing the connection (fail open).
-func (s *Server) safeObserve(log *slog.Logger, fn func()) {
+func (s *Server) safeObserve(log *slog.Logger, fn func()) (panicked bool) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Error("observer panic", "panic", r)
+			panicked = true
 		}
 	}()
 	fn()
+	return false
 }
 
 func (s *Server) dialUpstream() (net.Conn, error) {
