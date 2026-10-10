@@ -227,21 +227,6 @@ level=WARN msg=violation session=9 ... source=unknown violation=unknown sql="SEL
 level=WARN msg=blocked   session=9 ... source=scan scan=true violation=scan sql="UPDATE orders SET amount = -1"
 ```
 
-## Known limits
-
-What is genuinely not handled:
-
-- **No connection pooling.** It's one upstream connection per client connection. Pooling changes how authentication works (the proxy would have to authenticate clients itself), so it is a design decision, not a patch.
-- **Code the proxy can't read stays `unknown`.** Dynamic SQL inside a function (`EXECUTE` of a computed string), and functions in languages other than SQL and PL/pgSQL. That's inherent: what such code touches is only decided at run time. Use a [connection tag](#connection-tag) for those paths, or an exempt role.
-- **Polymorphic associations are resolved only when they can be verified.** A type that has no rows yet (nothing to check the class-to-table mapping against), a class whose table doesn't follow Rails' naming, or ids supplied by a subquery are flagged.
-- **Lookups by credential can't be attributed.** An API-token or session lookup is how the application *finds out* the tenant. Give such connections a [connection tag](#connection-tag) or an exempt role.
-- **A foreign key can only be verified when there are rows.** A `<thing>_id` column on an empty table is not used until the table has data.
-- **Triggers and rules aren't analysed.** A trigger fired by a statement can touch other tables; the proxy only sees the statement itself.
-- **A function is attributed from its arguments only where its body compares the tenant column to a parameter** (or hardcodes the tenant). Anything subtler is `unknown`.
-- **A cached row owner can be stale for up to `-cache-ttl`** after a delete the proxy didn't see (a cascade, or another path to the database) followed by key reuse. Primary keys that are never reused (serials, UUIDs) are unaffected. Lower the TTL, or set `-key-columns=` to turn the cache off and resolve every row from the database.
-- **`COPY ... FROM STDIN` isn't inspected row by row.** In `block` mode it is refused unless the role is exempt.
-- **The role/database `search_path` defaults are read at schema-refresh time**, so a change takes up to `-schema-refresh` (or the next DDL) to be seen.
-
 ## Development
 
 ```bash
