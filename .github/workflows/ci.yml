@@ -1,0 +1,125 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: vet, format, tests (-race)
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: pw
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      TENANTDB_TEST_DSN: postgres://postgres:pw@127.0.0.1:5432/postgres
+    defaults:
+      run:
+        working-directory: proxy
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: proxy/go.mod
+          cache-dependency-path: proxy/go.sum
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - run: go vet ./...
+      - name: tests
+        run: go test -race -count=1 ./...
+
+  fuzz:
+    name: differential fuzzing against PostgreSQL
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: pw
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      TENANTDB_TEST_DSN: postgres://postgres:pw@127.0.0.1:5432/postgres
+    defaults:
+      run:
+        working-directory: proxy
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: proxy/go.mod
+          cache-dependency-path: proxy/go.sum
+      - name: random statements, run for real, compared with what was claimed
+        run: |
+          for seed in 101 102 103 104; do
+            TENANTDB_FUZZ_N=6000 TENANTDB_FUZZ_SEED=$seed go test -count=1 -run 'TestDifferential|TestCopyParserAgreesWithPostgres' ./internal/attrib
+          done
+
+  e2e:
+    name: end to end (config, logs, metrics, graceful shutdown)
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: pw
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: proxy/go.mod
+          cache-dependency-path: proxy/go.sum
+      - run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - run: bench/ops/e2e.sh
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: "5432"
+          PGUSER: postgres
+          PGPASSWORD: pw
+
+  vuln:
+    name: govulncheck
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: proxy
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: proxy/go.mod
+          cache-dependency-path: proxy/go.sum
+      - run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  docker:
+    name: the image builds and starts
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: tenantdb:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: it runs
+        run: docker run --rm tenantdb:ci -version

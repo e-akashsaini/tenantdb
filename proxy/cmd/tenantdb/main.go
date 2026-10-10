@@ -21,6 +21,9 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "analyze" {
 		os.Exit(runAnalyze(os.Args[2:]))
 	}
+	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
+		os.Exit(runHealthcheck(os.Args[2:]))
+	}
 	var (
 		listen       = flag.String("listen", env("TENANTDB_LISTEN", ":6432"), "address to accept clients on")
 		upstream     = flag.String("upstream", env("TENANTDB_UPSTREAM", "127.0.0.1:5432"), "host:port of the PostgreSQL server")

@@ -255,3 +255,26 @@ func TestEventsAreCounted(t *testing.T) {
 		}
 	}
 }
+
+func TestHealthcheckSubcommand(t *testing.T) {
+	up, _ := net.Listen("tcp", "127.0.0.1:0")
+	defer up.Close()
+	ts, _, _ := adminFixture(t, up.Addr().String(), false, nil, false)
+	if rc := runHealthcheck([]string{"-url", ts.URL + "/readyz"}); rc != 0 {
+		t.Errorf("a ready instance: exit %d", rc)
+	}
+	if rc := runHealthcheck([]string{"-url", ts.URL + "/nope", "-timeout", "1s"}); rc != 1 {
+		t.Errorf("a 404: exit %d", rc)
+	}
+	bad, _, _ := adminFixture(t, "127.0.0.1:1", false, nil, false)
+	if rc := runHealthcheck([]string{"-url", bad.URL + "/readyz"}); rc != 1 {
+		t.Errorf("an instance that cannot reach its database: exit %d", rc)
+	}
+	if rc := runHealthcheck([]string{"-url", "http://127.0.0.1:1/readyz", "-timeout", "1s"}); rc != 1 {
+		t.Errorf("nothing listening: exit %d", rc)
+	}
+	t.Setenv("TENANTDB_ADMIN_ADDR", "0.0.0.0:1")
+	if rc := runHealthcheck([]string{"-timeout", "1s"}); rc != 1 {
+		t.Errorf("the default URL comes from TENANTDB_ADMIN_ADDR: exit %d", rc)
+	}
+}

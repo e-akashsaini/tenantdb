@@ -3,9 +3,14 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/pprof"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -129,4 +134,39 @@ func (a *adminServer) serve(ctx context.Context, addr string, pprofOn bool) (net
 func isLoopback(a net.Addr) bool {
 	t, ok := a.(*net.TCPAddr)
 	return ok && t.IP.IsLoopback()
+}
+
+// runHealthcheck is `tenantdb healthcheck [-url ...]`: it asks a running
+// instance's /readyz and exits 0 if it is ready. For container health checks
+// and exec probes, where the image has no curl.
+func runHealthcheck(args []string) int {
+	fs := flag.NewFlagSet("healthcheck", flag.ContinueOnError)
+	def := "http://127.0.0.1:9187/readyz"
+	if a := os.Getenv("TENANTDB_ADMIN_ADDR"); a != "" {
+		host, port, err := net.SplitHostPort(a)
+		if err == nil {
+			if host == "" || host == "0.0.0.0" || host == "::" {
+				host = "127.0.0.1"
+			}
+			def = "http://" + net.JoinHostPort(host, port) + "/readyz"
+		}
+	}
+	url := fs.String("url", def, "the /readyz (or /healthz) URL to ask")
+	timeout := fs.Duration("timeout", 3*time.Second, "give up after this long")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	c := &http.Client{Timeout: *timeout}
+	resp, err := c.Get(*url)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "unhealthy:", err)
+		return 1
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if resp.StatusCode != http.StatusOK {
+		fmt.Fprintf(os.Stderr, "unhealthy: %s: %s\n", resp.Status, strings.TrimSpace(string(body)))
+		return 1
+	}
+	return 0
 }

@@ -1,0 +1,7 @@
+.git
+.github
+bench
+docs
+LIMITS.md
+*.md
+**/*_test.go
