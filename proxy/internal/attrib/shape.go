@@ -30,6 +30,9 @@ type SetVar struct {
 	ValueOps []Operand
 }
 
+// varCurrentUser stands for current_user: the role the session runs as.
+const varCurrentUser = "\x00current_user"
+
 // Operand is a literal, a $n parameter reference, or the current value of a
 // session variable: current_setting('app.tenant'), the way applications that use
 // Postgres row-level security carry the tenant.
@@ -77,6 +80,12 @@ func (e *Extractor) operand(n *pg_query.Node) Operand {
 			return Operand{Lit: strconv.Itoa(int(c.GetIval().Ival)), Set: true}
 		case c.GetFval() != nil:
 			return Operand{Lit: c.GetFval().Fval, Set: true}
+		}
+	}
+	if f := n.GetSqlvalueFunction(); f != nil {
+		switch f.Op {
+		case pg_query.SQLValueFunctionOp_SVFOP_CURRENT_USER, pg_query.SQLValueFunctionOp_SVFOP_USER:
+			return Operand{Var: varCurrentUser, Set: true}
 		}
 	}
 	if fc := n.GetFuncCall(); fc != nil && len(fc.Funcname) > 0 && len(fc.Args) >= 1 &&

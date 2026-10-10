@@ -258,6 +258,7 @@ type state struct {
 	txnGen    uint64   // bumped whenever a transaction ends
 
 	vars, localVars map[string]string // custom session variables (SET app.x = ..., set_config): current_setting() reads them
+	roleS, roleL    roleState         // SET ROLE / SET SESSION AUTHORIZATION: session and SET LOCAL
 	path, localPath []string          // search_path: session value and SET LOCAL value
 	tag, localTag   string            // declared tenant: session value and SET LOCAL value
 
@@ -294,6 +295,9 @@ func (st *state) curTag() string {
 // val resolves an operand: a literal, a bound parameter, or the current value of
 // a session variable (unknown if nothing on this connection has set it).
 func (st *state) val(pt *portal, op Operand) (string, bool) {
+	if op.Var == varCurrentUser {
+		return st.effRole()
+	}
 	if op.Var != "" {
 		if v, ok := st.localVars[op.Var]; ok {
 			return v, true
@@ -309,6 +313,7 @@ func (st *state) val(pt *portal, op Operand) (string, bool) {
 func (st *state) resetTxn() {
 	st.inTxn, st.txnTenant = false, nil
 	st.localPath, st.localTag, st.localVars = nil, "", nil
+	st.roleL = roleState{}
 	st.txnGen++
 }
 
@@ -647,7 +652,7 @@ const maxCallDepth = 6
 // the tenant the caller passed. Dynamic SQL cannot be read and stays unsure.
 func (a *Attributor) analyze(st *state, x Stmt, pt *portal, depth int, owners ownerSet) analysis {
 	var r analysis
-	r.cr = a.confine(st, x, pt, owners)
+	r.cr = a.confine(st, x, pt, owners, depth == 0)
 	switch {
 	case x.Insert:
 		// The tenants are those of the rows being written, and every row must name one.
@@ -1204,6 +1209,11 @@ func (a *Attributor) applySet(st *state, sv *SetVar) {
 	if sv.ResetAll {
 		st.path, st.localPath, st.tag, st.localTag = nil, nil, "", ""
 		st.vars, st.localVars = map[string]string{}, nil
+		st.roleS, st.roleL = roleState{}, roleState{}
+		return
+	}
+	if sv.Name == "role" || sv.Name == "session_authorization" {
+		st.applyRole(sv)
 		return
 	}
 	if strings.Contains(sv.Name, ".") {

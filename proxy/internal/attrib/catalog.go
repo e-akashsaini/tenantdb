@@ -77,6 +77,7 @@ type Catalog struct {
 	funcs     map[string][]*FuncDef // "schema.name" of user-defined functions
 	triggers  map[string][]trigRow  // table key -> its enabled, non-internal triggers
 	ruled     map[string]bool       // tables with rewrite rules (CREATE RULE): their actions are not read
+	rls       *rlsData              // roles, table ownership and policies (rls.go)
 	gen       uint64
 	loaded    bool
 	reloading atomic.Bool
@@ -213,6 +214,7 @@ type snapshotData struct {
 	viewdefs   map[string]string // table key -> definition
 	triggers   map[string][]trigRow
 	ruled      map[string]bool
+	rls        *rlsData
 }
 
 // trigRow is one trigger: tgtype's bits say when it fires (insert 4, delete 8,
@@ -305,6 +307,7 @@ func (c *Catalog) Load(ctx context.Context) error {
 	d.viewdefs = loadViewDefs(ctx, conn)
 	d.triggers = loadTriggers(ctx, conn)
 	d.ruled = loadRuled(ctx, conn)
+	d.rls = loadRLS(ctx, conn)
 
 	// Row-level security can blind the lookup role; know whether it is subject to it.
 	if err := conn.QueryRow(ctx, `SELECT COALESCE((SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname = current_user), false)`).Scan(&d.bypassRLS); err != nil {
@@ -464,7 +467,7 @@ func (c *Catalog) apply(d snapshotData) {
 		funcs[k] = append(funcs[k], f)
 	}
 	c.mu.Lock()
-	c.tables, c.funcs, c.triggers, c.ruled, c.loaded = m, funcs, d.triggers, d.ruled, true
+	c.tables, c.funcs, c.triggers, c.ruled, c.rls, c.loaded = m, funcs, d.triggers, d.ruled, d.rls, true
 	c.bypassRLS, c.roleSearch, c.baseSearch = d.bypassRLS, d.roleSearch, d.baseSearch
 	if d.fks != nil {
 		c.fks = d.fks

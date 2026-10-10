@@ -22,11 +22,12 @@ type catSpec struct {
 	views      map[string]string // "schema.view" -> definition
 	triggers   map[string][]trigRow
 	ruled      map[string]bool
+	rlsd       *rlsData // roles, owners and policies
 }
 
 func (sp catSpec) snapshot() snapshotData {
 	d := snapshotData{cols: sp.rows, unique: map[string]map[string]bool{}, funcs: sp.funcs,
-		bypassRLS: !sp.subjectRLS, roleSearch: sp.roleSearch, baseSearch: sp.baseSearch, fks: sp.fks, polys: sp.polys, viewdefs: sp.views, triggers: sp.triggers, ruled: sp.ruled}
+		bypassRLS: !sp.subjectRLS, roleSearch: sp.roleSearch, baseSearch: sp.baseSearch, fks: sp.fks, polys: sp.polys, viewdefs: sp.views, triggers: sp.triggers, ruled: sp.ruled, rls: sp.rlsd}
 	for k, cols := range sp.unique {
 		d.unique[k] = map[string]bool{}
 		for _, c := range cols {

@@ -121,6 +121,7 @@ type confEval struct {
 	owners ownerSet
 
 	occ      map[string]*occRes
+	rls      bool                 // credit row-level security policies (only for the statement itself, not code that runs with its owner's rights)
 	merged   map[*QueryNode]*flat // what each level gains from the views merged into it
 	inner    map[string][]string  // a merged view's occurrence -> the occurrences standing in for it
 	expanded map[*TableInfo]bool
@@ -139,11 +140,11 @@ type confEval struct {
 
 // confine works out what statement x is confined to. owners, if non-nil, holds
 // the results of lookups for rows the cache did not know.
-func (a *Attributor) confine(st *state, x Stmt, pt *portal, owners ownerSet) confResult {
+func (a *Attributor) confine(st *state, x Stmt, pt *portal, owners ownerSet, rls bool) confResult {
 	if x.Q == nil || unsupported(x.Q) {
 		return confResult{}
 	}
-	ev := &confEval{a: a, st: st, pt: pt, owners: owners,
+	ev := &confEval{a: a, st: st, pt: pt, owners: owners, rls: rls,
 		occ: map[string]*occRes{}, bridge: map[string][]bridgeKey{}, conf: map[string]*tset{},
 		merged: map[*QueryNode]*flat{}, inner: map[string][]string{}, expanded: map[*TableInfo]bool{}, restricted: map[string]bool{}, needSeen: map[ownerKey]bool{}}
 	ev.collect(x.Q, 0)
@@ -193,6 +194,9 @@ func (ev *confEval) collect(q *QueryNode, depth int) {
 			r.tcol, _ = ev.a.scopeOf(r.ti)
 		}
 		ev.occ[o.ID] = r
+		if ev.rls && depth == 0 && tmp == nil && ti != nil && ti.rls && r.tenant {
+			ev.addPolicy(q, mg, o, r)
+		}
 		switch {
 		case depth > 0 && !ok && catalog:
 			ev.unsure = true // a table inside a view that the catalog does not know
@@ -771,4 +775,22 @@ func (ev *confEval) viaBridge(src *occRes, scol string, dst *occRes, dcol string
 		}
 	}
 	return changed
+}
+
+// addPolicy adds the row-level security policies that apply to this occurrence
+// as one more condition on it.
+func (ev *confEval) addPolicy(q *QueryNode, mg *flat, o Occ, r *occRes) {
+	role, ok := ev.st.effRole()
+	if !ok {
+		return
+	}
+	cmd := byte('r')
+	if q.WriteOcc == o.ID {
+		cmd = q.WriteCmd
+	}
+	perm, restr, applies := ev.a.cat.RLSFor(r.ti, role, cmd)
+	if !applies {
+		return
+	}
+	mg.conds = append(mg.conds, Scoped{C: ev.policyCond(o.ID, r.ti, perm, restr), Confines: []string{o.ID}})
 }

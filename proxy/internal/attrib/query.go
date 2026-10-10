@@ -93,6 +93,9 @@ type QueryNode struct {
 	Conds []Scoped
 	// Out is the one column a plain SELECT returns, if that is all it returns.
 	Out *CRef
+	// WriteOcc is the occurrence an UPDATE or DELETE modifies, and WriteCmd which ('w' or 'd').
+	WriteOcc string
+	WriteCmd byte
 	// Outs lists what a plain SELECT returns, and Simple says it is a
 	// select-project-join (see views.go).
 	Outs   []OutCol
@@ -141,7 +144,8 @@ func (b *builder) stmt(node *pg_query.Node, root *bscope) *QueryNode {
 		q := &QueryNode{}
 		sc := &bscope{parent: root, names: map[string]string{}}
 		b.withClause(q, u.WithClause, sc)
-		b.addOcc(q, sc, u.Relation)
+		q.WriteOcc, q.WriteCmd = b.addOcc(q, sc, u.Relation), 'w'
+
 		for _, f := range u.FromClause {
 			b.addFrom(q, sc, f)
 		}
@@ -153,7 +157,8 @@ func (b *builder) stmt(node *pg_query.Node, root *bscope) *QueryNode {
 		q := &QueryNode{}
 		sc := &bscope{parent: root, names: map[string]string{}}
 		b.withClause(q, d.WithClause, sc)
-		b.addOcc(q, sc, d.Relation)
+		q.WriteOcc, q.WriteCmd = b.addOcc(q, sc, d.Relation), 'd'
+
 		for _, f := range d.UsingClause {
 			b.addFrom(q, sc, f)
 		}
