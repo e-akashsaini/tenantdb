@@ -127,24 +127,26 @@ tenantdb analysis
 5747 statements read; 4947 attributed, 800 need no attribution (SET, BEGIN, DDL, ...)
 
 How tenants were determined
-  explicit          1065   21.5%
-  cache             1484   30.0%
-  untenanted        1985   40.1%
-  scan               213    4.3%
-  unknown            200    4.0%
+  explicit           873   17.7%
+  cache             1791   36.4%
+  untenanted        1979   40.2%
+  scan               212    4.3%
+  unknown             64    1.3%
 
-What strict mode would flag: 413 of 4947 attributed statements (8.3%)
+What strict mode would flag: 276 of 4920 attributed statements (5.6%)
 
 Worst query shapes (statements that differ only in their literals are grouped)
-   1. [unknown] x152  public.access_tokens, public.users
-      SELECT "users".* FROM "users" INNER JOIN "access_tokens" ...
+   1. [scan] x129  public.account_linked_accounts
+      SELECT "account_linked_accounts".* FROM "account_linked_accounts" WHERE "account_linked_accounts"."linked_account_id" = $1 LIMIT $2
+   2. [scan] x40  public.encrypted_configs
+      SELECT $3 AS one FROM "encrypted_configs" WHERE "encrypted_configs"."key" = $1 LIMIT $2
 ```
 
 By default it warms the row cache from the database and looks up the rows a statement names (`-warm`, `-lookup`), so a statement-by-id in a log with literal values is attributed. A `pg_stat_statements` export has only `$1` placeholders, so statements by id stay `unknown` there: the report still tells you which queries have no tenant filter, which is the main thing an audit wants.
 
 ### On a real Rails app
 
-[`bench/docuseal/`](bench/docuseal/README.md) runs DocuSeal (Rails 8, `account_id` on its tables) behind the proxy and drives it. 4,947 statements: 8.3% would be flagged, almost all of them authentication, cross-account lookups, global configuration reads and bootstrap checks; and in `block` mode the unmodified app stops at login. Read the caveats there before quoting any number: it is one app, one account, scripted traffic.
+[`bench/docuseal/`](bench/docuseal/README.md) runs DocuSeal (Rails 8, `account_id` on its tables) behind the proxy and drives it. 4,921 statements: 5.6% would be flagged, almost all of them cross-account lookups, global configuration reads and bootstrap checks (the authentication lookups are attributed through the token); and in `block` mode the unmodified app stops at login. Read the caveats there before quoting any number: it is one app, one account, scripted traffic.
 
 ### Running your own test suite through it
 
