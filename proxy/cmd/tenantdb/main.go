@@ -5,11 +5,12 @@ import (
 	"context"
 	"crypto/tls"
 	"flag"
-	"log/slog"
+	"fmt"
 	"os"
 	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/akashsaini/tenantdb/internal/attrib"
@@ -41,15 +42,50 @@ func main() {
 		requireTLS   = flag.Bool("require-tls", env("TENANTDB_REQUIRE_TLS", "") == "1", "refuse clients that do not use TLS (needs -tls-cert)")
 		onError      = flag.String("strict-on-error", env("TENANTDB_STRICT_ON_ERROR", "block"), "in -strict=block, what to do with a statement the policy check itself failed on (a bug): block it, or allow it")
 		prewarm      = flag.Bool("prewarm", true, "fill the row cache from the database at startup (needs -schema-dsn)")
-		debug        = flag.Bool("debug", false, "verbose logging")
+		debug        = flag.Bool("debug", false, "verbose logging (same as -log-level=debug)")
+		logFormat    = flag.String("log-format", env("TENANTDB_LOG_FORMAT", "text"), "log format: text or json")
+		logLevel     = flag.String("log-level", env("TENANTDB_LOG_LEVEL", "info"), "log level: debug, info, warn or error")
+		logSQL       = flag.String("log-sql", env("TENANTDB_LOG_SQL", "normalized"), "how statements appear in the log: normalized (literals replaced by $1, $2: no data values in the log), full (as sent), none")
+		adminAddr    = flag.String("admin-addr", env("TENANTDB_ADMIN_ADDR", ""), "address for /metrics, /healthz, /readyz and /version, e.g. 127.0.0.1:9187 (off if empty; it has no authentication: keep it on an internal interface)")
+		adminPprof   = flag.Bool("admin-pprof", false, "also serve /debug/pprof on the admin address")
+		drainTimeout = flag.Duration("shutdown-timeout", 30*time.Second, "on SIGTERM/SIGINT: how long clients get to finish before their connections are closed (idle ones are sent away at once; a second signal stops immediately)")
+		configFile   = flag.String("config", env("TENANTDB_CONFIG", ""), "file of `name: value` settings, one per flag; the command line overrides it, it overrides environment variables")
+		showVersion  = flag.Bool("version", false, "print the version and exit")
 	)
 	flag.Parse()
 
-	level := slog.LevelInfo
-	if *debug {
-		level = slog.LevelDebug
+	ver, commit, goVer := buildInfo()
+	if *showVersion {
+		fmt.Println("tenantdb", ver, "(commit "+orNone(commit)+", "+goVer+")")
+		return
 	}
-	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+	var fromFile map[string]string
+	if *configFile != "" {
+		vals, order, err := parseConfig(*configFile)
+		if err == nil {
+			err = applyConfig(flag.CommandLine, vals, order)
+		}
+		fromFile = vals
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "tenantdb: config:", err)
+			os.Exit(2)
+		}
+	}
+	log, err := newLogger(os.Stderr, *logFormat, *logLevel, *debug)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "tenantdb:", err)
+		os.Exit(2)
+	}
+	if *logSQL != "normalized" && *logSQL != "full" && *logSQL != "none" {
+		log.Error("bad -log-sql (want normalized, full or none)", "value", *logSQL)
+		os.Exit(2)
+	}
+	if *configFile != "" {
+		log.Info("config file applied", "file", *configFile)
+		if fi, err := os.Stat(*configFile); err == nil && fi.Mode().Perm()&0o007 != 0 && fromFile["schema-dsn"] != "" {
+			log.Warn("the config file is readable by everyone and holds a database connection string", "file", *configFile)
+		}
+	}
 
 	mode, err := attrib.ParseStrictMode(*strictFlag)
 	if err != nil {
@@ -85,8 +121,10 @@ func main() {
 		os.Exit(2)
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, stop := context.WithCancel(context.Background())
 	defer stop()
+	sigs := make(chan os.Signal, 4)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 
 	var catalog *attrib.Catalog
 	if *schemaDSN != "" {
@@ -124,6 +162,7 @@ func main() {
 		}
 	}
 
+	o := newObservability(ver, commit, goVer, string(mode))
 	attributor := attrib.New(attrib.Options{
 		Catalog: catalog,
 		Lookup:  lookup,
@@ -138,8 +177,12 @@ func main() {
 		CacheSize:     *cacheSize,
 		CacheTTL:      *cacheTTL,
 	}, func(e attrib.Event) {
+		o.event(e)
 		attrs := []any{"session", e.SessionID, "user", e.User, "db", e.DB,
-			"tenants", e.Tenants, "source", e.Source, "scan", e.Scan, "conflict", e.Conflict, "sql", e.SQL}
+			"tenants", e.Tenants, "source", e.Source, "scan", e.Scan, "conflict", e.Conflict}
+		if q := sqlForLog(*logSQL, e.SQL); q != "" {
+			attrs = append(attrs, "sql", q)
+		}
 		switch {
 		case e.Blocked:
 			log.Warn("blocked", append(attrs, "violation", e.Violation)...)
@@ -151,7 +194,8 @@ func main() {
 	})
 
 	srv := proxy.New(proxy.Config{
-		Observer:            attributor.Observer(),
+		Observer:            o.wrap(attributor.Observer()),
+		DrainTimeout:        *drainTimeout,
 		TLS:                 tlsCfg,
 		RequireTLS:          *requireTLS,
 		GateFailClosed:      mode == attrib.StrictBlock && *onError == "block",
@@ -165,7 +209,44 @@ func main() {
 		log.Error("listen failed", "err", err)
 		os.Exit(1)
 	}
-	log.Info("tenantdb proxy listening", "addr", srv.Addr().String(), "upstream", *upstream, "upstream_tls", *upTLS)
+	o.bind(srv, attributor, catalog)
+	log.Info("tenantdb proxy listening", "version", ver, "addr", srv.Addr().String(), "upstream", *upstream,
+		"upstream_tls", *upTLS, "strict", mode, "log_sql", *logSQL)
+	if *adminAddr != "" {
+		adm := &adminServer{obs: o, srv: srv, catalog: catalog, upstream: *upstream, needs: mode != attrib.StrictOff,
+			ver: map[string]string{"version": ver, "commit": commit, "go": goVer}}
+		addr, err := adm.serve(ctx, *adminAddr, *adminPprof)
+		if err != nil {
+			log.Error("admin listener failed", "err", err)
+			os.Exit(1)
+		}
+		log.Info("admin endpoints listening", "addr", addr.String())
+		if !isLoopback(addr) {
+			log.Warn("the admin endpoints have no authentication and are not on a loopback address: restrict who can reach them", "addr", addr.String())
+		}
+	}
+	go func() {
+		stopping := false
+		for sig := range sigs {
+			switch sig {
+			case syscall.SIGHUP:
+				if catalog != nil {
+					log.Info("SIGHUP: re-reading the schema")
+					catalog.ReloadAsync()
+				}
+			default:
+				if stopping {
+					log.Warn("second signal: closing every connection now")
+					srv.Close()
+					return
+				}
+				stopping = true
+				log.Info("stopping: no new connections; idle clients are sent away, the others have time to finish",
+					"signal", sig.String(), "timeout", *drainTimeout)
+				stop()
+			}
+		}
+	}()
 
 	if catalog != nil && *prewarm {
 		// Background: clients are served immediately while the cache fills.
@@ -179,6 +260,14 @@ func main() {
 		log.Error("serve failed", "err", err)
 		os.Exit(1)
 	}
+	log.Info("stopped")
+}
+
+func orNone(s string) string {
+	if s == "" {
+		return "unknown"
+	}
+	return s
 }
 
 func env(k, def string) string {

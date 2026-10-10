@@ -4,6 +4,7 @@ import (
 	"container/list"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -24,7 +25,12 @@ type RowCache struct {
 	now func() time.Time
 	ll  *list.List
 	m   map[cacheKey]*list.Element
+
+	hits, misses atomic.Uint64
 }
+
+// Counts returns how many lookups the cache answered and how many it could not.
+func (c *RowCache) Counts() (hits, misses uint64) { return c.hits.Load(), c.misses.Load() }
 
 func NewRowCache(max int) *RowCache { return NewRowCacheTTL(max, 0) }
 
@@ -60,15 +66,18 @@ func (c *RowCache) Get(table, col, val string) (string, bool) {
 	k := cacheKey{table, col, normVal(val)}
 	el, ok := c.m[k]
 	if !ok {
+		c.misses.Add(1)
 		return "", false
 	}
 	e := el.Value.(*cacheEntry)
 	if !e.expires.IsZero() && c.now().After(e.expires) {
 		delete(c.m, k)
 		c.ll.Remove(el)
+		c.misses.Add(1)
 		return "", false
 	}
 	c.ll.MoveToFront(el)
+	c.hits.Add(1)
 	return e.tenant, true
 }
 

@@ -84,6 +84,9 @@ type Catalog struct {
 	loaded    bool
 	reloading atomic.Bool
 
+	loads, loadFailures atomic.Uint64
+	lastLoad            atomic.Int64 // unix nanoseconds of the last successful load
+
 	// TenantColumns names the columns that hold the tenant. Set it before Load:
 	// foreign keys can only be verified when the tenant column is known.
 	TenantColumns []string
@@ -236,7 +239,15 @@ const (
 )
 
 // Load replaces the snapshot with the current schema.
-func (c *Catalog) Load(ctx context.Context) error {
+func (c *Catalog) Load(ctx context.Context) (err error) {
+	defer func() {
+		if err != nil {
+			c.loadFailures.Add(1)
+			return
+		}
+		c.loads.Add(1)
+		c.lastLoad.Store(time.Now().UnixNano())
+	}()
 	conn, err := pgx.Connect(ctx, c.dsn)
 	if err != nil {
 		return fmt.Errorf("catalog connect: %w", err)
@@ -675,6 +686,31 @@ func (c *Catalog) Refresh(ctx context.Context, every time.Duration, onErr func(e
 			cancel()
 		}
 	}
+}
+
+// CatalogStats are counters about reading the schema.
+type CatalogStats struct {
+	Loads, LoadFailures uint64
+	LastLoad            time.Time // zero if never
+	Tables, Views       int
+}
+
+// Stats reports how the schema loads are going.
+func (c *Catalog) Stats() CatalogStats {
+	st := CatalogStats{Loads: c.loads.Load(), LoadFailures: c.loadFailures.Load()}
+	if n := c.lastLoad.Load(); n != 0 {
+		st.LastLoad = time.Unix(0, n)
+	}
+	c.mu.RLock()
+	for _, t := range c.tables {
+		if t.Kind == 'v' {
+			st.Views++
+		} else {
+			st.Tables++
+		}
+	}
+	c.mu.RUnlock()
+	return st
 }
 
 func (c *Catalog) Loaded() bool {

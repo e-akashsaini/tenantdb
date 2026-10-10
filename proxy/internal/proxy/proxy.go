@@ -55,6 +55,29 @@ type Config struct {
 	// letting it through. For block mode: a statement nobody could check is not
 	// one anybody should run.
 	GateFailClosed bool
+	// DrainTimeout is how long a stopping server waits for clients to finish before
+	// closing their connections (default 30s; a negative value closes at once).
+	// Idle clients are told to reconnect as soon as the drain starts.
+	DrainTimeout time.Duration
+}
+
+// Stats are counters the server keeps while it runs.
+type Stats struct {
+	ConnsActive          atomic.Int64
+	ConnsTotal           atomic.Uint64
+	ConnsDrained         atomic.Uint64 // idle clients sent away when the server was stopping
+	UpstreamDialFailures atomic.Uint64
+	TLSHandshakeFailures atomic.Uint64
+	StartupFailures      atomic.Uint64 // clients that never completed their startup (garbage, timeout)
+	ObserverPanics       atomic.Uint64
+	RejectedSoft         atomic.Uint64 // statements refused; the connection stayed usable
+	RejectedHard         atomic.Uint64 // statements refused by closing the connection
+}
+
+// liveSession is what a draining server needs to send an idle client away.
+type liveSession struct {
+	gs     *gateState
+	notify func()
 }
 
 // Server accepts client connections and relays them to the upstream.
@@ -64,11 +87,21 @@ type Server struct {
 	obs    Observer
 	nextID atomic.Uint64
 
-	mu    sync.Mutex
-	ln    net.Listener
-	conns map[net.Conn]struct{}
-	wg    sync.WaitGroup
+	mu       sync.Mutex
+	ln       net.Listener
+	conns    map[net.Conn]struct{}
+	live     map[uint64]*liveSession
+	wg       sync.WaitGroup
+	stats    Stats
+	draining atomic.Bool
 }
+
+// Stats returns the server's counters.
+func (s *Server) Stats() *Stats { return &s.stats }
+
+// Draining reports whether the server has been told to stop and is waiting for
+// its clients to finish.
+func (s *Server) Draining() bool { return s.draining.Load() }
 
 // New returns a Server with defaults filled in.
 func New(cfg Config) *Server {
@@ -90,7 +123,10 @@ func New(cfg Config) *Server {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
-	return &Server{cfg: cfg, log: cfg.Logger, obs: cfg.Observer, conns: map[net.Conn]struct{}{}}
+	if cfg.DrainTimeout == 0 {
+		cfg.DrainTimeout = 30 * time.Second
+	}
+	return &Server{cfg: cfg, log: cfg.Logger, obs: cfg.Observer, conns: map[net.Conn]struct{}{}, live: map[uint64]*liveSession{}}
 }
 
 // Listen binds the listening socket. Use Addr to find the bound address.
@@ -125,7 +161,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 	go func() {
 		<-ctx.Done()
-		s.shutdown()
+		s.drain()
 	}()
 	for {
 		c, err := ln.Accept()
@@ -146,7 +182,8 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 }
 
-func (s *Server) shutdown() {
+// Close stops accepting and closes every connection at once.
+func (s *Server) Close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.ln != nil {
@@ -155,6 +192,40 @@ func (s *Server) shutdown() {
 	for c := range s.conns {
 		c.Close()
 	}
+}
+
+// drain stops accepting, sends idle clients away with the error Postgres itself
+// gives when an administrator stops it (they reconnect, to a new instance behind
+// a load balancer), and gives the others DrainTimeout to finish before closing
+// whatever is left.
+func (s *Server) drain() {
+	s.draining.Store(true)
+	s.mu.Lock()
+	if s.ln != nil {
+		s.ln.Close()
+	}
+	s.mu.Unlock()
+	deadline := time.Now().Add(s.cfg.DrainTimeout)
+	for s.cfg.DrainTimeout > 0 && time.Now().Before(deadline) {
+		s.mu.Lock()
+		var idle []*liveSession
+		for _, l := range s.live {
+			if l.gs.idle() {
+				idle = append(idle, l)
+			}
+		}
+		active := len(s.live)
+		s.mu.Unlock()
+		for _, l := range idle {
+			s.stats.ConnsDrained.Add(1)
+			l.notify()
+		}
+		if active == 0 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	s.Close()
 }
 
 func (s *Server) track(c net.Conn, add bool) {
@@ -169,6 +240,9 @@ func (s *Server) track(c net.Conn, add bool) {
 }
 
 func (s *Server) handle(client net.Conn) {
+	s.stats.ConnsTotal.Add(1)
+	s.stats.ConnsActive.Add(1)
+	defer s.stats.ConnsActive.Add(-1)
 	id := s.nextID.Add(1)
 	log := s.log.With("session", id, "client", client.RemoteAddr().String())
 	backend := s.newBackend(client)
@@ -181,6 +255,7 @@ func (s *Server) handle(client net.Conn) {
 		msg, err := backend.ReceiveStartupMessage()
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
+				s.stats.StartupFailures.Add(1)
 				log.Debug("startup failed", "err", err)
 			}
 			return
@@ -202,6 +277,7 @@ func (s *Server) handle(client net.Conn) {
 			tc := tls.Server(client, s.cfg.TLS)
 			_ = tc.SetDeadline(time.Now().Add(s.cfg.DialTimeout))
 			if err := tc.Handshake(); err != nil {
+				s.stats.TLSHandshakeFailures.Add(1)
 				log.Debug("client TLS handshake failed", "err", err)
 				return
 			}
@@ -229,6 +305,7 @@ func (s *Server) handle(client net.Conn) {
 
 	up, err := s.dialUpstream()
 	if err != nil {
+		s.stats.UpstreamDialFailures.Add(1)
 		log.Error("upstream dial failed", "err", err)
 		sendFatal(backend, "08006", "tenantdb: cannot reach upstream database")
 		return
@@ -240,6 +317,18 @@ func (s *Server) handle(client net.Conn) {
 	log = log.With("user", sess.User, "db", sess.DB)
 	log.Debug("session open")
 	defer log.Debug("session closed")
+	s.mu.Lock()
+	s.live[id] = &liveSession{gs: sess.gs, notify: func() {
+		_ = writeClient(sess, backend, &pgproto3.ErrorResponse{Severity: "FATAL", SeverityUnlocalized: "FATAL",
+			Code: "57P01", Message: "terminating connection due to administrator command"})
+		client.Close()
+	}}
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		delete(s.live, id)
+		s.mu.Unlock()
+	}()
 
 	frontend := pgproto3.NewFrontend(up, up)
 	frontend.Send(startup)
@@ -273,6 +362,10 @@ func (s *Server) pumpClient(log *slog.Logger, sess *Session, backend *pgproto3.B
 		if err != nil {
 			logRelayErr(log, "client read", err)
 			return
+		}
+		switch msg.(type) {
+		case *pgproto3.Query, *pgproto3.Sync, *pgproto3.FunctionCall:
+			sess.gs.ready.Store(false) // work is in flight: not idle until the reply says so
 		}
 		s.safeObserve(log, func() { s.obs.OnFrontend(sess, msg) })
 		frontend.Send(msg)
@@ -323,6 +416,7 @@ func (s *Server) pumpUpstream(log *slog.Logger, sess *Session, backend *pgproto3
 func (s *Server) safeObserve(log *slog.Logger, fn func()) (panicked bool) {
 	defer func() {
 		if r := recover(); r != nil {
+			s.stats.ObserverPanics.Add(1)
 			log.Error("observer panic", "panic", r)
 			panicked = true
 		}

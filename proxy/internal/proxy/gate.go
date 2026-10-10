@@ -122,9 +122,11 @@ func (s *Server) pumpClientGated(log *slog.Logger, sess *Session, gate Gate, bac
 			soft := sess.gs.idle() && !partial
 			log.Info("statement rejected", "code", rej.Code, "message", rej.Message, "soft", soft)
 			if !soft {
+				s.stats.RejectedHard.Add(1)
 				_ = writeClient(sess, backend, errorResponse("FATAL", rej))
 				return
 			}
+			s.stats.RejectedSoft.Add(1)
 			held, heldBytes = nil, 0
 			if _, isQuery := msg.(*pgproto3.Query); isQuery {
 				if writeClient(sess, backend, errorResponse("ERROR", rej), &pgproto3.ReadyForQuery{TxStatus: 'I'}) != nil {

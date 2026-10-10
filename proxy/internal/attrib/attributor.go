@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/akashsaini/tenantdb/internal/proxy"
@@ -118,10 +119,26 @@ type Attributor struct {
 	exempt    map[string]bool
 	allowScan map[string]bool
 
-	fmu    sync.Mutex
-	fgen   uint64
-	fcache map[*FuncDef]*FuncBody
-	tcache map[*FuncDef]*FuncBody // trigger functions, read with NEW/OLD bound
+	fmu  sync.Mutex
+	fgen uint64
+
+	lookups, lookupFailures atomic.Uint64
+	fcache                  map[*FuncDef]*FuncBody
+	tcache                  map[*FuncDef]*FuncBody // trigger functions, read with NEW/OLD bound
+}
+
+// Stats are the attributor's own counters.
+type Stats struct {
+	CacheEntries, BridgeEntries int
+	CacheHits, CacheMisses      uint64
+	Lookups, LookupFailures     uint64
+}
+
+// Stats returns the row cache and lookup counters.
+func (a *Attributor) Stats() Stats {
+	h, m := a.cache.Counts()
+	return Stats{CacheEntries: a.cache.Len(), BridgeEntries: a.bridge.Len(), CacheHits: h, CacheMisses: m,
+		Lookups: a.lookups.Load(), LookupFailures: a.lookupFailures.Load()}
 }
 
 func New(opt Options, onEvent func(Event)) *Attributor {
@@ -1098,14 +1115,17 @@ func (a *Attributor) lookupOwners(need []keyReq) (owners ownerSet, failed bool) 
 	defer cancel()
 	owners = ownerSet{}
 	for _, k := range need {
+		a.lookups.Add(1)
 		if k.via != nil {
 			bl, ok := a.lk.(bridgeLookup)
 			if !ok {
+				a.lookupFailures.Add(1)
 				failed = true
 				continue
 			}
 			ts, err := bl.viaTenants(ctx, *k.via, k.val)
 			if err != nil {
+				a.lookupFailures.Add(1)
 				failed = true
 				continue
 			}
@@ -1118,6 +1138,7 @@ func (a *Attributor) lookupOwners(need []keyReq) (owners ownerSet, failed bool) 
 		}
 		ts, err := a.lk.tenants(ctx, k.ti, k.tcol, k.col, k.val)
 		if err != nil {
+			a.lookupFailures.Add(1)
 			failed = true
 			continue
 		}

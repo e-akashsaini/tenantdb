@@ -45,6 +45,12 @@ Every event also carries `scan` (reads across tenants, even if a tag attributed 
 - **`INSERT` without a column list**, using the real column order from the catalog.
 - **Rows by any unique column, and through foreign keys.** A statement that names a row by a unique column (`id`, `slug`, `uuid`: anything with a single-column unique index) is attributed to that row's tenant. A lookup by a foreign key (`WHERE submission_id = 5`) is attributed through the parent row. Foreign keys are the declared ones plus columns named `<thing>_id` next to a table called `<thing>` or `<thing>s`; each is checked against a sample of real rows (the child must always have its parent's tenant) and discarded if it isn't, or if there are no rows to check yet.
 - **Polymorphic associations (Rails).** `WHERE record_type = 'Template' AND record_id = 5` is resolved through the table the class name maps to (`ActiveStorage::Blob` is `active_storage_blobs`), after the mapping has been checked against real rows. A type with no rows yet, or ids that come from a subquery, stay unknown.
+- **Credential lookups.** `SELECT ... FROM users JOIN access_tokens ON ... WHERE token = $1` is attributed to the user's tenant: the unique key on a table with no tenant column pins one row, and the proxy asks the database which tenant that row leads to (with the statement's own join). The token is hashed before it is cached, and entries expire within a minute.
+- **Subqueries and views.** `col IN (SELECT ... WHERE tenant_id = 'a')` carries the subquery's tenant to the outer table when the two columns are provably tied (same tenant column, or a verified foreign key). A view is read through its definition: a per-tenant view (`WHERE tenant_id = 'a'` or `current_setting('app.tenant')`) or one that renames the tenant column is attributed like the query it stands for.
+- **Relationships it was never told about.** When the application joins `a.x = b.y` and `b.y` is unique, the proxy checks in the background whether every `a` row has the tenant of the `b` row it points at, and if so uses the relationship from then on. Coincidences (equal numbers in different tenants) do not pass the check.
+- **Row-level security.** If a table has policies and the role is subject to them (not a superuser, not `BYPASSRLS`, not the table's owner unless `FORCE ROW LEVEL SECURITY`), the policy is one more condition on every statement: `USING (tenant_id = current_setting('app.tenant'))` attributes an unfiltered `SELECT` to the tenant the session set. `SET ROLE` and `SET LOCAL ROLE` are followed.
+- **Triggers and rules.** A write fires the triggers on its table; their functions are read with `NEW.tenant_id`/`OLD.tenant_id` bound to the tenant of the row, so an audit trigger that writes the row's own tenant adds nothing, and one that touches other tenants' data shows up.
+- **`COPY ... FROM STDIN`.** The load is attributed to the tenants its rows name (text and CSV, with any delimiter, quote, `NULL` string and header; checked against PostgreSQL's own parser on random input).
 - **Joins and aliases.** `... FROM templates JOIN submissions ... WHERE submissions.id = $1` is read through the qualifier. An unqualified column in a join could belong to either table, so it names none.
 - **`OR`.** A WHERE clause confines a statement to a tenant only if every alternative does: `tenant_id = 'a' AND (x = 1 OR y = 2)` is `a`; `tenant_id = 'a' OR amount > 5` is not attributed to `a`.
 - **Cache hygiene.** Rows are learned only from successful `INSERT`s and from result columns that come straight from one table. `DELETE` evicts, an `UPDATE` that changes a unique or tenant column drops that table's entries, and `TRUNCATE`/`DROP TABLE` forget the table. Entries also expire after `-cache-ttl`.
@@ -52,9 +58,10 @@ Every event also carries `scan` (reads across tenants, even if a tag attributed 
 ### It fails closed
 These are `unknown`, never `untenanted`:
 - a table the schema snapshot doesn't know,
-- a view that hides its tenant column (it may wrap tenant tables),
+- a view whose definition can't be read, that calls application code, or a materialized view (it may wrap tenant tables),
 - a temp table filled from data that couldn't be attributed,
-- a call to a function whose code can't be read: dynamic SQL (`EXECUTE` of a computed string), `plpython`, C, and so on.
+- a call to a function whose code can't be read: dynamic SQL (`EXECUTE` of a computed string), `plpython`, C, and so on,
+- a write to a table with rewrite rules, or with a trigger that touches tenant data it can't tie to the row.
 
 Built-in and extension functions are ignored.
 
@@ -218,9 +225,21 @@ Each flag also has an environment variable where listed.
 | `-strict-exempt` | `TENANTDB_STRICT_EXEMPT` | | Roles never held to the policy |
 | `-strict-allow-scan` | `TENANTDB_STRICT_ALLOW_SCAN` | | Roles allowed to scan |
 | `-strict-on-error` | `TENANTDB_STRICT_ON_ERROR` | `block` | In block mode, what to do with a statement the check itself failed on: `block` or `allow` |
-| `-debug` | | off | Verbose logging |
+| `-config` | `TENANTDB_CONFIG` | | File of `name: value` settings, one per flag (the command line overrides it; it overrides the environment) |
+| `-admin-addr` | `TENANTDB_ADMIN_ADDR` | off | Serve `/metrics`, `/healthz`, `/readyz`, `/version` here (no authentication: keep it internal) |
+| `-admin-pprof` | | off | Also serve `/debug/pprof` on the admin address |
+| `-log-format` | `TENANTDB_LOG_FORMAT` | `text` | `text` or `json` |
+| `-log-level` | `TENANTDB_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
+| `-log-sql` | `TENANTDB_LOG_SQL` | `normalized` | `normalized` (literals replaced by `$1`: no data values in the log), `full`, or `none` |
+| `-shutdown-timeout` | | `30s` | On `SIGTERM`: how long clients get to finish before their connections are closed |
+| `-debug` | | off | Same as `-log-level debug` |
+| `-version` | | | Print the version and exit |
 
 Pre-warming gives each table an equal share of the `-cache-size` budget, so one huge table can't starve the rest.
+
+## Operating it
+
+Metrics, health checks, graceful shutdown, config files, failure behaviour, upgrades and alert suggestions are in [docs/OPERATIONS.md](docs/OPERATIONS.md). Security reporting and hardening notes are in [SECURITY.md](SECURITY.md).
 
 ## Log output
 
@@ -263,5 +282,12 @@ proxy/
     lookup.go              ask the database who owns a row (de-duplicated)
     warm.go                background cache pre-warming
     strict.go              the policy and the blocking gate
+    confine.go query.go    the soundness model: is every tenant-table occurrence confined?
+    views.go rls.go        views read through their definitions; row-level security policies
+    learn.go poly.go       relationships learned from joins; Rails polymorphic associations
+    copyin.go              COPY FROM STDIN streams
+  internal/metrics/        a small Prometheus-format registry
 bench/docuseal/            run a real Rails app (DocuSeal) behind the proxy and drive it
+bench/compat/              the same operations through psycopg, asyncpg, node-postgres, SQLAlchemy, with and without a pooler
+bench/ops/e2e.sh           end-to-end check of config, logs, metrics and graceful shutdown against a real server
 ```
