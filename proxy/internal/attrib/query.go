@@ -34,10 +34,19 @@ type Leaf struct {
 	Ops []Operand
 	// R is set for a comparison of two columns (a join condition).
 	R *CRef
+	// In is set for `L IN (SELECT out FROM ...)`: the rows of L's table that can
+	// match are those whose L value some row of the subquery produces.
+	In *InSub
 	// Mentions lists the columns of any other comparison (ranges, LIKE, functions of
 	// a column, ...): they say nothing about which tenant, but they do mean the
 	// statement is restricted by something.
 	Mentions []CRef
+}
+
+// InSub is the subquery of `x IN (SELECT out ...)`.
+type InSub struct {
+	Q   *QueryNode
+	Out CRef
 }
 
 type CondKind int
@@ -76,7 +85,9 @@ type Occ struct {
 type QueryNode struct {
 	Occs  []Occ
 	Conds []Scoped
-	Subs  []*QueryNode // nested queries: subselects anywhere, CTEs, derived tables, set-operation branches
+	// Out is the one column a plain SELECT returns, if that is all it returns.
+	Out  *CRef
+	Subs []*QueryNode // nested queries: subselects anywhere, CTEs, derived tables, set-operation branches
 	// Unsupported marks constructs whose reads cannot be bounded (MERGE ...).
 	Unsupported bool
 }
@@ -100,11 +111,12 @@ type builder struct {
 	e       *Extractor
 	n       int
 	subSeen map[*pg_query.SubLink]bool
+	subNode map[*pg_query.SubLink]*QueryNode
 }
 
 // buildQuery builds the model of a statement, or nil if it has no table access to model.
 func (e *Extractor) buildQuery(node *pg_query.Node) *QueryNode {
-	b := &builder{e: e, subSeen: map[*pg_query.SubLink]bool{}}
+	b := &builder{e: e, subSeen: map[*pg_query.SubLink]bool{}, subNode: map[*pg_query.SubLink]*QueryNode{}}
 	return b.stmt(node, &bscope{names: map[string]string{}})
 }
 
@@ -202,6 +214,13 @@ func (b *builder) selectStmt(s *pg_query.SelectStmt, parent *bscope) *QueryNode 
 	}
 	b.cond(q, sc, s.WhereClause, nil)
 	b.sweep(q, sc, &pg_query.Node{Node: &pg_query.Node_SelectStmt{SelectStmt: s}})
+	if len(s.TargetList) == 1 && len(s.GroupClause) == 0 {
+		if rt := s.TargetList[0].GetResTarget(); rt != nil {
+			if c, ok := b.colRef(sc, rt.Val); ok {
+				q.Out = &c
+			}
+		}
+	}
 	return q
 }
 
@@ -320,6 +339,7 @@ func (b *builder) sweep(q *QueryNode, sc *bscope, root *pg_query.Node) {
 			b.subSeen[sl] = true
 			if sub := b.query(sl.Subselect, sc); sub != nil {
 				q.Subs = append(q.Subs, sub)
+				b.subNode[sl] = sub
 			}
 			return false
 		}
@@ -337,6 +357,7 @@ func (b *builder) subLinks(q *QueryNode, sc *bscope, n *pg_query.Node) {
 			b.subSeen[sl] = true
 			if sub := b.query(sl.Subselect, sc); sub != nil {
 				q.Subs = append(q.Subs, sub)
+				b.subNode[sl] = sub
 			}
 			return false
 		}
@@ -420,6 +441,18 @@ func (b *builder) expr(q *QueryNode, sc *bscope, n *pg_query.Node) *Cond {
 	case n.GetAExpr() != nil:
 		if leaf := b.leaf(sc, n.GetAExpr()); leaf != nil {
 			return &Cond{Kind: CondLeaf, Leaf: leaf}
+		}
+	case n.GetSubLink() != nil:
+		// x IN (SELECT out ...) and x = ANY (SELECT out ...)
+		sl := n.GetSubLink()
+		if sl.SubLinkType == pg_query.SubLinkType_ANY_SUBLINK && (len(sl.OperName) == 0 ||
+			(len(sl.OperName) == 1 && sl.OperName[0].GetString_().GetSval() == "=")) {
+			sub := b.subNode[sl]
+			lc, ok := b.colRef(sc, sl.Testexpr)
+			if ok && sub != nil && sub.Out != nil && !b.e.operand(sl.Testexpr).Set {
+				return &Cond{Kind: CondLeaf, Leaf: &Leaf{L: lc, In: &InSub{Q: sub, Out: *sub.Out},
+					Mentions: b.mentions(sc, n)}}
+			}
 		}
 	}
 	return &Cond{Kind: CondOther, Mentions: b.mentions(sc, n)}

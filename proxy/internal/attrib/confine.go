@@ -94,7 +94,11 @@ type occRes struct {
 
 type joinEq struct{ a, b, ca, cb string }
 
+// inLink: o.ocol IN (SELECT so.socol ...): see applyLinks.
+type inLink struct{ o, ocol, so, socol string }
+
 type condOut struct {
+	links      []inLink
 	bridge     map[string][]bridgeKey
 	conf       map[string]*tset
 	eqs        []joinEq
@@ -113,6 +117,7 @@ type confEval struct {
 	owners ownerSet
 
 	occ        map[string]*occRes
+	links      []inLink
 	bridge     map[string][]bridgeKey // non-tenant occurrences pinned to one row by a unique key
 	conf       map[string]*tset
 	restricted map[string]bool
@@ -132,6 +137,12 @@ func (a *Attributor) confine(st *state, x Stmt, pt *portal, owners ownerSet) con
 		occ: map[string]*occRes{}, bridge: map[string][]bridgeKey{}, conf: map[string]*tset{}, restricted: map[string]bool{}, needSeen: map[ownerKey]bool{}}
 	ev.collect(x.Q)
 	ev.level(x.Q)
+	// `x IN (SELECT y ...)` hands the subquery's confinement to x's table, which
+	// can in turn confine others through joins: go round until nothing moves.
+	for i := 0; i < 8 && ev.applyLinks(); i++ {
+		ev.links, ev.bridge = nil, map[string][]bridgeKey{}
+		ev.level(x.Q)
+	}
 	return ev.result()
 }
 
@@ -207,6 +218,11 @@ func (ev *confEval) level(q *QueryNode) {
 				ev.bridge[id] = append(ev.bridge[id], ks...)
 			}
 		}
+		for _, lk := range out.links {
+			if updatable[lk.o] {
+				ev.links = append(ev.links, lk)
+			}
+		}
 		for _, e := range out.eqs {
 			props = append(props, propItem{e, updatable})
 		}
@@ -247,6 +263,30 @@ func (ev *confEval) level(q *QueryNode) {
 	for _, s := range q.Subs {
 		ev.level(s)
 	}
+}
+
+// applyLinks: o.ocol IN (SELECT so.socol ...) means every row of o that can
+// match has an ocol value some surviving row of so produced, so it belongs to the
+// tenant of that row, if the two columns tie rows to the same tenant. It reports
+// whether any occurrence became more confined.
+func (ev *confEval) applyLinks() bool {
+	changed := false
+	for _, lk := range ev.links {
+		src, dst := ev.occ[lk.so], ev.occ[lk.o]
+		if src == nil || dst == nil || ev.conf[lk.so] == nil {
+			continue
+		}
+		if !ev.related(src, lk.socol, dst, lk.ocol) {
+			ev.suggest(src, lk.socol, dst, lk.ocol)
+			continue
+		}
+		n := inter(ev.conf[lk.o], ev.conf[lk.so])
+		if ev.conf[lk.o] == nil || len(n.m) != len(ev.conf[lk.o].m) {
+			ev.conf[lk.o] = n
+			changed = true
+		}
+	}
+	return changed
 }
 
 // suggest offers the catalog a relationship the join between two tenant tables
@@ -325,6 +365,7 @@ func (ev *confEval) cond(c *Cond) condOut {
 			for id, ks := range ko.bridge {
 				out.bridge[id] = append(out.bridge[id], ks...)
 			}
+			out.links = append(out.links, ko.links...)
 			out.eqs = append(out.eqs, ko.eqs...)
 		}
 		ev.poly(c, &out)
@@ -416,6 +457,15 @@ func (ev *confEval) values(ops []Operand) ([]string, bool) {
 }
 
 func (ev *confEval) leaf(l *Leaf, out *condOut) {
+	if l.In != nil {
+		ev.mention(l.Mentions, out)
+		o, ok1 := ev.resolve(l.L)
+		so, ok2 := ev.resolve(l.In.Out)
+		if ok1 && ok2 && o.tenant && so.tenant {
+			out.links = append(out.links, inLink{o.id, l.L.Col, so.id, l.In.Out.Col})
+		}
+		return
+	}
 	if l.R != nil {
 		a, ok1 := ev.resolve(l.L)
 		b, ok2 := ev.resolve(*l.R)

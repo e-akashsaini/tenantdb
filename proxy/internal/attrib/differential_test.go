@@ -206,7 +206,33 @@ type dquery struct {
 
 func (g *dgen) selectQuery() dquery {
 	names := []string{"customers", "orders", "items", "countries", "shipments"}
-	switch g.r.Intn(12) {
+	switch g.r.Intn(14) {
+	case 12, 13: // x IN (SELECT y ...): the subquery's confinement may carry to the outer table
+		j := dJoins[g.r.Intn(len(dJoins))]
+		child, parent := dTables[j[0]], dTables[j[2]]
+		oa, sa := g.newAlias(), g.newAlias()
+		var outer, sub *dtable
+		var ocol, scol string
+		switch g.r.Intn(3) {
+		case 0: // child.fk IN (SELECT parent.id ...)
+			outer, sub, ocol, scol = child, parent, j[1], j[3]
+		case 1: // parent.id IN (SELECT child.fk ...)
+			outer, sub, ocol, scol = parent, child, j[3], j[1]
+		default: // tenant column to tenant column
+			outer, sub, ocol, scol = dTables[g.pick("customers", "orders", "items")], dTables[g.pick("customers", "orders", "items")], "tenant_id", "tenant_id"
+		}
+		subWhere := g.pred(sa, sub, 1)
+		op := g.pick("IN", "IN", "IN", "NOT IN")
+		in := fmt.Sprintf("%s.%s %s (SELECT %s.%s FROM tdbdiff.%s %s WHERE %s)", oa, ocol, op, sa, scol, sub.name, sa, subWhere)
+		where := g.pick(in, in, in+" AND "+g.pred(oa, outer, 1), in+" OR "+g.pred(oa, outer, 1), g.pred(oa, outer, 1)+" AND "+in)
+		return dquery{
+			sql: fmt.Sprintf("SELECT %s.* FROM tdbdiff.%s %s WHERE %s", oa, outer.name, oa, where),
+			truth: []string{
+				fmt.Sprintf("SELECT DISTINCT %s.tenant_id FROM tdbdiff.%s %s WHERE %s", oa, outer.name, oa, where),
+				fmt.Sprintf("SELECT DISTINCT %s.tenant_id FROM tdbdiff.%s %s WHERE %s", sa, sub.name, sa, subWhere),
+			},
+			tenant: true,
+		}
 	case 5, 6: // a credential row (no tenant column) pins a tenant row through a join
 		cust := dTables["customers"]
 		ca, ka := g.newAlias(), g.newAlias()
