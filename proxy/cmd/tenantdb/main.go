@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"flag"
 	"fmt"
 	"os"
@@ -42,6 +43,8 @@ func main() {
 		cacheTTL     = flag.Duration("cache-ttl", time.Hour, "how long a cached row owner is trusted (0: until evicted); bounds staleness after deletes the proxy did not see")
 		tlsCert      = flag.String("tls-cert", env("TENANTDB_TLS_CERT", ""), "server certificate (PEM) so clients can encrypt their connection to the proxy; re-read when the file changes")
 		tlsKey       = flag.String("tls-key", env("TENANTDB_TLS_KEY", ""), "private key (PEM) for -tls-cert")
+		clientCA     = flag.String("tls-client-ca", env("TENANTDB_TLS_CLIENT_CA", ""), "CA bundle (PEM) to verify client certificates against (mutual TLS); clients must then present a certificate it signed. Re-read when the file changes")
+		clientAuth   = flag.String("tls-client-auth", env("TENANTDB_TLS_CLIENT_AUTH", "require"), "with -tls-client-ca: require (a certificate is mandatory) or verify-if-given (one is checked only if the client sends it)")
 		requireTLS   = flag.Bool("require-tls", env("TENANTDB_REQUIRE_TLS", "") == "1", "refuse clients that do not use TLS (needs -tls-cert)")
 		onError      = flag.String("strict-on-error", env("TENANTDB_STRICT_ON_ERROR", "block"), "in -strict=block, what to do with a statement the policy check itself failed on (a bug): block it, or allow it")
 		prewarm      = flag.Bool("prewarm", true, "fill the row cache from the database at startup (needs -schema-dsn)")
@@ -53,6 +56,7 @@ func main() {
 		adminPprof   = flag.Bool("admin-pprof", false, "also serve /debug/pprof on the admin address")
 		drainTimeout = flag.Duration("shutdown-timeout", 30*time.Second, "on SIGTERM/SIGINT: how long clients get to finish before their connections are closed (idle ones are sent away at once; a second signal stops immediately)")
 		configFile   = flag.String("config", env("TENANTDB_CONFIG", ""), "file of `name: value` settings, one per flag; the command line overrides it, it overrides environment variables")
+		scramCB      = flag.String("scram-channel-binding", env("TENANTDB_SCRAM_CHANNEL_BINDING", "auto"), "SCRAM-SHA-256-PLUS (channel binding) cannot pass through a proxy that ends TLS. auto: hide it from clients not using TLS to the proxy, offer it to those that are (works if the proxy has the database's certificate); strip: never offer it; passthrough: always offer it")
 		showVersion  = flag.Bool("version", false, "print the version and exit")
 	)
 	flag.Parse()
@@ -102,6 +106,10 @@ func main() {
 		os.Exit(2)
 	}
 
+	if *scramCB != "auto" && *scramCB != "strip" && *scramCB != "passthrough" {
+		log.Error("bad -scram-channel-binding (want auto, strip or passthrough)", "value", *scramCB)
+		os.Exit(2)
+	}
 	if *onError != "block" && *onError != "allow" {
 		log.Error("bad -strict-on-error (want block or allow)", "value", *onError)
 		os.Exit(2)
@@ -118,6 +126,36 @@ func main() {
 			os.Exit(2)
 		}
 		tlsCfg = &tls.Config{MinVersion: tls.VersionTLS12, GetCertificate: rl.get}
+		if *clientCA != "" {
+			if *clientAuth != "require" && *clientAuth != "verify-if-given" {
+				log.Error("bad -tls-client-auth (want require or verify-if-given)", "value", *clientAuth)
+				os.Exit(2)
+			}
+			cr := &caReloader{file: *clientCA}
+			if _, err := cr.pool(); err != nil {
+				log.Error("cannot load the client CA bundle", "err", err)
+				os.Exit(2)
+			}
+			mode := tls.RequireAndVerifyClientCert
+			if *clientAuth == "verify-if-given" {
+				mode = tls.VerifyClientCertIfGiven
+			}
+			base := tlsCfg
+			tlsCfg = &tls.Config{MinVersion: tls.VersionTLS12, GetCertificate: rl.get,
+				GetConfigForClient: func(*tls.ClientHelloInfo) (*tls.Config, error) {
+					pool, err := cr.pool()
+					if err != nil {
+						return nil, err
+					}
+					c := base.Clone()
+					c.ClientAuth, c.ClientCAs = mode, pool
+					return c, nil
+				}}
+			log.Info("mutual TLS: client certificates are verified", "ca", *clientCA, "mode", *clientAuth)
+		}
+	} else if *clientCA != "" {
+		log.Error("-tls-client-ca needs -tls-cert and -tls-key")
+		os.Exit(2)
 	}
 	if *requireTLS && tlsCfg == nil {
 		log.Error("-require-tls needs -tls-cert and -tls-key")
@@ -199,6 +237,7 @@ func main() {
 	srv := proxy.New(proxy.Config{
 		Observer:            o.wrap(attributor.Observer()),
 		DrainTimeout:        *drainTimeout,
+		SCRAMChannelBinding: *scramCB,
 		TLS:                 tlsCfg,
 		RequireTLS:          *requireTLS,
 		GateFailClosed:      mode == attrib.StrictBlock && *onError == "block",
@@ -314,4 +353,44 @@ func (r *certReloader) get(*tls.ClientHelloInfo) (*tls.Certificate, error) {
 		r.modTime = fi.ModTime()
 	}
 	return r.cert, nil
+}
+
+// caReloader serves the CA pool clients' certificates are checked against, and
+// picks up a changed bundle without a restart.
+type caReloader struct {
+	file string
+
+	mu      sync.Mutex
+	p       *x509.CertPool
+	modTime time.Time
+	checked time.Time
+}
+
+func (r *caReloader) pool() (*x509.CertPool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.p != nil && time.Since(r.checked) < 10*time.Second {
+		return r.p, nil
+	}
+	r.checked = time.Now()
+	fi, err := os.Stat(r.file)
+	if err == nil && r.p != nil && fi.ModTime().Equal(r.modTime) {
+		return r.p, nil
+	}
+	pem, err := os.ReadFile(r.file)
+	if err == nil {
+		p := x509.NewCertPool()
+		if p.AppendCertsFromPEM(pem) {
+			r.p = p
+			if fi != nil {
+				r.modTime = fi.ModTime()
+			}
+			return r.p, nil
+		}
+		err = fmt.Errorf("%s holds no PEM certificates", r.file)
+	}
+	if r.p != nil {
+		return r.p, nil // keep the last good bundle
+	}
+	return nil, err
 }

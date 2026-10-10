@@ -18,7 +18,7 @@ func TestExpositionFormat(t *testing.T) {
 	c := r.NewCounterVec("t_statements_total", "Statements by source.", "source")
 	c.With("explicit").Inc()
 	c.With("explicit").Add(2)
-	c.With(`we"ird\`+"\n").Inc()
+	c.With(`we"ird\` + "\n").Inc()
 	plain := r.NewCounter("t_plain_total", "A counter.")
 	plain.Inc()
 	r.NewGaugeFunc("t_gauge", "A gauge.", func() float64 { return 2.5 })

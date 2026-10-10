@@ -14,6 +14,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -34,7 +35,9 @@ type Config struct {
 
 	// TLS, if set, lets clients encrypt their connection to the proxy (the
 	// server certificate and key). Without it the proxy answers a client's TLS
-	// request with "no" and the client falls back to plaintext.
+	// request with "no" and the client falls back to plaintext. Set ClientAuth and
+	// ClientCAs on it to require client certificates (mutual TLS): a client the
+	// handshake rejects never reaches the database.
 	TLS *tls.Config
 	// RequireTLS refuses clients that do not encrypt. Needs TLS.
 	RequireTLS bool
@@ -59,6 +62,17 @@ type Config struct {
 	// closing their connections (default 30s; a negative value closes at once).
 	// Idle clients are told to reconnect as soon as the drain starts.
 	DrainTimeout time.Duration
+	// SCRAMChannelBinding says what to do with SCRAM-SHA-256-PLUS (channel
+	// binding) in the server's offer of authentication methods. Channel binding
+	// ties authentication to one TLS connection, so it cannot survive a proxy that
+	// ends TLS: the client binds to the proxy's certificate and the database
+	// expects its own.
+	//   "auto" (the default) hides it from clients that are not using TLS to the
+	//     proxy (libpq refuses it there) and offers it to those that are, which
+	//     works when the proxy presents the same certificate as the database;
+	//   "strip" never offers it;
+	//   "passthrough" always offers it.
+	SCRAMChannelBinding string
 }
 
 // Stats are counters the server keeps while it runs.
@@ -70,6 +84,7 @@ type Stats struct {
 	TLSHandshakeFailures atomic.Uint64
 	StartupFailures      atomic.Uint64 // clients that never completed their startup (garbage, timeout)
 	ObserverPanics       atomic.Uint64
+	ChannelBindingFailed atomic.Uint64 // clients whose SCRAM channel binding was refused by the database
 	RejectedSoft         atomic.Uint64 // statements refused; the connection stayed usable
 	RejectedHard         atomic.Uint64 // statements refused by closing the connection
 }
@@ -122,6 +137,11 @@ func New(cfg Config) *Server {
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
+	}
+	switch cfg.SCRAMChannelBinding {
+	case "auto", "strip", "passthrough":
+	default:
+		cfg.SCRAMChannelBinding = "auto"
 	}
 	if cfg.DrainTimeout == 0 {
 		cfg.DrainTimeout = 30 * time.Second
@@ -251,6 +271,7 @@ func (s *Server) handle(client net.Conn) {
 
 	var startup *pgproto3.StartupMessage
 	secure := false
+	certSubject := ""
 	for startup == nil {
 		msg, err := backend.ReceiveStartupMessage()
 		if err != nil {
@@ -282,6 +303,9 @@ func (s *Server) handle(client net.Conn) {
 				return
 			}
 			_ = tc.SetDeadline(time.Time{})
+			if peers := tc.ConnectionState().PeerCertificates; len(peers) > 0 {
+				certSubject = peers[0].Subject.String()
+			}
 			client, secure = tc, true
 			backend = s.newBackend(tc)
 		case *pgproto3.GSSEncRequest:
@@ -313,8 +337,12 @@ func (s *Server) handle(client net.Conn) {
 	s.track(up, true)
 	defer s.track(up, false)
 
-	sess := &Session{ID: id, User: startup.Parameters["user"], DB: startup.Parameters["database"], Params: startup.Parameters, gs: &gateState{}}
+	sess := &Session{ID: id, User: startup.Parameters["user"], DB: startup.Parameters["database"], Params: startup.Parameters, TLS: secure, ClientCert: certSubject, gs: &gateState{}}
 	log = log.With("user", sess.User, "db", sess.DB)
+	if certSubject != "" {
+		log = log.With("client_cert", certSubject)
+		log.Debug("client certificate verified")
+	}
 	log.Debug("session open")
 	defer log.Debug("session closed")
 	s.mu.Lock()
@@ -379,6 +407,33 @@ func (s *Server) pumpClient(log *slog.Logger, sess *Session, backend *pgproto3.B
 	}
 }
 
+// stripPlus decides whether to hide SCRAM-SHA-256-PLUS from this client.
+func (s *Server) stripPlus(sess *Session) bool {
+	switch s.cfg.SCRAMChannelBinding {
+	case "strip":
+		return true
+	case "passthrough":
+		return false
+	}
+	return !sess.TLS
+}
+
+// withoutChannelBinding copies the offer without SCRAM-SHA-256-PLUS.
+func withoutChannelBinding(m *pgproto3.AuthenticationSASL) *pgproto3.AuthenticationSASL {
+	out := &pgproto3.AuthenticationSASL{}
+	for _, mech := range m.AuthMechanisms {
+		if mech != "SCRAM-SHA-256-PLUS" {
+			out.AuthMechanisms = append(out.AuthMechanisms, mech)
+		}
+	}
+	return out
+}
+
+// channelBindingError recognises the database refusing a client's channel binding.
+func channelBindingError(e *pgproto3.ErrorResponse) bool {
+	return e.Code == "08P01" && strings.Contains(e.Message, "channel binding")
+}
+
 func (s *Server) pumpUpstream(log *slog.Logger, sess *Session, backend *pgproto3.Backend, frontend *pgproto3.Frontend) {
 	for {
 		msg, err := frontend.Receive()
@@ -395,6 +450,9 @@ func (s *Server) pumpUpstream(log *slog.Logger, sess *Session, backend *pgproto3
 			backend.SetAuthType(pgproto3.AuthTypeMD5Password)
 		case *pgproto3.AuthenticationSASL:
 			backend.SetAuthType(pgproto3.AuthTypeSASL)
+			if s.stripPlus(sess) {
+				msg = withoutChannelBinding(msg.(*pgproto3.AuthenticationSASL))
+			}
 		case *pgproto3.AuthenticationSASLContinue:
 			backend.SetAuthType(pgproto3.AuthTypeSASLContinue)
 		case *pgproto3.AuthenticationSASLFinal:
@@ -403,6 +461,12 @@ func (s *Server) pumpUpstream(log *slog.Logger, sess *Session, backend *pgproto3
 		if rfq, ok := msg.(*pgproto3.ReadyForQuery); ok {
 			sess.gs.tx.Store(uint32(rfq.TxStatus))
 			sess.gs.ready.Store(true)
+		}
+		if e, ok := msg.(*pgproto3.ErrorResponse); ok && channelBindingError(e) {
+			s.stats.ChannelBindingFailed.Add(1)
+			log.Warn("the database refused the client's SCRAM channel binding: channel binding ties authentication to one TLS connection and cannot pass through a proxy that ends TLS. "+
+				"Connect with channel_binding=disable (libpq), or give tenantdb the same certificate as the database, or run it with -scram-channel-binding=strip",
+				"client_tls", sess.TLS, "mode", s.cfg.SCRAMChannelBinding)
 		}
 		s.safeObserve(log, func() { s.obs.OnBackend(sess, msg) })
 		if err := writeClient(sess, backend, msg); err != nil {

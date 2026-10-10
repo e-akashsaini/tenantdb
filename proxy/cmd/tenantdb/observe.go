@@ -151,6 +151,7 @@ func (o *observability) bind(srv *proxy.Server, a *attrib.Attributor, cat *attri
 	r.NewCounterFunc("tenantdb_upstream_dial_failures_total", "Times the database could not be reached for a client.", f(&st.UpstreamDialFailures))
 	r.NewCounterFunc("tenantdb_tls_handshake_failures_total", "Client TLS handshakes that failed.", f(&st.TLSHandshakeFailures))
 	r.NewCounterFunc("tenantdb_startup_failures_total", "Clients that sent garbage or never finished their startup.", f(&st.StartupFailures))
+	r.NewCounterFunc("tenantdb_scram_channel_binding_failures_total", "Clients whose SCRAM channel binding the database refused (it cannot pass through a proxy that ends TLS).", f(&st.ChannelBindingFailed))
 	r.NewCounterFunc("tenantdb_observer_panics_total", "Panics in statement analysis (the proxy fails open unless block mode says otherwise).", f(&st.ObserverPanics))
 	r.NewCounterFunc("tenantdb_rejected_statements_soft_total", "Statements refused with an error; the connection stayed usable.", f(&st.RejectedSoft))
 	r.NewCounterFunc("tenantdb_rejected_statements_hard_total", "Statements refused by closing the connection (it was not safe to fake an abort).", f(&st.RejectedHard))

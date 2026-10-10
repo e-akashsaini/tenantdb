@@ -37,6 +37,24 @@ A setting can come from the command line, a config file, or an environment varia
 
 The config file has one `name: value` per line, using the flag names (`strict`, `upstream-tls`, `cache-size`, ...; `_` works for `-`). `#` starts a comment. Values may be quoted. A name that is not a flag is an error, so a typo in a security setting is never silently ignored. Keep the database connection string out of the file (use `TENANTDB_SCHEMA_DSN`); tenantdb warns if a world-readable config file holds one.
 
+## TLS, client certificates and SCRAM channel binding
+
+`-tls-cert`/`-tls-key` let clients encrypt their connection to tenantdb (certificates are re-read when the files change), `-require-tls` refuses those that do not, and `-upstream-tls` encrypts the connection to the database.
+
+**Mutual TLS.** `-tls-client-ca ca.pem` makes tenantdb verify client certificates: a client without a certificate signed by that CA is rejected in the TLS handshake and never reaches the database (`-tls-client-auth verify-if-given` checks a certificate only when one is sent). The CA bundle is re-read when the file changes. The certificate's subject is recorded on the session (`client_cert` in debug logs). The database still authenticates the user as usual: tenantdb is the gate, not a substitute for the database's own authentication.
+
+**SCRAM channel binding.** Channel binding (`SCRAM-SHA-256-PLUS`, libpq's `channel_binding`) ties a login to one TLS connection so that something in the middle cannot relay it. A proxy that ends TLS is exactly that, so it only works through tenantdb when the client and the database see the **same certificate**. What happens (checked against PostgreSQL 16 with libpq 18; `bench/compat/tls.sh` reproduces it):
+
+| Client → tenantdb | tenantdb → database | `channel_binding` | Result |
+|---|---|---|---|
+| no TLS | TLS | any but `require` | works: tenantdb hides `-PLUS` from clients that cannot use it |
+| TLS | TLS, tenantdb has its own certificate | `disable` | works |
+| TLS | TLS, tenantdb has its own certificate | `prefer` (libpq default) or `require` | **fails**: `SCRAM channel binding check failed`. Set `channel_binding=disable` in the connection string |
+| TLS | TLS, tenantdb has the database's certificate and key | any | works, including `require` |
+| any | no TLS | any | works (the database offers no channel binding) |
+
+Clients that do not implement channel binding (pgx, node-postgres, pgjdbc by default) are not affected. `-scram-channel-binding` changes the behaviour: `auto` (default) is the table above; `strip` never offers `-PLUS`, so `require` fails at the client with a clear message; `passthrough` always offers it. When the database refuses a binding, tenantdb logs why and counts it (`tenantdb_scram_channel_binding_failures_total`).
+
 ## Failure behaviour
 
 What happens when something goes wrong depends on the mode, and is chosen to be the safe thing for each:

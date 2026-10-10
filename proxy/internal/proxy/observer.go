@@ -8,6 +8,11 @@ type Session struct {
 	User   string
 	DB     string
 	Params map[string]string
+	// TLS is set when the client connected to the proxy over TLS.
+	TLS bool
+	// ClientCert is the subject of the certificate the client presented (mutual
+	// TLS), or empty.
+	ClientCert string
 
 	// State is private storage for the Observer, one value per connection.
 	// Guard it yourself: both observer callbacks may run concurrently.
