@@ -40,14 +40,28 @@ func (e *Extractor) forFunc(def *FuncDef) *Extractor {
 	return &fe
 }
 
+// forTrigger returns an extractor that reads NEW.<tenant> and OLD.<tenant> as
+// "argument 1": the tenant of the row that fired the trigger.
+func (e *Extractor) forTrigger(def *FuncDef) *Extractor {
+	fe := *e
+	fe.fname = strings.ToLower(def.Name)
+	fe.args = nil
+	fe.trig = true
+	return &fe
+}
+
 // bodyOf reads a function's code.
-func (e *Extractor) bodyOf(def *FuncDef) *FuncBody {
+func (e *Extractor) bodyOf(def *FuncDef) *FuncBody { return e.readBody(def, e.forFunc(def)) }
+
+// triggerBodyOf reads a trigger function's code.
+func (e *Extractor) triggerBodyOf(def *FuncDef) *FuncBody { return e.readBody(def, e.forTrigger(def)) }
+
+func (e *Extractor) readBody(def *FuncDef, fe *Extractor) *FuncBody {
 	b := &FuncBody{NoArgs: def.HasModes}
 	if def.Kind == 'a' || def.Kind == 'w' || strings.TrimSpace(def.Src) == "" {
 		b.Opaque = true
 		return b
 	}
-	fe := e.forFunc(def)
 	switch strings.ToLower(def.Lang) {
 	case "sql":
 		stmts, ok := fe.parseAll(def.Src)
@@ -61,7 +75,11 @@ func (e *Extractor) bodyOf(def *FuncDef) *FuncBody {
 		for _, q := range queries {
 			stmts, ok := fe.parseAll(q)
 			if !ok {
-				// PL/pgSQL hands over bare expressions ("n > 10") as well as statements.
+				// PL/pgSQL hands over bare expressions ("n > 10") as well as statements,
+				// and assignments ("n := n + 1"), of which only the value is a query.
+				if _, rhs, isAssign := strings.Cut(q, ":="); isAssign {
+					q = rhs
+				}
 				stmts, ok = fe.parseAll("SELECT " + q)
 			}
 			if !ok {
@@ -122,7 +140,17 @@ func plpgsqlQueries(def *FuncDef) (queries []string, ok bool) {
 			params = append(params, pgIdent(n)+" text")
 		}
 	}
-	create := "CREATE FUNCTION tdb_probe(" + strings.Join(params, ", ") + ") RETURNS void LANGUAGE plpgsql AS " + tag + def.Src + tag
+	// The declared return type decides which RETURN forms the PL/pgSQL parser accepts.
+	ret := "void"
+	switch def.Ret {
+	case "trigger":
+		ret, params = "trigger", nil
+	case "set":
+		ret = "SETOF int"
+	case "scalar":
+		ret = "int"
+	}
+	create := "CREATE FUNCTION tdb_probe(" + strings.Join(params, ", ") + ") RETURNS " + ret + " LANGUAGE plpgsql AS " + tag + def.Src + tag
 	js, err := pg_query.ParsePlPgSqlToJSON(create)
 	if err != nil {
 		return nil, false

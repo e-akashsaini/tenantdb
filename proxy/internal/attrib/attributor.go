@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -120,6 +121,7 @@ type Attributor struct {
 	fmu    sync.Mutex
 	fgen   uint64
 	fcache map[*FuncDef]*FuncBody
+	tcache map[*FuncDef]*FuncBody // trigger functions, read with NEW/OLD bound
 }
 
 func New(opt Options, onEvent func(Event)) *Attributor {
@@ -699,6 +701,10 @@ func (a *Attributor) analyze(st *state, x Stmt, pt *portal, depth int, owners ow
 		r.tenantTouched = true
 		r.scan = r.cr.scan
 	}
+	own := r.tenants
+	for _, w := range x.Writes {
+		r.merge(a.triggerEffect(st, w, own, depth, owners))
+	}
 	path := a.pathOf(st)
 	for _, c := range x.Calls {
 		if defs := a.cat.Funcs(c.Ref, path, st.user); len(defs) > 0 {
@@ -764,7 +770,7 @@ func (a *Attributor) funcBody(def *FuncDef) *FuncBody {
 	a.fmu.Lock()
 	defer a.fmu.Unlock()
 	if a.fcache == nil || a.fgen != gen {
-		a.fcache, a.fgen = map[*FuncDef]*FuncBody{}, gen
+		a.fcache, a.tcache, a.fgen = map[*FuncDef]*FuncBody{}, map[*FuncDef]*FuncBody{}, gen
 	}
 	if b, ok := a.fcache[def]; ok {
 		return b
@@ -772,6 +778,54 @@ func (a *Attributor) funcBody(def *FuncDef) *FuncBody {
 	b := a.ex.bodyOf(def)
 	a.fcache[def] = b
 	return b
+}
+
+// triggerBody reads (and caches) a trigger function's code.
+func (a *Attributor) triggerBody(def *FuncDef) *FuncBody {
+	gen := a.cat.Generation()
+	a.fmu.Lock()
+	defer a.fmu.Unlock()
+	if a.fcache == nil || a.fgen != gen {
+		a.fcache, a.tcache, a.fgen = map[*FuncDef]*FuncBody{}, map[*FuncDef]*FuncBody{}, gen
+	}
+	if b, ok := a.tcache[def]; ok {
+		return b
+	}
+	b := a.ex.triggerBodyOf(def)
+	a.tcache[def] = b
+	return b
+}
+
+// triggerEffect analyses the triggers a write fires. NEW.tenant_id in a trigger
+// body is the tenant of the row being written, so it is bound to each of the
+// statement's tenants in turn; a trigger that touches tenant data it cannot tie
+// to those tenants makes the statement unresolved, as a function would.
+func (a *Attributor) triggerEffect(st *state, w Write, tenants []string, depth int, owners ownerSet) analysis {
+	var r analysis
+	ti, tmp, ok := a.tableFor(st, w.Ref)
+	if !ok || tmp != nil || ti == nil {
+		return r
+	}
+	if a.cat.HasRules(ti) {
+		r.unsure = true // a rule rewrites the statement into others that are not read
+	}
+	for _, t := range a.cat.Triggers(ti, w.Events) {
+		if depth >= maxCallDepth || len(t.Funcs) == 0 {
+			r.unsure = true
+			continue
+		}
+		for _, def := range t.Funcs {
+			b := a.triggerBody(def)
+			if len(tenants) == 0 {
+				r.merge(a.bodyEffect(st, b, &portal{params: []string{""}, valid: []bool{false}}, depth+1, owners))
+				continue
+			}
+			for _, tv := range tenants {
+				r.merge(a.bodyEffect(st, b, &portal{params: []string{tv}, valid: []bool{true}}, depth+1, owners))
+			}
+		}
+	}
+	return r
 }
 
 // insertTenants returns the tenants an INSERT writes rows for. Every row must
@@ -1084,6 +1138,7 @@ func (a *Attributor) judge(r analysis) (sound, trusted bool, tenants []string) {
 	trusted = sound && !r.unconfined
 	if trusted {
 		tenants = dedupe(r.tenants)
+		sort.Strings(tenants)
 	}
 	return sound, trusted, tenants
 }

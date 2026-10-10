@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	pg_query "github.com/pganalyze/pg_query_go/v6"
+	"google.golang.org/protobuf/proto"
 )
 
 // TempDef describes a temporary table being created.
@@ -117,6 +118,7 @@ func (e *Extractor) stmtFor(text string, node *pg_query.Node) Stmt {
 		e.shape(node, &st)
 		st.Q = e.buildQuery(node)
 		st.Tables, st.Funcs, st.Calls = e.tablesOf(node)
+		st.Writes = writesOf(node)
 		st.Filtered = e.filtered(node)
 		if sv := e.selectSetConfig(node); sv != nil {
 			st.Set = sv
@@ -208,4 +210,42 @@ func refOfNameList(n *pg_query.Node) (TableRef, bool) {
 		return TableRef{Name: parts[0]}, true
 	}
 	return TableRef{Schema: parts[len(parts)-2], Name: parts[len(parts)-1]}, true
+}
+
+// Write is a table a statement modifies and the trigger events that causes.
+type Write struct {
+	Ref    TableRef
+	Events int // trigInsert | trigUpdate | trigDelete
+}
+
+// writesOf finds every INSERT, UPDATE, DELETE and COPY FROM in a statement,
+// data-modifying CTEs included.
+func writesOf(node *pg_query.Node) []Write {
+	var out []Write
+	walk(node.ProtoReflect(), func(m proto.Message) bool {
+		switch v := m.(type) {
+		case *pg_query.InsertStmt:
+			if v.Relation != nil {
+				ev := trigInsert
+				if oc := v.OnConflictClause; oc != nil && oc.Action == pg_query.OnConflictAction_ONCONFLICT_UPDATE {
+					ev |= trigUpdate
+				}
+				out = append(out, Write{relRef(v.Relation), ev})
+			}
+		case *pg_query.UpdateStmt:
+			if v.Relation != nil {
+				out = append(out, Write{relRef(v.Relation), trigUpdate})
+			}
+		case *pg_query.DeleteStmt:
+			if v.Relation != nil {
+				out = append(out, Write{relRef(v.Relation), trigDelete})
+			}
+		case *pg_query.CopyStmt:
+			if v.IsFrom && v.Relation != nil {
+				out = append(out, Write{relRef(v.Relation), trigInsert})
+			}
+		}
+		return true
+	})
+	return out
 }

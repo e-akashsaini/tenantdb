@@ -46,6 +46,9 @@ type Stmt struct {
 	// column. A statement on tenant data where it is false reads every tenant.
 	Filtered bool
 
+	// Writes lists the tables the statement inserts into, updates or deletes from
+	// (including inside CTEs), with the trigger events that fire.
+	Writes     []Write
 	Tables     []TableRef  // every table the statement names (CTE names excluded)
 	Funcs      []TableRef  // every function it calls
 	Calls      []Call      // the same calls, with their arguments
@@ -71,6 +74,10 @@ type Extractor struct {
 	// is read as "the tenant is argument 1".
 	fname string
 	args  map[string]int
+	// Set while reading a trigger function: NEW.<tenant column> and
+	// OLD.<tenant column> stand for the tenant of the row that fired it,
+	// which the caller binds as argument 1.
+	trig bool
 
 	// anyKey: collect equality predicates on every column, not only the
 	// configured key columns. The catalog then decides which ones identify a row

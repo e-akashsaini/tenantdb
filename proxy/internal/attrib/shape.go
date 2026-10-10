@@ -85,6 +85,12 @@ func (e *Extractor) operand(n *pg_query.Node) Operand {
 			return Operand{Var: strings.ToLower(c.GetSval().Sval), Set: true}
 		}
 	}
+	if ref := n.GetColumnRef(); ref != nil && e.trig && len(ref.Fields) == 2 {
+		q := strings.ToLower(ref.Fields[0].GetString_().GetSval())
+		if c := strings.ToLower(ref.Fields[1].GetString_().GetSval()); (q == "new" || q == "old") && e.cols[c] {
+			return Operand{Param: 1, Set: true}
+		}
+	}
 	if ref := n.GetColumnRef(); ref != nil && len(e.args) > 0 {
 		name := ""
 		switch len(ref.Fields) {

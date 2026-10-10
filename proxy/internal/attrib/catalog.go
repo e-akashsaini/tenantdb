@@ -55,7 +55,8 @@ type FuncDef struct {
 	Src          string
 	ArgNames     []string
 	NArgs        int
-	HasModes     bool // some arguments are OUT/INOUT/VARIADIC/TABLE
+	HasModes     bool   // some arguments are OUT/INOUT/VARIADIC/TABLE
+	Ret          string // what it returns: "void", "trigger", "set" (SETOF / TABLE) or "scalar"; "" is read as void
 }
 
 // isSystemSchema holds relations that never contain tenant data.
@@ -74,6 +75,8 @@ type Catalog struct {
 	mu        sync.RWMutex
 	tables    map[string]*TableInfo // "schema.name", lower-cased
 	funcs     map[string][]*FuncDef // "schema.name" of user-defined functions
+	triggers  map[string][]trigRow  // table key -> its enabled, non-internal triggers
+	ruled     map[string]bool       // tables with rewrite rules (CREATE RULE): their actions are not read
 	gen       uint64
 	loaded    bool
 	reloading atomic.Bool
@@ -140,7 +143,9 @@ WHERE i.indisunique AND i.indisvalid AND i.indnatts = 1 AND i.indpred IS NULL AN
 // Functions that belong to an extension (deptype 'e') are not user code.
 const funcSQL = `
 SELECT n.nspname, p.proname, l.lanname, p.prokind::text, p.prosrc,
-       COALESCE(p.proargnames, '{}'::text[]), p.pronargs::int, p.proargmodes IS NOT NULL
+       COALESCE(p.proargnames, '{}'::text[]), p.pronargs::int, p.proargmodes IS NOT NULL,
+       CASE WHEN p.prorettype = 'void'::regtype THEN 'void' WHEN p.prorettype = 'trigger'::regtype THEN 'trigger'
+            WHEN p.proretset THEN 'set' ELSE 'scalar' END
 FROM pg_proc p
 JOIN pg_namespace n ON n.oid = p.pronamespace
 JOIN pg_language l ON l.oid = p.prolang
@@ -155,6 +160,22 @@ SELECT n.nspname, c.relname, pg_get_viewdef(c.oid, false)
 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
 WHERE c.relkind = 'v' AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%'
   AND n.nspname NOT LIKE 'pg_temp%'`
+
+// Triggers a statement on a table can fire. Internal ones (foreign keys) are not
+// application code.
+const triggerSQL = `
+SELECT n.nspname, c.relname, t.tgtype::int, pn.nspname, p.proname
+FROM pg_trigger t
+JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+JOIN pg_proc p ON p.oid = t.tgfoid JOIN pg_namespace pn ON pn.oid = p.pronamespace
+WHERE NOT t.tgisinternal AND t.tgenabled IN ('O', 'A')
+  AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%'`
+
+// CREATE RULE ... ON INSERT/UPDATE/DELETE rewrites a statement into others. pg_rules
+// leaves out the rules that make a view a view.
+const rulesSQL = `
+SELECT DISTINCT schemaname, tablename FROM pg_rules
+WHERE schemaname NOT IN ('pg_catalog','information_schema')`
 
 const roleSettingSQL = `
 SELECT COALESCE(r.rolname, ''), COALESCE(d.datname, ''), s.setconfig
@@ -190,7 +211,24 @@ type snapshotData struct {
 	fks        map[string]map[string]FKRef // tests only; Load computes them itself
 	polys      map[string]map[string]map[string]FKRef
 	viewdefs   map[string]string // table key -> definition
+	triggers   map[string][]trigRow
+	ruled      map[string]bool
 }
+
+// trigRow is one trigger: tgtype's bits say when it fires (insert 4, delete 8,
+// update 16, truncate 32) and fn names its function as schema.name.
+type trigRow struct {
+	typ int
+	fn  string
+}
+
+// Trigger event bits, as in pg_trigger.tgtype.
+const (
+	trigInsert   = 4
+	trigDelete   = 8
+	trigUpdate   = 16
+	trigTruncate = 32
+)
 
 // Load replaces the snapshot with the current schema.
 func (c *Catalog) Load(ctx context.Context) error {
@@ -250,7 +288,7 @@ func (c *Catalog) Load(ctx context.Context) error {
 	for frows.Next() {
 		f := &FuncDef{}
 		var kind string
-		if err := frows.Scan(&f.Schema, &f.Name, &f.Lang, &kind, &f.Src, &f.ArgNames, &f.NArgs, &f.HasModes); err != nil {
+		if err := frows.Scan(&f.Schema, &f.Name, &f.Lang, &kind, &f.Src, &f.ArgNames, &f.NArgs, &f.HasModes, &f.Ret); err != nil {
 			frows.Close()
 			return err
 		}
@@ -265,6 +303,8 @@ func (c *Catalog) Load(ctx context.Context) error {
 	}
 
 	d.viewdefs = loadViewDefs(ctx, conn)
+	d.triggers = loadTriggers(ctx, conn)
+	d.ruled = loadRuled(ctx, conn)
 
 	// Row-level security can blind the lookup role; know whether it is subject to it.
 	if err := conn.QueryRow(ctx, `SELECT COALESCE((SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname = current_user), false)`).Scan(&d.bypassRLS); err != nil {
@@ -300,6 +340,76 @@ func (c *Catalog) Load(ctx context.Context) error {
 	c.apply(d)
 	c.loadFKs(ctx, conn)
 	return nil
+}
+
+// loadTriggers reads the application's triggers. If the role cannot see them the
+// map is nil and statements are analysed as if there were none.
+func loadTriggers(ctx context.Context, conn *pgx.Conn) map[string][]trigRow {
+	rows, err := conn.Query(ctx, triggerSQL)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	out := map[string][]trigRow{}
+	for rows.Next() {
+		var s, t, fs, fn string
+		var typ int
+		if err := rows.Scan(&s, &t, &typ, &fs, &fn); err != nil {
+			return out
+		}
+		k := strings.ToLower(s + "." + t)
+		out[k] = append(out[k], trigRow{typ: typ, fn: strings.ToLower(fs + "." + fn)})
+	}
+	return out
+}
+
+func loadRuled(ctx context.Context, conn *pgx.Conn) map[string]bool {
+	rows, err := conn.Query(ctx, rulesSQL)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var s, t string
+		if err := rows.Scan(&s, &t); err != nil {
+			return out
+		}
+		out[strings.ToLower(s+"."+t)] = true
+	}
+	return out
+}
+
+// HasRules reports whether a rewrite rule is defined on ti.
+func (c *Catalog) HasRules(ti *TableInfo) bool {
+	if c == nil || ti == nil {
+		return false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.ruled[ti.Key()]
+}
+
+// TrigDef is a trigger a statement may fire.
+type TrigDef struct {
+	Funcs []*FuncDef // the function(s) it could be; none if it cannot be found
+}
+
+// Triggers returns the triggers on ti that fire for the given event bits
+// (trigInsert | trigUpdate | ...).
+func (c *Catalog) Triggers(ti *TableInfo, events int) []TrigDef {
+	if c == nil || ti == nil {
+		return nil
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var out []TrigDef
+	for _, t := range c.triggers[ti.Key()] {
+		if t.typ&events != 0 {
+			out = append(out, TrigDef{Funcs: c.funcs[t.fn]})
+		}
+	}
+	return out
 }
 
 // loadViewDefs reads every view's definition. A role that cannot read some of
@@ -354,7 +464,7 @@ func (c *Catalog) apply(d snapshotData) {
 		funcs[k] = append(funcs[k], f)
 	}
 	c.mu.Lock()
-	c.tables, c.funcs, c.loaded = m, funcs, true
+	c.tables, c.funcs, c.triggers, c.ruled, c.loaded = m, funcs, d.triggers, d.ruled, true
 	c.bypassRLS, c.roleSearch, c.baseSearch = d.bypassRLS, d.roleSearch, d.baseSearch
 	if d.fks != nil {
 		c.fks = d.fks
