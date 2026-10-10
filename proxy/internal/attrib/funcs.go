@@ -94,7 +94,7 @@ func (e *Extractor) doBody(d *pg_query.DoStmt) *FuncBody {
 }
 
 func (e *Extractor) parseAll(sql string) ([]Stmt, bool) {
-	tree, err := pg_query.Parse(sql)
+	tree, err := Parse(sql)
 	if err != nil {
 		return nil, false
 	}
@@ -109,7 +109,7 @@ func (e *Extractor) parseAll(sql string) ([]Stmt, bool) {
 // is false if the body does not parse or runs dynamic SQL.
 func plpgsqlQueries(def *FuncDef) (queries []string, ok bool) {
 	tag := "$tdb_body$"
-	if strings.Contains(def.Src, tag) {
+	if strings.Contains(def.Src, tag) || checkParseable(def.Src) != nil {
 		return nil, false
 	}
 	var params []string

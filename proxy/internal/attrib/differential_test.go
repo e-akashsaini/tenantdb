@@ -278,6 +278,9 @@ func TestDifferentialSoundness(t *testing.T) {
 	if _, err := conn.Exec(ctx, diffSchemaSQL); err != nil {
 		t.Fatalf("schema: %v", err)
 	}
+	if _, err := conn.Exec(ctx, diffExtraSchemaSQL); err != nil {
+		t.Fatalf("extra schema: %v", err)
+	}
 	defer conn.Exec(ctx, "DROP SCHEMA IF EXISTS tdbdiff CASCADE")
 
 	cat := NewCatalog(dsn)
@@ -331,9 +334,12 @@ func TestDifferentialSoundness(t *testing.T) {
 	ran := 0
 	for i := 0; i < n; i++ {
 		var q dquery
-		if g.r.Intn(6) == 0 {
+		switch k := g.r.Intn(10); {
+		case k < 1:
 			q = g.dmlQuery()
-		} else {
+		case k < 4:
+			q = g.extraQuery()
+		default:
 			q = g.selectQuery()
 		}
 		// Ground truth: the tenants of the rows the query really touches.
@@ -349,9 +355,14 @@ func TestDifferentialSoundness(t *testing.T) {
 				ok = false
 			} else {
 				for rows.Next() {
-					var tn *string
-					if rows.Scan(&tn) == nil && tn != nil {
-						truth[*tn] = true
+					vals, verr := rows.Values()
+					if verr != nil {
+						continue
+					}
+					for _, v := range vals {
+						if str, isStr := v.(string); isStr {
+							truth[str] = true
+						}
 					}
 				}
 				rows.Close()
@@ -383,11 +394,19 @@ func TestDifferentialSoundness(t *testing.T) {
 		}
 		ran++
 		tl := sortedSet(truth)
+		useParams := g.r.Intn(10) < 3
 
 		for ci, c := range cfgs {
 			c.evs = nil
 			sess := sessions[ci]
-			c.a.OnFrontend(sess, &pgproto3.Query{String: q.sql})
+			if psql, pvals := paramize(q.sql); useParams && len(pvals) > 0 {
+				c.a.OnFrontend(sess, &pgproto3.Parse{Name: "", Query: psql})
+				c.a.OnFrontend(sess, &pgproto3.Bind{Parameters: pvals})
+				c.a.OnFrontend(sess, &pgproto3.Execute{})
+				c.a.OnFrontend(sess, &pgproto3.Sync{})
+			} else {
+				c.a.OnFrontend(sess, &pgproto3.Query{String: q.sql})
+			}
 			c.a.OnBackend(sess, &pgproto3.CommandComplete{CommandTag: []byte("OK")})
 			c.a.OnBackend(sess, &pgproto3.ReadyForQuery{TxStatus: 'I'})
 			if stats[c.name] == nil {

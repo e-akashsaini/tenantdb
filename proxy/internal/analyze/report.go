@@ -8,7 +8,6 @@ import (
 	"strings"
 
 	"github.com/akashsaini/tenantdb/internal/attrib"
-	pg_query "github.com/pganalyze/pg_query_go/v6"
 )
 
 // Report is the result of analysing a workload. Counts are weighted by how many
@@ -77,7 +76,7 @@ func (r *Report) add(ev attrib.Event, w int64) {
 		return
 	}
 	r.Violations[ev.Violation] += w
-	norm, err := pg_query.Normalize(ev.SQL)
+	norm, err := attrib.Normalize(ev.SQL)
 	if err != nil {
 		norm = ev.SQL
 	}

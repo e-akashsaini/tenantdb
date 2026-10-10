@@ -11,7 +11,6 @@ import (
 	"github.com/akashsaini/tenantdb/internal/attrib"
 	"github.com/akashsaini/tenantdb/internal/proxy"
 	"github.com/jackc/pgx/v5/pgproto3"
-	pg_query "github.com/pganalyze/pg_query_go/v6"
 )
 
 // Options configures a run.
@@ -95,7 +94,7 @@ func (r *Runner) Feed(e Entry) {
 	}
 	r.cur, r.produced = e.Calls, false
 	r.rep.Entries += e.Calls
-	if _, err := pg_query.Parse(e.SQL); err != nil {
+	if _, err := attrib.Parse(e.SQL); err != nil {
 		r.rep.Unparsed += e.Calls
 		return
 	}

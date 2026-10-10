@@ -96,7 +96,7 @@ func lowerSet(in []string) map[string]bool {
 
 // Parse splits sql into statements and extracts tenant information from each.
 func (e *Extractor) Parse(sql string) ([]Stmt, error) {
-	tree, err := pg_query.Parse(sql)
+	tree, err := Parse(sql)
 	if err != nil {
 		return nil, err
 	}

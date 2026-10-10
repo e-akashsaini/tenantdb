@@ -17,6 +17,8 @@ func soundSpec() catSpec {
 	add(tbl("public", "countries", 'r', "code", "name"))
 	return catSpec{
 		rows: rows,
+		funcs: []*FuncDef{{Schema: "public", Name: "orders_of", Lang: "sql", Kind: 'f', NArgs: 1, ArgNames: []string{"p"},
+			Src: `SELECT * FROM orders WHERE tenant_id = p`}},
 		unique: map[string][]string{
 			"public.customers": {"id", "slug"}, "public.orders": {"id"}, "public.items": {"id"}, "public.countries": {"code"},
 		},
@@ -133,5 +135,19 @@ func TestSubqueriesAreEachConfinedOrTheStatementIsNot(t *testing.T) {
 	e = h.attributed(t, `WITH x AS (SELECT * FROM orders) SELECT * FROM x WHERE x.tenant_id = 't1'`)
 	if e.Source == SourceExplicit {
 		t.Errorf("the CTE reads every tenant's orders: %+v", e)
+	}
+}
+
+// Found by the differential fuzzer: after a row lookup finished the analysis, the
+// tenants a function call contributed were forgotten, so the statement was claimed
+// for the subquery's tenant alone.
+func TestLookupResultsAreCombinedWithFunctionCallTenants(t *testing.T) {
+	h := soundHarness()
+	h.a.lk = &fakeLookup{rows: map[string][]string{"public.customers|id|35": {"t2"}}}
+	h.query(`SELECT f.* FROM orders_of('t3') f WHERE NOT EXISTS (SELECT 1 FROM orders o2 WHERE o2.customer_id = 35)`)
+	h.waitFor(t, 1)
+	e := h.last(t)
+	if e.Source != SourceLookup || !reflect.DeepEqual(e.Tenants, []string{"t2", "t3"}) {
+		t.Errorf("want the subquery's tenant (found by lookup) and the function's: %+v", e)
 	}
 }

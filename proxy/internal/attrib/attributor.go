@@ -66,6 +66,10 @@ type Event struct {
 	// to the database (block mode only).
 	Violation string
 	Blocked   bool
+	// Unparsed: the statement could not be analysed (a syntax the parser does not
+	// know, or too large or deeply chained to hand to it safely). Nothing can be
+	// said about it, so it is unknown.
+	Unparsed bool
 }
 
 // Options configures an Attributor.
@@ -145,12 +149,16 @@ func (a *Attributor) Cache() *RowCache { return a.cache }
 
 var _ proxy.Observer = (*Attributor)(nil)
 
-type prepared struct{ stmts []Stmt }
+type prepared struct {
+	stmts    []Stmt
+	unparsed string // the SQL, if it could not be analysed
+}
 
 type portal struct {
-	stmts  []Stmt
-	params []string // decoded bound values; valid[i] is false for NULL
-	valid  []bool
+	unparsed string
+	stmts    []Stmt
+	params   []string // decoded bound values; valid[i] is false for NULL
+	valid    []bool
 }
 
 // resolve turns an operand into its value, using bound parameters if any.
@@ -320,7 +328,7 @@ func (a *Attributor) OnFrontend(s *proxy.Session, msg pgproto3.FrontendMessage) 
 		st.mu.Lock()
 		defer st.mu.Unlock()
 		if err != nil {
-			// Still expect one reply we cannot interpret; ReadyForQuery clears it.
+			a.unparsed(s, st, m.String)
 			return
 		}
 		for _, x := range stmts {
@@ -332,7 +340,8 @@ func (a *Attributor) OnFrontend(s *proxy.Session, msg pgproto3.FrontendMessage) 
 		st.mu.Lock()
 		defer st.mu.Unlock()
 		if err != nil {
-			delete(st.prepared, m.Name)
+			st.prepared[m.Name] = &prepared{unparsed: m.Query}
+			st.batchParsed = append(st.batchParsed, m.Name)
 			return
 		}
 		st.prepared[m.Name] = &prepared{stmts: stmts}
@@ -346,7 +355,7 @@ func (a *Attributor) OnFrontend(s *proxy.Session, msg pgproto3.FrontendMessage) 
 			delete(st.portals, m.DestinationPortal)
 			return
 		}
-		pt := &portal{stmts: p.stmts, params: make([]string, len(m.Parameters)), valid: make([]bool, len(m.Parameters))}
+		pt := &portal{stmts: p.stmts, unparsed: p.unparsed, params: make([]string, len(m.Parameters)), valid: make([]bool, len(m.Parameters))}
 		for i, v := range m.Parameters {
 			if v != nil {
 				pt.params[i], pt.valid[i] = decodeParam(v, formatFor(m.ParameterFormatCodes, i)), true
@@ -365,6 +374,10 @@ func (a *Attributor) OnFrontend(s *proxy.Session, msg pgproto3.FrontendMessage) 
 		defer st.mu.Unlock()
 		pt := st.portals[m.Portal]
 		if pt == nil {
+			return
+		}
+		if pt.unparsed != "" {
+			a.unparsed(s, st, pt.unparsed)
 			return
 		}
 		for _, x := range pt.stmts {
@@ -598,9 +611,9 @@ const maxCallDepth = 6
 // each body statement is analysed with the call's arguments bound to the
 // function's parameters, so `tenant_id = p_tenant` inside the function yields
 // the tenant the caller passed. Dynamic SQL cannot be read and stays unsure.
-func (a *Attributor) analyze(st *state, x Stmt, pt *portal, depth int) analysis {
+func (a *Attributor) analyze(st *state, x Stmt, pt *portal, depth int, owners ownerSet) analysis {
 	var r analysis
-	r.cr = a.confine(st, x, pt, nil)
+	r.cr = a.confine(st, x, pt, owners)
 	switch {
 	case x.Insert:
 		// The tenants are those of the rows being written, and every row must name one.
@@ -649,17 +662,17 @@ func (a *Attributor) analyze(st *state, x Stmt, pt *portal, depth int) analysis 
 	path := a.pathOf(st)
 	for _, c := range x.Calls {
 		if defs := a.cat.Funcs(c.Ref, path, st.user); len(defs) > 0 {
-			r.merge(a.callEffect(st, c, defs, pt, depth))
+			r.merge(a.callEffect(st, c, defs, pt, depth, owners))
 		}
 	}
 	if x.Body != nil {
-		r.merge(a.bodyEffect(st, x.Body, nil, depth+1))
+		r.merge(a.bodyEffect(st, x.Body, nil, depth+1, owners))
 	}
 	return r
 }
 
 // callEffect analyses a call to an application-defined function.
-func (a *Attributor) callEffect(st *state, c Call, defs []*FuncDef, pt *portal, depth int) analysis {
+func (a *Attributor) callEffect(st *state, c Call, defs []*FuncDef, pt *portal, depth int, owners ownerSet) analysis {
 	var r analysis
 	if depth >= maxCallDepth {
 		r.unsure = true
@@ -675,7 +688,7 @@ func (a *Attributor) callEffect(st *state, c Call, defs []*FuncDef, pt *portal, 
 			continue // a different overload
 		}
 		matched = true
-		r.merge(a.bodyEffect(st, a.funcBody(def), args, depth+1))
+		r.merge(a.bodyEffect(st, a.funcBody(def), args, depth+1, owners))
 	}
 	if !matched {
 		r.unsure = true
@@ -685,7 +698,7 @@ func (a *Attributor) callEffect(st *state, c Call, defs []*FuncDef, pt *portal, 
 
 // bodyEffect analyses the statements of a function body. args holds the values
 // of the call's arguments (nil for a DO block).
-func (a *Attributor) bodyEffect(st *state, b *FuncBody, args *portal, depth int) analysis {
+func (a *Attributor) bodyEffect(st *state, b *FuncBody, args *portal, depth int, owners ownerSet) analysis {
 	var r analysis
 	if b.Opaque {
 		r.unsure = true
@@ -695,7 +708,7 @@ func (a *Attributor) bodyEffect(st *state, b *FuncBody, args *portal, depth int)
 		args = nil
 	}
 	for _, s := range b.Stmts {
-		br := a.analyze(st, s, args, depth)
+		br := a.analyze(st, s, args, depth, owners)
 		if br.tenantTouched && len(br.tenants) == 0 {
 			// It reads tenant data and neither an argument nor the body says whose.
 			br.unresolvedFn = true
@@ -870,18 +883,8 @@ func (a *Attributor) handle(s *proxy.Session, st *state, x Stmt, pt *portal) {
 	x.Inserts = append(x.Inserts, a.rawInserts(x, ti)...)
 	p.dropTable = x.SetsKey || a.assignsKey(ti, x)
 
-	r := a.analyze(st, x, pt, 0)
-	catalog := a.cat != nil && a.cat.Loaded()
-	// Can the tenants found be trusted for the whole statement? Not if a tenant
-	// table is read unconfined, a function reads tenant data nothing attributes, or
-	// something it touches cannot be vouched for (an unknown table, a view that
-	// hides its tenant column, ...).
-	sound := !r.unresolvedFn && !(r.unsure && catalog) // nothing in it is beyond the proxy's sight
-	trusted := sound && !r.unconfined
-	tenants := dedupe(r.tenants)
-	if !trusted {
-		tenants = nil
-	}
+	r := a.analyze(st, x, pt, 0, nil)
+	sound, trusted, tenants := a.judge(r)
 	if x.Temp != nil {
 		kind, ten := a.provenance(st, r, tenants)
 		p.temp = &tempReg{def: x.Temp, kind: kind, tenants: ten}
@@ -915,6 +918,7 @@ func (a *Attributor) handle(s *proxy.Session, st *state, x Stmt, pt *portal) {
 	// The statement's own tenants are trustworthy, and either name some, or the
 	// predicates contradict each other so it reads nothing at all.
 	confinedToNothing := trusted && !x.Insert && r.cr.confined && r.cr.tenantOccs > 0 && len(tenants) == 0
+	_ = sound
 
 	switch {
 	case len(tenants) > 0 || confinedToNothing:
@@ -994,14 +998,30 @@ func (a *Attributor) lookupOwners(need []keyReq) (owners ownerSet, failed bool) 
 	return owners, failed
 }
 
-// finishLookup re-reads the statement with the owners the database named.
-// st.mu must be held.
+// finishLookup re-reads the statement with the owners the database named: the
+// whole analysis again (function calls included), so the verdict is made exactly
+// as it would have been had the cache known. st.mu must be held.
 func (a *Attributor) finishLookup(st *state, ev Event, x Stmt, pt *portal, owners ownerSet, failed bool, txnOK bool) {
-	cr := a.confine(st, x, pt, owners)
-	if cr.confined && cr.tenantOccs > 0 {
-		claimEvent(&ev, cr.tenants, cr, false)
+	r := a.analyze(st, x, pt, 0, owners)
+	_, trusted, tenants := a.judge(r)
+	if trusted && (len(tenants) > 0 || (!x.Insert && r.cr.confined && r.cr.tenantOccs > 0)) {
+		claimEvent(&ev, tenants, r.cr, x.Insert)
 	}
 	a.settle(st, &ev, txnOK)
+}
+
+// judge decides how far an analysis can be believed. sound: nothing in the
+// statement is beyond the proxy's sight (an unknown table, a view that hides its
+// tenant column, a function whose code cannot be read). trusted: and no tenant
+// table is read unconfined, so the tenants found speak for the whole statement.
+func (a *Attributor) judge(r analysis) (sound, trusted bool, tenants []string) {
+	catalog := a.cat != nil && a.cat.Loaded()
+	sound = !r.unresolvedFn && !(r.unsure && catalog)
+	trusted = sound && !r.unconfined
+	if trusted {
+		tenants = dedupe(r.tenants)
+	}
+	return sound, trusted, tenants
 }
 
 // settle fills in whatever the statement itself did not determine, in order of
@@ -1260,4 +1280,17 @@ func (a *Attributor) assignsKey(ti *TableInfo, x Stmt) bool {
 		}
 	}
 	return false
+}
+
+// unparsed records a statement the proxy could not analyse. It is queued like any
+// statement, so the server's reply stays lined up, and reported as unknown: in
+// block mode it is refused unless the role is exempt. Must be called with st.mu held.
+func (a *Attributor) unparsed(s *proxy.Session, st *state, sql string) {
+	st.queue = append(st.queue, &pending{})
+	const maxLogged = 4 << 10
+	if len(sql) > maxLogged {
+		sql = sql[:maxLogged] + "..."
+	}
+	ev := Event{SessionID: s.ID, User: s.User, DB: s.DB, SQL: sql, Source: SourceUnknown, Unparsed: true}
+	a.emit(st, ev)
 }
