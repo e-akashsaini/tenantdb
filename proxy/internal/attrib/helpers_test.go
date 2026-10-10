@@ -16,11 +16,12 @@ type catSpec struct {
 	roleSearch map[[2]string][]string
 	baseSearch []string
 	fks        map[string]map[string]FKRef // "schema.table" -> column -> parent
+	polys      map[string]map[string]map[string]FKRef
 }
 
 func (sp catSpec) snapshot() snapshotData {
 	d := snapshotData{cols: sp.rows, unique: map[string]map[string]bool{}, funcs: sp.funcs,
-		bypassRLS: !sp.subjectRLS, roleSearch: sp.roleSearch, baseSearch: sp.baseSearch, fks: sp.fks}
+		bypassRLS: !sp.subjectRLS, roleSearch: sp.roleSearch, baseSearch: sp.baseSearch, fks: sp.fks, polys: sp.polys}
 	for k, cols := range sp.unique {
 		d.unique[k] = map[string]bool{}
 		for _, c := range cols {

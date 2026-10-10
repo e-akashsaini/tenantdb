@@ -19,32 +19,32 @@ everything. Every request is real ActiveRecord traffic.
 
 ## What it found
 
-Measured pass: 234 HTTP requests, **4,946 statements** attributed. (The first
+Measured pass: 234 HTTP requests, **4,947 statements** attributed. (The first
 version of the engine, before this exercise, flagged 16% of the same kind of
 traffic; the changes it drove are listed below.)
 
 | How the tenant was determined | statements |
 |---|---:|
-| shared tables, `SELECT 1`, ... (`untenanted`) | 40.2% |
-| a row looked up by a unique column or foreign key (`cache`, `lookup`) | 28.0% |
+| shared tables, `SELECT 1`, ... (`untenanted`) | 40.1% |
+| a row looked up by a unique column, foreign key or polymorphic parent (`cache`, `lookup`) | 29.5% |
 | the statement names the account (`explicit`) | 21.5% |
-| tenant data with no account or row filter (`scan`) | 6.2% |
-| tenant data, tenant not determined (`unknown`) | 3.7% |
+| tenant data with no account or row filter (`scan`) | 4.3% |
+| tenant data, tenant not determined (`unknown`) | 4.0% |
 | a row that doesn't exist (`nomatch`) | 0.5% |
 
-So **10.0% would be flagged** by strict mode (6.2% scan + 3.7% unknown). What they are:
+So **8.3% would be flagged** by strict mode (4.3% scan + 4.0% unknown). What they are:
 
 | Flagged statements | Count | Verdict |
 |---|---:|---|
 | `users JOIN access_tokens WHERE token = $1` | 152 | Authentication: the tenant is what this query *discovers*. Inherently unattributable. Needs an exempt role or a connection tag. |
 | `account_linked_accounts WHERE linked_account_id = $1` | 129 | A lookup by the *other* account's id: cross-account by design. |
-| `search_entries` / `active_storage_attachments` by `record_type` + `record_id` | 128 | Rails polymorphic associations. A limitation of tenantdb: it could resolve these (the type names the parent table) but doesn't yet. |
 | `encrypted_configs` / `account_configs WHERE key = $1` | 65 | Settings read by key with no account filter. These are the kind of finding an audit exists for; whether they are a bug depends on the app (I did not read DocuSeal's source). |
+| polymorphic lookups that could not be resolved | 48 | `active_storage_attachments` whose `record_id` comes from a subquery (32), and `search_entries` of a type (`Submission`) that has no rows yet to verify the mapping against (16). |
 | `template_versions WHERE template_id = $1` | 16 | A foreign key tenantdb couldn't verify because the table was empty. Resolves once there is data. |
 | bootstrap checks (`SELECT 1 FROM users LIMIT 1`) | 3 | The app asking whether anyone has registered. |
 
 Offline, `tenantdb analyze` on the Postgres log of the same traffic gives the
-same answer: 4,946 statements, the same counts for every source, 493 flagged.
+same answer: 4,947 statements, the same counts for every source, 413 flagged.
 
 ## What it said about running in `block` mode
 
@@ -70,6 +70,12 @@ was a defect found by running this app, and fixed:
   guess would attribute queries to the wrong tenant, which is worse than none.
 - **Joins and aliases.** `SELECT ... FROM templates JOIN submissions ... WHERE
   submissions.id = $1` names its table through a qualifier; that is now read.
+- **Polymorphic associations.** Rails stores `record_type = 'Template'` and
+  `record_id = 5` on a child row; the type names the parent table. tenantdb maps
+  the class name to a table by Rails' naming rules (`ActiveStorage::Blob` ->
+  `active_storage_blobs`), verifies each mapping against real rows like a foreign
+  key, and resolves the pair through the right parent. This took the
+  `search_entries` and `active_storage_attachments` lookups from 128 flagged to 48.
 - **A lookup is not a scan.** Equality on an identifying column that couldn't be
   resolved is `unknown`; `scan` is kept for tenant data read with no identifying
   filter at all.

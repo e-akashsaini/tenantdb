@@ -44,6 +44,7 @@ Every event also carries `scan` (reads across tenants, even if a tag attributed 
 - **Temporary tables.** A temp table with its own tenant column is filtered like any tenant table. One filled from a query inherits the tenants of that query (`derived`); one filled from unattributed data stays `unknown`. They are per-session, shadow real tables the way Postgres does, and never enter the shared cache.
 - **`INSERT` without a column list**, using the real column order from the catalog.
 - **Rows by any unique column, and through foreign keys.** A statement that names a row by a unique column (`id`, `slug`, `uuid`: anything with a single-column unique index) is attributed to that row's tenant. A lookup by a foreign key (`WHERE submission_id = 5`) is attributed through the parent row. Foreign keys are the declared ones plus columns named `<thing>_id` next to a table called `<thing>` or `<thing>s`; each is checked against a sample of real rows (the child must always have its parent's tenant) and discarded if it isn't, or if there are no rows to check yet.
+- **Polymorphic associations (Rails).** `WHERE record_type = 'Template' AND record_id = 5` is resolved through the table the class name maps to (`ActiveStorage::Blob` is `active_storage_blobs`), after the mapping has been checked against real rows. A type with no rows yet, or ids that come from a subquery, stay unknown.
 - **Joins and aliases.** `... FROM templates JOIN submissions ... WHERE submissions.id = $1` is read through the qualifier. An unqualified column in a join could belong to either table, so it names none.
 - **`OR`.** A WHERE clause confines a statement to a tenant only if every alternative does: `tenant_id = 'a' AND (x = 1 OR y = 2)` is `a`; `tenant_id = 'a' OR amount > 5` is not attributed to `a`.
 - **Cache hygiene.** Rows are learned only from successful `INSERT`s and from result columns that come straight from one table. `DELETE` evicts, an `UPDATE` that changes a unique or tenant column drops that table's entries, and `TRUNCATE`/`DROP TABLE` forget the table. Entries also expire after `-cache-ttl`.
@@ -113,16 +114,16 @@ Formats: `.log` (PostgreSQL log, including bound parameters), `.csv` (a `pg_stat
 ```
 tenantdb analysis
 =================
-5746 statements read; 4946 attributed, 800 need no attribution (SET, BEGIN, DDL, ...)
+5747 statements read; 4947 attributed, 800 need no attribution (SET, BEGIN, DDL, ...)
 
 How tenants were determined
   explicit          1065   21.5%
-  cache             1402   28.3%
-  untenanted        1986   40.2%
-  scan               309    6.2%
-  unknown            184    3.7%
+  cache             1484   30.0%
+  untenanted        1985   40.1%
+  scan               213    4.3%
+  unknown            200    4.0%
 
-What strict mode would flag: 493 of 4946 attributed statements (10.0%)
+What strict mode would flag: 413 of 4947 attributed statements (8.3%)
 
 Worst query shapes (statements that differ only in their literals are grouped)
    1. [unknown] x152  public.access_tokens, public.users
@@ -133,7 +134,7 @@ By default it warms the row cache from the database and looks up the rows a stat
 
 ### On a real Rails app
 
-[`bench/docuseal/`](bench/docuseal/README.md) runs DocuSeal (Rails 8, `account_id` on its tables) behind the proxy and drives it. 4,946 statements: 10.0% would be flagged, almost all of them authentication, polymorphic associations, global configuration reads and bootstrap checks; and in `block` mode the unmodified app stops at login. Read the caveats there before quoting any number: it is one app, one account, scripted traffic.
+[`bench/docuseal/`](bench/docuseal/README.md) runs DocuSeal (Rails 8, `account_id` on its tables) behind the proxy and drives it. 4,947 statements: 8.3% would be flagged, almost all of them authentication, cross-account lookups, global configuration reads and bootstrap checks; and in `block` mode the unmodified app stops at login. Read the caveats there before quoting any number: it is one app, one account, scripted traffic.
 
 ### Running your own test suite through it
 
@@ -232,7 +233,7 @@ What is genuinely not handled:
 
 - **No connection pooling.** It's one upstream connection per client connection. Pooling changes how authentication works (the proxy would have to authenticate clients itself), so it is a design decision, not a patch.
 - **Code the proxy can't read stays `unknown`.** Dynamic SQL inside a function (`EXECUTE` of a computed string), and functions in languages other than SQL and PL/pgSQL. That's inherent: what such code touches is only decided at run time. Use a [connection tag](#connection-tag) for those paths, or an exempt role.
-- **Polymorphic associations aren't resolved.** A Rails `record_type` + `record_id` pair names its parent table at run time; tenantdb doesn't follow it yet, so those lookups are flagged.
+- **Polymorphic associations are resolved only when they can be verified.** A type that has no rows yet (nothing to check the class-to-table mapping against), a class whose table doesn't follow Rails' naming, or ids supplied by a subquery are flagged.
 - **Lookups by credential can't be attributed.** An API-token or session lookup is how the application *finds out* the tenant. Give such connections a [connection tag](#connection-tag) or an exempt role.
 - **A foreign key can only be verified when there are rows.** A `<thing>_id` column on an empty table is not used until the table has data.
 - **Triggers and rules aren't analysed.** A trigger fired by a statement can touch other tables; the proxy only sees the statement itself.

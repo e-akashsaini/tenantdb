@@ -1044,7 +1044,7 @@ func (a *Attributor) predTable(st *state, x Stmt, pr Pred) (*TableInfo, bool) {
 func (a *Attributor) identifies(st *state, x Stmt) bool {
 	for _, pr := range x.Keys {
 		if ti, ok := a.predTable(st, x, pr); ok {
-			if _, _, _, ok := a.target(ti, pr.Col); ok {
+			if _, _, _, ok := a.target(ti, pr.Col); ok || ti.HasPolyID(pr.Col) {
 				return true
 			}
 		}
@@ -1072,8 +1072,13 @@ func (a *Attributor) keyTenants(st *state, table string, x Stmt, pt *portal) (ha
 				continue
 			}
 			if tgt, tcol, pcol, found = a.target(pti, pr.Col); !found {
-				skipped = true
-				continue
+				if tgt, tcol, pcol, found = a.polyTarget(st, x, pti, pr, pt); !found {
+					// record_type = 'X' only qualifies its record_id; it is not an alternative.
+					if !a.polyTypePart(x, pti, pr) {
+						skipped = true
+					}
+					continue
+				}
 			}
 			ckey = tgt.Key()
 		} else {
@@ -1299,6 +1304,52 @@ func (a *Attributor) tableNames(st *state, x Stmt) []string {
 func (a *Attributor) assignsKey(ti *TableInfo, x Stmt) bool {
 	for _, c := range x.SetCols {
 		if a.tenants[c] || (ti != nil && ti.IsUnique(c)) {
+			return true
+		}
+	}
+	return false
+}
+
+// polyTarget resolves `X_type = 'Class' AND X_id = n`: the class names the parent
+// table (verified against real rows), and n is a row of it.
+func (a *Attributor) polyTarget(st *state, x Stmt, ti *TableInfo, pr Pred, pt *portal) (tgt *TableInfo, tcol, pcol string, ok bool) {
+	base, found := strings.CutSuffix(pr.Col, "_id")
+	if !found || a.cat == nil || !ti.HasPolyID(pr.Col) {
+		return nil, "", "", false
+	}
+	for _, sib := range x.Keys {
+		if sib.Col != base+"_type" || sib.Qual != pr.Qual || len(sib.Ops) != 1 {
+			continue
+		}
+		class, resolved := pt.resolve(sib.Ops[0])
+		if !resolved {
+			return nil, "", "", false
+		}
+		ref, verified := a.cat.Poly(ti, base, class)
+		if !verified {
+			return nil, "", "", false
+		}
+		parent, found := a.cat.TableByKey(ref.ParentKey)
+		if !found {
+			return nil, "", "", false
+		}
+		tc, _ := a.scopeOf(parent)
+		if tc == "" {
+			return nil, "", "", false
+		}
+		return parent, tc, ref.ParentCol, true
+	}
+	return nil, "", "", false
+}
+
+// polyTypePart: is pr the X_type half of a pair whose X_id is also in the statement?
+func (a *Attributor) polyTypePart(x Stmt, ti *TableInfo, pr Pred) bool {
+	base, found := strings.CutSuffix(pr.Col, "_type")
+	if !found || !ti.HasPolyID(base+"_id") {
+		return false
+	}
+	for _, sib := range x.Keys {
+		if sib.Col == base+"_id" && sib.Qual == pr.Qual {
 			return true
 		}
 	}

@@ -78,8 +78,9 @@ type Catalog struct {
 	// TenantColumns names the columns that hold the tenant. Set it before Load:
 	// foreign keys can only be verified when the tenant column is known.
 	TenantColumns []string
-	fks           map[string]map[string]FKRef // table key -> column -> the verified parent row it points at
-	fkMemo        map[string]fkVerdict        // verdicts kept across reloads
+	fks           map[string]map[string]FKRef            // table key -> column -> the verified parent row it points at
+	fkMemo        map[string]fkVerdict                   // verdicts kept across reloads
+	polys         map[string]map[string]map[string]FKRef // table -> association -> type value -> parent
 
 	bypassRLS  bool                   // the loading role is not subject to row-level security
 	roleSearch map[[2]string][]string // (role, database) -> search_path from ALTER ROLE/DATABASE ... SET
@@ -169,6 +170,7 @@ type snapshotData struct {
 	roleSearch map[[2]string][]string
 	baseSearch []string
 	fks        map[string]map[string]FKRef // tests only; Load computes them itself
+	polys      map[string]map[string]map[string]FKRef
 }
 
 // Load replaces the snapshot with the current schema.
@@ -306,6 +308,9 @@ func (c *Catalog) apply(d snapshotData) {
 	if d.fks != nil {
 		c.fks = d.fks
 	}
+	if d.polys != nil {
+		c.polys = d.polys
+	}
 	c.gen++
 	c.mu.Unlock()
 }
@@ -420,8 +425,9 @@ func (c *Catalog) loadFKs(ctx context.Context, conn *pgx.Conn) {
 		}
 		out[k][f.ccol] = FKRef{ParentKey: f.parent.Key(), ParentCol: f.pcol}
 	}
+	polys := c.verifyPolys(ctx, conn, tables, tcol)
 	c.mu.Lock()
-	c.fks = out
+	c.fks, c.polys = out, polys
 	c.mu.Unlock()
 }
 
