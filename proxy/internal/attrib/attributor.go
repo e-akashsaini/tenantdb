@@ -252,8 +252,9 @@ type state struct {
 	txnTenant []string // tenants seen so far in the open transaction
 	txnGen    uint64   // bumped whenever a transaction ends
 
-	path, localPath []string // search_path: session value and SET LOCAL value
-	tag, localTag   string   // declared tenant: session value and SET LOCAL value
+	vars, localVars map[string]string // custom session variables (SET app.x = ..., set_config): current_setting() reads them
+	path, localPath []string          // search_path: session value and SET LOCAL value
+	tag, localTag   string            // declared tenant: session value and SET LOCAL value
 
 	gather   bool    // Gate is collecting events instead of emitting them
 	gathered []Event // events produced while gathering
@@ -285,11 +286,24 @@ func (st *state) curTag() string {
 	return st.tag
 }
 
+// val resolves an operand: a literal, a bound parameter, or the current value of
+// a session variable (unknown if nothing on this connection has set it).
+func (st *state) val(pt *portal, op Operand) (string, bool) {
+	if op.Var != "" {
+		if v, ok := st.localVars[op.Var]; ok {
+			return v, true
+		}
+		v, ok := st.vars[op.Var]
+		return v, ok
+	}
+	return pt.resolve(op)
+}
+
 // resetTxn is called when a transaction ends: SET LOCAL values go away and any
 // lookup still in flight must not touch the next transaction.
 func (st *state) resetTxn() {
 	st.inTxn, st.txnTenant = false, nil
-	st.localPath, st.localTag = nil, ""
+	st.localPath, st.localTag, st.localVars = nil, "", nil
 	st.txnGen++
 }
 
@@ -315,6 +329,17 @@ func (a *Attributor) st(s *proxy.Session) *state {
 		v.tag = t
 	} else if t, ok := s.Params[a.tagVar]; ok {
 		v.tag = t
+	}
+	v.vars = map[string]string{}
+	for k, val := range s.Params {
+		if strings.Contains(k, ".") {
+			v.vars[strings.ToLower(k)] = val
+		}
+	}
+	for k, val := range opts {
+		if strings.Contains(k, ".") {
+			v.vars[k] = val
+		}
 	}
 	s.State = v
 	return v
@@ -617,7 +642,7 @@ func (a *Attributor) analyze(st *state, x Stmt, pt *portal, depth int, owners ow
 	switch {
 	case x.Insert:
 		// The tenants are those of the rows being written, and every row must name one.
-		r.tenants = insertTenants(x, pt)
+		r.tenants = insertTenants(st, x, pt)
 		if r.cr.tenantOccs > 0 && !r.cr.confined {
 			r.tenants, r.unconfined = nil, true
 		}
@@ -680,7 +705,7 @@ func (a *Attributor) callEffect(st *state, c Call, defs []*FuncDef, pt *portal, 
 	}
 	args := &portal{params: make([]string, len(c.Args)), valid: make([]bool, len(c.Args))}
 	for i, op := range c.Args {
-		args.params[i], args.valid[i] = pt.resolve(op)
+		args.params[i], args.valid[i] = st.val(pt, op)
 	}
 	matched := false
 	for _, def := range defs {
@@ -736,13 +761,13 @@ func (a *Attributor) funcBody(def *FuncDef) *FuncBody {
 
 // insertTenants returns the tenants an INSERT writes rows for. Every row must
 // name one, as a literal or a bound value; otherwise nothing is claimed.
-func insertTenants(x Stmt, pt *portal) []string {
+func insertTenants(st *state, x Stmt, pt *portal) []string {
 	if len(x.Inserts) == 0 || len(x.Inserts) != x.InsertRows {
 		return nil
 	}
 	var out []string
 	for _, r := range x.Inserts {
-		v, ok := pt.resolve(r.Tenant)
+		v, ok := st.val(pt, r.Tenant)
 		if !ok {
 			return nil
 		}
@@ -820,7 +845,13 @@ func (a *Attributor) handle(s *proxy.Session, st *state, x Stmt, pt *portal) {
 	st.queue = append(st.queue, p)
 
 	if x.Set != nil {
-		a.applySet(st, x.Set)
+		sv := *x.Set
+		for _, op := range sv.ValueOps {
+			if v, ok := st.val(pt, op); ok {
+				sv.Values = append(sv.Values, v)
+			}
+		}
+		a.applySet(st, &sv)
 	}
 	if x.Dealloc != nil {
 		if *x.Dealloc == "" {
@@ -860,7 +891,7 @@ func (a *Attributor) handle(s *proxy.Session, st *state, x Stmt, pt *portal) {
 		}
 		args := &portal{params: make([]string, len(x.Exec.Args)), valid: make([]bool, len(x.Exec.Args))}
 		for i, op := range x.Exec.Args {
-			args.params[i], args.valid[i] = pt.resolve(op)
+			args.params[i], args.valid[i] = st.val(pt, op)
 		}
 		prep.SQL = x.SQL
 		x, pt, p.stmt = prep, args, prep
@@ -892,12 +923,12 @@ func (a *Attributor) handle(s *proxy.Session, st *state, x Stmt, pt *portal) {
 
 	// What this statement teaches the cache once it succeeds.
 	for _, row := range x.Inserts {
-		tv, ok := pt.resolve(row.Tenant)
+		tv, ok := st.val(pt, row.Tenant)
 		if !ok || p.table == "" {
 			continue
 		}
 		for _, k := range row.Keys {
-			if kv, ok := pt.resolve(k.Op); ok && a.keyUsable(ti, k.Col) {
+			if kv, ok := st.val(pt, k.Op); ok && a.keyUsable(ti, k.Col) {
 				p.learn = append(p.learn, learned{cacheKey{p.table, k.Col, normVal(kv)}, tv})
 			}
 		}
@@ -905,7 +936,7 @@ func (a *Attributor) handle(s *proxy.Session, st *state, x Stmt, pt *portal) {
 	if x.Delete && p.table != "" {
 		for _, pr := range x.Keys {
 			for _, o := range pr.Ops {
-				if v, ok := pt.resolve(o); ok {
+				if v, ok := st.val(pt, o); ok {
 					p.forget = append(p.forget, cacheKey{p.table, pr.Col, normVal(v)})
 				}
 			}
@@ -1084,7 +1115,26 @@ func (a *Attributor) target(ti *TableInfo, col string) (tgt *TableInfo, tcol, pc
 func (a *Attributor) applySet(st *state, sv *SetVar) {
 	if sv.ResetAll {
 		st.path, st.localPath, st.tag, st.localTag = nil, nil, "", ""
+		st.vars, st.localVars = map[string]string{}, nil
 		return
+	}
+	if strings.Contains(sv.Name, ".") {
+		// A custom variable (app.tenant, tenantdb.tenant, ...): current_setting() reads it back.
+		target := &st.vars
+		if sv.Local {
+			target = &st.localVars
+		}
+		if *target == nil {
+			*target = map[string]string{}
+		}
+		if sv.Reset || len(sv.Values) == 0 {
+			delete(*target, sv.Name)
+			if sv.Local {
+				// SET LOCAL ... then RESET: back to the session value
+			}
+		} else {
+			(*target)[sv.Name] = sv.Values[0]
+		}
 	}
 	switch sv.Name {
 	case "search_path":

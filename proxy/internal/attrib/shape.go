@@ -26,12 +26,17 @@ type SetVar struct {
 	Local    bool // SET LOCAL: undone when the transaction ends
 	Reset    bool // RESET name / SET name TO DEFAULT
 	ResetAll bool // RESET ALL / DISCARD ALL
+	// ValueOps: the value was not a literal (set_config('x', $1, false)); resolved when run.
+	ValueOps []Operand
 }
 
-// Operand is a literal or a $n parameter reference.
+// Operand is a literal, a $n parameter reference, or the current value of a
+// session variable: current_setting('app.tenant'), the way applications that use
+// Postgres row-level security carry the tenant.
 type Operand struct {
 	Lit   string
-	Param int // 1-based; 0 for a literal
+	Param int    // 1-based; 0 for a literal
+	Var   string // session variable name (lower-cased), for current_setting('...')
 	Set   bool
 }
 
@@ -72,6 +77,12 @@ func (e *Extractor) operand(n *pg_query.Node) Operand {
 			return Operand{Lit: strconv.Itoa(int(c.GetIval().Ival)), Set: true}
 		case c.GetFval() != nil:
 			return Operand{Lit: c.GetFval().Fval, Set: true}
+		}
+	}
+	if fc := n.GetFuncCall(); fc != nil && len(fc.Funcname) > 0 && len(fc.Args) >= 1 &&
+		strings.EqualFold(fc.Funcname[len(fc.Funcname)-1].GetString_().GetSval(), "current_setting") {
+		if c := unwrap(fc.Args[0]).GetAConst(); c != nil && c.GetSval() != nil {
+			return Operand{Var: strings.ToLower(c.GetSval().Sval), Set: true}
 		}
 	}
 	if ref := n.GetColumnRef(); ref != nil && len(e.args) > 0 {
@@ -493,10 +504,15 @@ func (e *Extractor) selectSetConfig(n *pg_query.Node) *SetVar {
 			continue
 		}
 		name, val := e.operand(fc.Args[0]), e.operand(fc.Args[1])
-		if !name.Set || name.Param != 0 || !val.Set || val.Param != 0 {
+		if !name.Set || name.Param != 0 || name.Var != "" || !val.Set || val.Var != "" {
 			continue
 		}
-		sv := &SetVar{Name: strings.ToLower(name.Lit), Values: []string{val.Lit}}
+		sv := &SetVar{Name: strings.ToLower(name.Lit)}
+		if val.Param != 0 {
+			sv.ValueOps = []Operand{val}
+		} else {
+			sv.Values = []string{val.Lit}
+		}
 		if len(fc.Args) >= 3 {
 			if c := unwrap(fc.Args[2]).GetAConst(); c != nil && c.GetBoolval() != nil {
 				sv.Local = c.GetBoolval().Boolval

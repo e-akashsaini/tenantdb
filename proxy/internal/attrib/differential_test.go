@@ -97,7 +97,12 @@ func (g *dgen) atom(a string, t *dtable, depth int) string {
 		col = a + ".tenant_id"
 		c = dcol{"tenant_id", "text"}
 	}
-	switch g.r.Intn(16) {
+	switch g.r.Intn(18) {
+	case 16, 17:
+		if t.tenant {
+			return a + ".tenant_id = " + g.pick("current_setting('app.tenant')", "current_setting('app.tenant', true)", "current_setting('app.tenant')::text")
+		}
+		return "true"
 	case 0, 1, 2, 3:
 		return col + " = " + g.lit(c, t.name)
 	case 4:
@@ -325,6 +330,15 @@ func TestDifferentialSoundness(t *testing.T) {
 	}
 	if _, err := conn.Exec(ctx, "SET search_path = tdbdiff"); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, "SET app.tenant = 't2'"); err != nil {
+		t.Fatal(err)
+	}
+	for i, c := range cfgs {
+		c.a.OnFrontend(sessions[i], &pgproto3.Query{String: "SET app.tenant = 't2'"})
+		c.a.OnBackend(sessions[i], &pgproto3.CommandComplete{CommandTag: []byte("SET")})
+		c.a.OnBackend(sessions[i], &pgproto3.ReadyForQuery{TxStatus: 'I'})
+		c.evs = nil
 	}
 
 	g := &dgen{r: rand.New(rand.NewSource(seed))}

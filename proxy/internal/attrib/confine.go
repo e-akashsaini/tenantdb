@@ -375,7 +375,7 @@ func (ev *confEval) identifying(o *occRes, col string) bool {
 func (ev *confEval) values(ops []Operand) ([]string, bool) {
 	vals := make([]string, 0, len(ops))
 	for _, op := range ops {
-		v, ok := ev.pt.resolve(op)
+		v, ok := ev.st.val(ev.pt, op)
 		if !ok {
 			return nil, false
 		}
@@ -498,7 +498,7 @@ func (ev *confEval) poly(c *Cond, out *condOut) {
 			if !ok || so.id != o.id {
 				continue
 			}
-			class, resolved := ev.pt.resolve(s.Leaf.Ops[0])
+			class, resolved := ev.st.val(ev.pt, s.Leaf.Ops[0])
 			ids, idsResolved := ev.values(idLeaf.Ops)
 			if !resolved || !idsResolved {
 				break
