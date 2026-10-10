@@ -23,7 +23,12 @@ const (
 	// SourceTransaction: the statement names no tenant, but an earlier
 	// statement in the same transaction did.
 	SourceTransaction Source = "transaction"
-	// SourceUnknown: nothing available to attribute the statement.
+	// SourceUntenanted: every table the statement touches has no tenant
+	// column (shared reference data, SELECT 1, ...), so there is no tenant to
+	// attribute. Needs the schema catalog.
+	SourceUntenanted Source = "untenanted"
+	// SourceUnknown: the statement touches tenant data but no tenant could be
+	// determined. This is the one to alert on.
 	SourceUnknown Source = "unknown"
 )
 
@@ -44,6 +49,9 @@ type Options struct {
 	TenantColumns []string // columns that hold the tenant, e.g. tenant_id
 	KeyColumns    []string // columns that identify a row across tenants, e.g. id; empty disables the row cache
 	CacheSize     int      // max cached rows (default 100000)
+	// Catalog is optional. With it the proxy can tell shared tables from
+	// tenant tables and can read column-less INSERTs.
+	Catalog *Catalog
 }
 
 // Attributor is a proxy.Observer that attributes DML statements to tenants.
@@ -52,6 +60,7 @@ type Attributor struct {
 	cache   *RowCache
 	onEvent func(Event)
 	tenants map[string]bool
+	cat     *Catalog
 }
 
 func New(opt Options, onEvent func(Event)) *Attributor {
@@ -60,6 +69,7 @@ func New(opt Options, onEvent func(Event)) *Attributor {
 		cache:   NewRowCache(opt.CacheSize),
 		onEvent: onEvent,
 		tenants: lowerSet(opt.TenantColumns),
+		cat:     opt.Catalog,
 	}
 }
 
@@ -211,6 +221,9 @@ func (a *Attributor) OnBackend(s *proxy.Session, msg pgproto3.BackendMessage) {
 			a.learnRow(st.queue[0], m)
 		}
 	case *pgproto3.CommandComplete:
+		if a.cat != nil && isDDL(string(m.CommandTag)) {
+			a.cat.ReloadAsync()
+		}
 		if p := st.pop(); p != nil {
 			for _, l := range p.learn {
 				a.cache.Put(l.key.table, l.key.col, l.key.val, l.tenant)
@@ -306,10 +319,18 @@ func (a *Attributor) handle(s *proxy.Session, st *state, x Stmt, pt *portal) {
 		return
 	}
 
+	// INSERT without a column list: the schema says which position is the tenant.
+	x.Inserts = append(x.Inserts, a.rawInserts(x)...)
+
 	// Tenant values named by the statement, including bound parameters.
 	tenants := append([]string(nil), x.Tenants...)
 	for _, n := range x.Params {
 		if v, ok := pt.resolve(Operand{Param: n, Set: true}); ok {
+			tenants = append(tenants, v)
+		}
+	}
+	for _, r := range x.Inserts {
+		if v, ok := pt.resolve(r.Tenant); ok {
 			tenants = append(tenants, v)
 		}
 	}
@@ -341,6 +362,8 @@ func (a *Attributor) handle(s *proxy.Session, st *state, x Stmt, pt *portal) {
 	switch {
 	case len(tenants) > 0:
 		ev.Tenants, ev.Source = tenants, SourceExplicit
+	case a.untenanted(x):
+		ev.Source = SourceUntenanted
 	default:
 		if t, ok := a.lookup(x, pt); ok {
 			ev.Tenants, ev.Source = t, SourceCache
@@ -446,4 +469,69 @@ func dedupe(in []string) []string {
 		}
 	}
 	return out
+}
+
+// rawInserts turns the rows of a column-less INSERT into InsRows using the
+// table's column order from the catalog. It returns nothing if the table is
+// unknown, ambiguous, or has no tenant column.
+func (a *Attributor) rawInserts(x Stmt) []InsRow {
+	if len(x.RawInserts) == 0 || a.cat == nil {
+		return nil
+	}
+	ti, ok := a.cat.Table(x.Table)
+	if !ok || ti.Ambiguous {
+		return nil
+	}
+	tIdx := -1
+	keyIdx := map[string]int{}
+	for i, c := range ti.Cols {
+		switch {
+		case tIdx < 0 && a.tenants[c]:
+			tIdx = i
+		case a.ex.keys[c]:
+			keyIdx[c] = i
+		}
+	}
+	if tIdx < 0 {
+		return nil
+	}
+	var out []InsRow
+	for _, row := range x.RawInserts {
+		if tIdx >= len(row) {
+			continue
+		}
+		r := InsRow{Tenant: row[tIdx]}
+		for c, i := range keyIdx {
+			if i < len(row) {
+				r.Keys = append(r.Keys, KeyOp{Col: c, Op: row[i]})
+			}
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+// untenanted reports whether every table x touches is known to have no tenant
+// column. Anything the catalog cannot vouch for (unknown or ambiguous tables,
+// functions in FROM, no catalog at all) is not untenanted.
+func (a *Attributor) untenanted(x Stmt) bool {
+	if a.cat == nil || !a.cat.Loaded() || x.Opaque {
+		return false
+	}
+	for _, t := range x.Tables {
+		ti, ok := a.cat.Table(t)
+		if !ok || ti.Ambiguous {
+			return false
+		}
+		for _, c := range ti.Cols {
+			if a.tenants[c] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func isDDL(tag string) bool {
+	return strings.HasPrefix(tag, "CREATE ") || strings.HasPrefix(tag, "ALTER ") || strings.HasPrefix(tag, "DROP ")
 }

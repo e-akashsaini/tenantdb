@@ -85,6 +85,7 @@ func (e *Extractor) shape(n *pg_query.Node, st *Stmt) {
 		if v.InsertStmt.Relation != nil && v.InsertStmt.WithClause == nil {
 			st.Table = relName(v.InsertStmt.Relation)
 			st.Inserts = e.insertRows(v.InsertStmt)
+			st.RawInserts = rawInsertRows(v.InsertStmt)
 		}
 	}
 }
@@ -131,7 +132,7 @@ func (e *Extractor) keyPreds(where *pg_query.Node) []Pred {
 func (e *Extractor) insertRows(s *pg_query.InsertStmt) []InsRow {
 	sel := s.SelectStmt.GetSelectStmt()
 	if sel == nil || len(sel.ValuesLists) == 0 || len(s.Cols) == 0 {
-		return nil // no column list: positions unknown without the table schema
+		return nil // no column list: see rawInsertRows
 	}
 	var out []InsRow
 	for _, row := range sel.ValuesLists {
@@ -157,4 +158,53 @@ func (e *Extractor) insertRows(s *pg_query.InsertStmt) []InsRow {
 		}
 	}
 	return out
+}
+
+// rawInsertRows returns the operands of each VALUES row of an INSERT that has
+// no column list. Which position is the tenant needs the table schema.
+func rawInsertRows(s *pg_query.InsertStmt) [][]Operand {
+	sel := s.SelectStmt.GetSelectStmt()
+	if sel == nil || len(sel.ValuesLists) == 0 || len(s.Cols) != 0 {
+		return nil
+	}
+	var out [][]Operand
+	for _, row := range sel.ValuesLists {
+		items := row.GetList()
+		if items == nil {
+			continue
+		}
+		ops := make([]Operand, len(items.Items))
+		for i, it := range items.Items {
+			ops[i] = operand(it)
+		}
+		out = append(out, ops)
+	}
+	return out
+}
+
+// tablesOf lists every table a statement names and reports whether it reads
+// through a function in FROM (whose body the proxy cannot see). Names that are
+// really CTEs are left out.
+func tablesOf(n *pg_query.Node) (tables []string, opaque bool) {
+	ctes := map[string]bool{}
+	walk(n.ProtoReflect(), func(m proto.Message) bool {
+		if c, ok := m.(*pg_query.CommonTableExpr); ok {
+			ctes[strings.ToLower(c.Ctename)] = true
+		}
+		return true
+	})
+	set := map[string]bool{}
+	walk(n.ProtoReflect(), func(m proto.Message) bool {
+		switch v := m.(type) {
+		case *pg_query.RangeVar:
+			name := strings.ToLower(v.Relname)
+			if v.Schemaname != "" || !ctes[name] {
+				set[name] = true
+			}
+		case *pg_query.RangeFunction:
+			opaque = true
+		}
+		return true
+	})
+	return sortedKeys(set), opaque
 }

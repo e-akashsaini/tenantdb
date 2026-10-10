@@ -24,6 +24,10 @@ type Stmt struct {
 	Inserts []InsRow // INSERT ... VALUES rows
 	Delete  bool     // a DELETE statement
 	SetsKey bool     // an UPDATE that assigns a key or tenant column
+
+	Tables     []string    // every table the statement names (CTE names excluded)
+	Opaque     bool        // reads through a set-returning function the proxy cannot see into
+	RawInserts [][]Operand // INSERT ... VALUES without a column list: positions need the schema
 }
 
 type txnKind int
@@ -82,6 +86,7 @@ func (e *Extractor) Parse(sql string) ([]Stmt, error) {
 			e.collect(raw.Stmt, vals, params)
 			st.Tenants, st.Params = sortedKeys(vals), sortedInts(params)
 			e.shape(raw.Stmt, &st)
+			st.Tables, st.Opaque = tablesOf(raw.Stmt)
 		}
 		out = append(out, st)
 	}

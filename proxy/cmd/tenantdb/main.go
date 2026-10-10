@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"time"
 
 	"github.com/akashsaini/tenantdb/internal/attrib"
 	"github.com/akashsaini/tenantdb/internal/proxy"
@@ -15,14 +16,17 @@ import (
 
 func main() {
 	var (
-		listen     = flag.String("listen", env("TENANTDB_LISTEN", ":6432"), "address to accept clients on")
-		upstream   = flag.String("upstream", env("TENANTDB_UPSTREAM", "127.0.0.1:5432"), "host:port of the PostgreSQL server")
-		upTLS      = flag.Bool("upstream-tls", env("TENANTDB_UPSTREAM_TLS", "") == "1", "connect to the upstream with TLS")
-		upTLSOff   = flag.Bool("upstream-tls-insecure", false, "skip upstream certificate verification (testing only)")
-		tenantCols = flag.String("tenant-columns", env("TENANTDB_TENANT_COLUMNS", "tenant_id"), "comma-separated column names that identify the tenant")
-		keyCols    = flag.String("key-columns", env("TENANTDB_KEY_COLUMNS", "id"), "comma-separated column names that identify a row, used to learn which tenant owns it (empty disables the row cache)")
-		cacheSize  = flag.Int("cache-size", 100000, "maximum rows remembered by the row-to-tenant cache")
-		debug      = flag.Bool("debug", false, "verbose logging")
+		listen      = flag.String("listen", env("TENANTDB_LISTEN", ":6432"), "address to accept clients on")
+		upstream    = flag.String("upstream", env("TENANTDB_UPSTREAM", "127.0.0.1:5432"), "host:port of the PostgreSQL server")
+		upTLS       = flag.Bool("upstream-tls", env("TENANTDB_UPSTREAM_TLS", "") == "1", "connect to the upstream with TLS")
+		upTLSOff    = flag.Bool("upstream-tls-insecure", false, "skip upstream certificate verification (testing only)")
+		tenantCols  = flag.String("tenant-columns", env("TENANTDB_TENANT_COLUMNS", "tenant_id"), "comma-separated column names that identify the tenant")
+		keyCols     = flag.String("key-columns", env("TENANTDB_KEY_COLUMNS", "id"), "comma-separated column names that identify a row, used to learn which tenant owns it (empty disables the row cache)")
+		cacheSize   = flag.Int("cache-size", 100000, "maximum rows remembered by the row-to-tenant cache")
+		schemaDSN   = flag.String("schema-dsn", env("TENANTDB_SCHEMA_DSN", ""), "connection string of a read-only role used to read the schema and pre-warm the cache (prefer the TENANTDB_SCHEMA_DSN env var: flags show up in process lists)")
+		schemaEvery = flag.Duration("schema-refresh", 5*time.Minute, "how often to re-read the schema")
+		prewarm     = flag.Bool("prewarm", true, "fill the row cache from the database at startup (needs -schema-dsn)")
+		debug       = flag.Bool("debug", false, "verbose logging")
 	)
 	flag.Parse()
 
@@ -32,7 +36,25 @@ func main() {
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
+	var catalog *attrib.Catalog
+	if *schemaDSN != "" {
+		catalog = attrib.NewCatalog(*schemaDSN)
+		lctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		if err := catalog.Load(lctx); err != nil {
+			// Fail open: the proxy still relays and attributes without the schema.
+			log.Error("schema load failed; running without catalog", "err", err)
+		} else {
+			log.Info("schema loaded")
+		}
+		cancel()
+		go catalog.Refresh(ctx, *schemaEvery, func(err error) { log.Warn("schema refresh failed", "err", err) })
+	}
+
 	attributor := attrib.New(attrib.Options{
+		Catalog:       catalog,
 		TenantColumns: strings.Split(*tenantCols, ","),
 		KeyColumns:    strings.Split(*keyCols, ","),
 		CacheSize:     *cacheSize,
@@ -55,8 +77,14 @@ func main() {
 	}
 	log.Info("tenantdb proxy listening", "addr", srv.Addr().String(), "upstream", *upstream, "upstream_tls", *upTLS)
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
+	if catalog != nil && *prewarm {
+		// Background: clients are served immediately while the cache fills.
+		go func() {
+			if err := attributor.Warm(ctx, *schemaDSN, *cacheSize, log); err != nil {
+				log.Error("cache warm failed", "err", err)
+			}
+		}()
+	}
 	if err := srv.Serve(ctx); err != nil {
 		log.Error("serve failed", "err", err)
 		os.Exit(1)
