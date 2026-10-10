@@ -25,6 +25,8 @@ func main() {
 		cacheSize   = flag.Int("cache-size", 100000, "maximum rows remembered by the row-to-tenant cache")
 		schemaDSN   = flag.String("schema-dsn", env("TENANTDB_SCHEMA_DSN", ""), "connection string of a read-only role used to read the schema and pre-warm the cache (prefer the TENANTDB_SCHEMA_DSN env var: flags show up in process lists)")
 		schemaEvery = flag.Duration("schema-refresh", 5*time.Minute, "how often to re-read the schema")
+		tagVar      = flag.String("tag-var", env("TENANTDB_TAG_VAR", "tenantdb.tenant"), "session variable a connection sets to declare its tenant (SET tenantdb.tenant = 'acme', or startup option -c tenantdb.tenant=acme)")
+		lookupRows  = flag.Bool("lookup", true, "resolve rows missing from the cache by asking the database (needs -schema-dsn)")
 		prewarm     = flag.Bool("prewarm", true, "fill the row cache from the database at startup (needs -schema-dsn)")
 		debug       = flag.Bool("debug", false, "verbose logging")
 	)
@@ -53,14 +55,26 @@ func main() {
 		go catalog.Refresh(ctx, *schemaEvery, func(err error) { log.Warn("schema refresh failed", "err", err) })
 	}
 
+	var lookup *attrib.Lookup
+	if catalog != nil && *lookupRows {
+		var err error
+		if lookup, err = attrib.NewLookup(ctx, *schemaDSN); err != nil {
+			log.Error("lookup disabled", "err", err)
+		} else {
+			defer lookup.Close()
+		}
+	}
+
 	attributor := attrib.New(attrib.Options{
 		Catalog:       catalog,
+		Lookup:        lookup,
+		TagVar:        *tagVar,
 		TenantColumns: strings.Split(*tenantCols, ","),
 		KeyColumns:    strings.Split(*keyCols, ","),
 		CacheSize:     *cacheSize,
 	}, func(e attrib.Event) {
 		log.Info("query", "session", e.SessionID, "user", e.User, "db", e.DB,
-			"tenants", e.Tenants, "source", e.Source, "conflict", e.Conflict, "sql", e.SQL)
+			"tenants", e.Tenants, "source", e.Source, "scan", e.Scan, "conflict", e.Conflict, "sql", e.SQL)
 	})
 
 	srv := proxy.New(proxy.Config{

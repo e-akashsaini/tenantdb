@@ -2,7 +2,9 @@ package attrib
 
 import (
 	"reflect"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/akashsaini/tenantdb/internal/proxy"
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -11,13 +13,36 @@ import (
 type harness struct {
 	a      *Attributor
 	s      *proxy.Session
+	mu     sync.Mutex
 	events []Event
+}
+
+func (h *harness) record(e Event) {
+	h.mu.Lock()
+	h.events = append(h.events, e)
+	h.mu.Unlock()
 }
 
 func newHarness() *harness {
 	h := &harness{s: &proxy.Session{ID: 1, User: "u", DB: "d"}}
-	h.a = New(Options{TenantColumns: []string{"tenant_id"}, KeyColumns: []string{"id"}}, func(e Event) { h.events = append(h.events, e) })
+	h.a = New(Options{TenantColumns: []string{"tenant_id"}, KeyColumns: []string{"id"}}, h.record)
 	return h
+}
+
+// waitFor blocks until n events exist (lookups finish asynchronously).
+func (h *harness) waitFor(t *testing.T, n int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		h.mu.Lock()
+		got := len(h.events)
+		h.mu.Unlock()
+		if got >= n {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d events", n)
 }
 
 func (h *harness) query(sql string)                 { h.a.OnFrontend(h.s, &pgproto3.Query{String: sql}) }
@@ -26,6 +51,8 @@ func (h *harness) front(m pgproto3.FrontendMessage) { h.a.OnFrontend(h.s, m) }
 
 func (h *harness) last(t *testing.T) Event {
 	t.Helper()
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	if len(h.events) == 0 {
 		t.Fatal("no event emitted")
 	}

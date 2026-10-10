@@ -63,3 +63,65 @@ func TestSplitsStatementsAndTxnControl(t *testing.T) {
 		t.Errorf("sql = %q", stmts[1].SQL)
 	}
 }
+
+func TestFilteredFlag(t *testing.T) {
+	e := NewExtractor([]string{"tenant_id"}, []string{"id"})
+	for sql, want := range map[string]bool{
+		`SELECT * FROM t`:                                             false,
+		`SELECT id FROM t`:                                            false, // selecting a key is not filtering by it
+		`SELECT * FROM t WHERE amount > 1`:                            false,
+		`SELECT * FROM t WHERE id = 1`:                                true,
+		`SELECT * FROM t WHERE tenant_id <> 'a'`:                      true,
+		`SELECT * FROM t WHERE x IN (SELECT 1 FROM u WHERE u.id = 2)`: true,
+		`SELECT * FROM a JOIN b ON a.id = b.a_id`:                     true,
+		`SELECT * FROM a JOIN b ON a.x = b.y`:                         false,
+		`UPDATE t SET x = 1`:                                          false,
+		`DELETE FROM t WHERE id = 1`:                                  true,
+	} {
+		stmts, err := e.Parse(sql)
+		if err != nil || len(stmts) != 1 {
+			t.Fatalf("%s: %v", sql, err)
+		}
+		if stmts[0].Filtered != want {
+			t.Errorf("%s: Filtered = %v, want %v", sql, stmts[0].Filtered, want)
+		}
+	}
+}
+
+func TestTablesAndFuncsCarrySchemas(t *testing.T) {
+	e := NewExtractor([]string{"tenant_id"}, nil)
+	stmts, _ := e.Parse(`WITH c AS (SELECT 1) SELECT s.t.x, lower(a), app.f(b) FROM s.t JOIN u ON true JOIN c ON true`)
+	st := stmts[0]
+	if want := []TableRef{{"s", "t"}, {"", "u"}}; !reflect.DeepEqual(st.Tables, want) {
+		t.Errorf("tables = %v, want %v (CTE excluded)", st.Tables, want)
+	}
+	if want := []TableRef{{"app", "f"}, {"", "lower"}}; !reflect.DeepEqual(st.Funcs, want) {
+		t.Errorf("funcs = %v, want %v", st.Funcs, want)
+	}
+	if st.Table.Name != "" {
+		t.Error("a join is not a single-table statement")
+	}
+}
+
+func TestSetStatements(t *testing.T) {
+	e := NewExtractor([]string{"tenant_id"}, nil)
+	for sql, want := range map[string]*SetVar{
+		`SET search_path = a, "B"`:             {Name: "search_path", Values: []string{"a", "B"}},
+		`SET LOCAL x.y = 'v'`:                  {Name: "x.y", Values: []string{"v"}, Local: true},
+		`SET SESSION x.y TO 7`:                 {Name: "x.y", Values: []string{"7"}},
+		`RESET x.y`:                            {Name: "x.y", Reset: true},
+		`SET x.y TO DEFAULT`:                   {Name: "x.y", Reset: true},
+		`RESET ALL`:                            {ResetAll: true, Name: ""},
+		`DISCARD ALL`:                          {ResetAll: true},
+		`SELECT set_config('x.y', 'v', true)`:  {Name: "x.y", Values: []string{"v"}, Local: true},
+		`SELECT set_config('x.y', 'v', false)`: {Name: "x.y", Values: []string{"v"}},
+	} {
+		stmts, err := e.Parse(sql)
+		if err != nil || len(stmts) != 1 {
+			t.Fatalf("%s: %v", sql, err)
+		}
+		if !reflect.DeepEqual(stmts[0].Set, want) {
+			t.Errorf("%s: %+v, want %+v", sql, stmts[0].Set, want)
+		}
+	}
+}

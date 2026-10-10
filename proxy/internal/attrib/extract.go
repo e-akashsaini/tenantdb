@@ -14,19 +14,25 @@ import (
 type Stmt struct {
 	SQL     string
 	DML     bool     // SELECT/INSERT/UPDATE/DELETE/MERGE: statements that should be attributed
+	Insert  bool     // an INSERT
 	Txn     txnKind  // transaction control, if any
 	Tenants []string // literal tenant values named by the statement (sorted, unique)
 	Params  []int    // 1-based $n parameters compared to the tenant column
+	Set     *SetVar  // a session variable change (SET, RESET, DISCARD ALL, set_config)
 
 	// Row-cache inputs, filled only for statements that touch a single table.
-	Table   string   // lower-cased table name, empty when not a single-table statement
+	Table   TableRef // zero value when not a single-table statement
 	Keys    []Pred   // equality predicates on key columns in the WHERE clause
 	Inserts []InsRow // INSERT ... VALUES rows
 	Delete  bool     // a DELETE statement
 	SetsKey bool     // an UPDATE that assigns a key or tenant column
 
-	Tables     []string    // every table the statement names (CTE names excluded)
-	Opaque     bool        // reads through a set-returning function the proxy cannot see into
+	// Filtered is true when a WHERE or JOIN condition mentions a tenant or key
+	// column. A statement on tenant data where it is false reads every tenant.
+	Filtered bool
+
+	Tables     []TableRef  // every table the statement names (CTE names excluded)
+	Funcs      []TableRef  // every function it calls
 	RawInserts [][]Operand // INSERT ... VALUES without a column list: positions need the schema
 }
 
@@ -69,9 +75,17 @@ func (e *Extractor) Parse(sql string) ([]Stmt, error) {
 	for _, raw := range tree.Stmts {
 		st := Stmt{SQL: stmtText(sql, raw)}
 		switch n := raw.Stmt.GetNode().(type) {
-		case *pg_query.Node_SelectStmt, *pg_query.Node_InsertStmt, *pg_query.Node_UpdateStmt,
+		case *pg_query.Node_InsertStmt:
+			st.DML, st.Insert = true, true
+		case *pg_query.Node_SelectStmt, *pg_query.Node_UpdateStmt,
 			*pg_query.Node_DeleteStmt, *pg_query.Node_MergeStmt:
 			st.DML = true
+		case *pg_query.Node_VariableSetStmt:
+			st.Set = setVar(n.VariableSetStmt)
+		case *pg_query.Node_DiscardStmt:
+			if n.DiscardStmt.Target == pg_query.DiscardMode_DISCARD_ALL {
+				st.Set = &SetVar{ResetAll: true}
+			}
 		case *pg_query.Node_TransactionStmt:
 			switch n.TransactionStmt.Kind {
 			case pg_query.TransactionStmtKind_TRANS_STMT_BEGIN, pg_query.TransactionStmtKind_TRANS_STMT_START:
@@ -86,7 +100,11 @@ func (e *Extractor) Parse(sql string) ([]Stmt, error) {
 			e.collect(raw.Stmt, vals, params)
 			st.Tenants, st.Params = sortedKeys(vals), sortedInts(params)
 			e.shape(raw.Stmt, &st)
-			st.Tables, st.Opaque = tablesOf(raw.Stmt)
+			st.Tables, st.Funcs = tablesOf(raw.Stmt)
+			st.Filtered = e.filtered(raw.Stmt)
+			if sv := selectSetConfig(raw.Stmt); sv != nil {
+				st.Set = sv
+			}
 		}
 		out = append(out, st)
 	}

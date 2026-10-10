@@ -1,11 +1,13 @@
 package attrib
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/akashsaini/tenantdb/internal/proxy"
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -18,8 +20,13 @@ const (
 	// SourceExplicit: the statement itself names the tenant.
 	SourceExplicit Source = "explicit"
 	// SourceCache: the statement names a row (e.g. id = 42) whose tenant was
-	// learned earlier from an INSERT or from result rows.
+	// learned earlier from an INSERT, from result rows, or from pre-warming.
 	SourceCache Source = "cache"
+	// SourceLookup: like cache, but the row was not cached so the database was
+	// asked.
+	SourceLookup Source = "lookup"
+	// SourceSession: the connection declared its tenant (startup option or SET).
+	SourceSession Source = "session"
 	// SourceTransaction: the statement names no tenant, but an earlier
 	// statement in the same transaction did.
 	SourceTransaction Source = "transaction"
@@ -27,6 +34,11 @@ const (
 	// column (shared reference data, SELECT 1, ...), so there is no tenant to
 	// attribute. Needs the schema catalog.
 	SourceUntenanted Source = "untenanted"
+	// SourceScan: the statement reads tenant data with no tenant or key filter
+	// at all, so it spans every tenant. Definite, unlike unknown.
+	SourceScan Source = "scan"
+	// SourceNoMatch: the statement names a row that does not exist.
+	SourceNoMatch Source = "nomatch"
 	// SourceUnknown: the statement touches tenant data but no tenant could be
 	// determined. This is the one to alert on.
 	SourceUnknown Source = "unknown"
@@ -39,8 +51,11 @@ type Event struct {
 	SQL       string
 	Tenants   []string // more than one means the statement spans tenants
 	Source    Source
+	// Scan is set when the statement reads tenant data without any tenant or
+	// key filter, whether or not a tenant could still be attributed to it.
+	Scan bool
 	// Conflict is set when the statement belongs to a different tenant than
-	// the one already established earlier in the same transaction.
+	// the one the connection declared or the transaction already established.
 	Conflict bool
 }
 
@@ -50,9 +65,21 @@ type Options struct {
 	KeyColumns    []string // columns that identify a row across tenants, e.g. id; empty disables the row cache
 	CacheSize     int      // max cached rows (default 100000)
 	// Catalog is optional. With it the proxy can tell shared tables from
-	// tenant tables and can read column-less INSERTs.
+	// tenant tables, resolve schemas, and read column-less INSERTs.
 	Catalog *Catalog
+	// Lookup is optional. With it a row missing from the cache is resolved by
+	// asking the database.
+	Lookup *Lookup
+	// TagVar is the session variable a connection sets to declare its tenant,
+	// e.g. `SET tenantdb.tenant = 'acme'` or the startup option
+	// `-c tenantdb.tenant=acme`. Default "tenantdb.tenant".
+	TagVar string
 }
+
+const (
+	maxLookupKeys = 20
+	lookupTimeout = 3 * time.Second
+)
 
 // Attributor is a proxy.Observer that attributes DML statements to tenants.
 type Attributor struct {
@@ -61,16 +88,26 @@ type Attributor struct {
 	onEvent func(Event)
 	tenants map[string]bool
 	cat     *Catalog
+	lk      rowLookup
+	tagVar  string
 }
 
 func New(opt Options, onEvent func(Event)) *Attributor {
-	return &Attributor{
+	a := &Attributor{
 		ex:      NewExtractor(opt.TenantColumns, opt.KeyColumns),
 		cache:   NewRowCache(opt.CacheSize),
 		onEvent: onEvent,
 		tenants: lowerSet(opt.TenantColumns),
 		cat:     opt.Catalog,
+		tagVar:  strings.ToLower(opt.TagVar),
 	}
+	if a.tagVar == "" {
+		a.tagVar = "tenantdb.tenant"
+	}
+	if opt.Lookup != nil {
+		a.lk = opt.Lookup
+	}
+	return a
 }
 
 // Cache exposes the row cache (for inspection and tests).
@@ -104,6 +141,7 @@ func (p *portal) resolve(o Operand) (string, bool) {
 // Replies come back in order, so a FIFO lines results up with statements.
 type pending struct {
 	stmt   Stmt
+	table  string     // cache name of the table, empty for multi-table statements
 	learn  []learned  // committed to the cache when the statement succeeds
 	forget []cacheKey // dropped from the cache when the statement succeeds
 	shape  rowShape   // how to read tenant and key columns out of result rows
@@ -120,13 +158,47 @@ type rowShape struct {
 	keys   map[string]int
 }
 
+type keyReq struct{ col, val string }
+
 type state struct {
-	mu        sync.Mutex
-	prepared  map[string]*prepared
-	portals   map[string]*portal
-	queue     []*pending
+	mu   sync.Mutex
+	user string
+
+	prepared map[string]*prepared
+	portals  map[string]*portal
+	queue    []*pending
+
 	inTxn     bool
 	txnTenant []string // tenants seen so far in the open transaction
+	txnGen    uint64   // bumped whenever a transaction ends
+
+	path, localPath []string // search_path: session value and SET LOCAL value
+	tag, localTag   string   // declared tenant: session value and SET LOCAL value
+}
+
+func (st *state) searchPath() []string {
+	switch {
+	case st.localPath != nil:
+		return st.localPath
+	case st.path != nil:
+		return st.path
+	}
+	return defaultSearchPath
+}
+
+func (st *state) curTag() string {
+	if st.localTag != "" {
+		return st.localTag
+	}
+	return st.tag
+}
+
+// resetTxn is called when a transaction ends: SET LOCAL values go away and any
+// lookup still in flight must not touch the next transaction.
+func (st *state) resetTxn() {
+	st.inTxn, st.txnTenant = false, nil
+	st.localPath, st.localTag = nil, ""
+	st.txnGen++
 }
 
 // initMu serialises lazy creation of per-session state: the frontend and
@@ -139,7 +211,18 @@ func (a *Attributor) st(s *proxy.Session) *state {
 	if v, ok := s.State.(*state); ok {
 		return v
 	}
-	v := &state{prepared: map[string]*prepared{}, portals: map[string]*portal{}}
+	v := &state{user: s.User, prepared: map[string]*prepared{}, portals: map[string]*portal{}}
+	opts := parseStartupOptions(s.Params["options"])
+	if sp, ok := opts["search_path"]; ok {
+		v.path = splitPath(sp)
+	} else if sp, ok := s.Params["search_path"]; ok {
+		v.path = splitPath(sp)
+	}
+	if t, ok := opts[a.tagVar]; ok {
+		v.tag = t
+	} else if t, ok := s.Params[a.tagVar]; ok {
+		v.tag = t
+	}
 	s.State = v
 	return v
 }
@@ -214,7 +297,7 @@ func (a *Attributor) OnBackend(s *proxy.Session, msg pgproto3.BackendMessage) {
 	switch m := msg.(type) {
 	case *pgproto3.RowDescription:
 		if len(st.queue) > 0 {
-			st.queue[0].shape = a.shapeOf(st.queue[0].stmt, m)
+			st.queue[0].shape = a.shapeOf(st.queue[0], m)
 		}
 	case *pgproto3.DataRow:
 		if len(st.queue) > 0 && st.queue[0].shape.ok {
@@ -231,8 +314,8 @@ func (a *Attributor) OnBackend(s *proxy.Session, msg pgproto3.BackendMessage) {
 			for _, k := range p.forget {
 				a.cache.Delete(k.table, k.col, k.val)
 			}
-			if p.stmt.SetsKey {
-				a.cache.DropTable(p.stmt.Table)
+			if p.stmt.SetsKey && p.table != "" {
+				a.cache.DropTable(p.table)
 			}
 		}
 	case *pgproto3.PortalSuspended, *pgproto3.EmptyQueryResponse:
@@ -242,7 +325,7 @@ func (a *Attributor) OnBackend(s *proxy.Session, msg pgproto3.BackendMessage) {
 	case *pgproto3.ReadyForQuery:
 		st.queue = nil
 		if m.TxStatus == 'I' {
-			st.inTxn, st.txnTenant = false, nil
+			st.resetTxn()
 		} else {
 			st.inTxn = true
 		}
@@ -261,8 +344,8 @@ func (st *state) pop() *pending {
 // shapeOf finds which result columns hold the tenant and the row keys. It only
 // trusts columns that come straight from one table (non-zero TableOID, same
 // OID for all of them) and are sent as text.
-func (a *Attributor) shapeOf(x Stmt, rd *pgproto3.RowDescription) rowShape {
-	if x.Table == "" || x.Delete || len(a.ex.keys) == 0 {
+func (a *Attributor) shapeOf(p *pending, rd *pgproto3.RowDescription) rowShape {
+	if p.table == "" || p.stmt.Delete || len(a.ex.keys) == 0 {
 		return rowShape{}
 	}
 	sh := rowShape{tenant: -1, keys: map[string]int{}}
@@ -296,9 +379,77 @@ func (a *Attributor) learnRow(p *pending, row *pgproto3.DataRow) {
 	tenant := string(row.Values[p.shape.tenant])
 	for col, i := range p.shape.keys {
 		if i < len(row.Values) && row.Values[i] != nil {
-			a.cache.Put(p.stmt.Table, col, string(row.Values[i]), tenant)
+			a.cache.Put(p.table, col, string(row.Values[i]), tenant)
 		}
 	}
+}
+
+// resolve finds the table a reference names, using the session search_path.
+func (a *Attributor) resolve(st *state, ref TableRef) (*TableInfo, bool) {
+	if a.cat == nil || !a.cat.Loaded() {
+		return nil, false
+	}
+	return a.cat.Table(ref, st.searchPath(), st.user)
+}
+
+// tableKey is the cache's name for a table: schema-qualified when the catalog
+// resolved it, otherwise as written.
+func tableKey(ref TableRef, ti *TableInfo) string {
+	if ti != nil {
+		return ti.Key()
+	}
+	return ref.String()
+}
+
+func (a *Attributor) hasTenantCol(ti *TableInfo) bool {
+	for _, c := range ti.Cols {
+		if a.tenants[c] {
+			return true
+		}
+	}
+	return false
+}
+
+type scope int
+
+const (
+	scopeUnknown    scope = iota // something the proxy cannot vouch for
+	scopeUntenanted              // provably touches no tenant data
+	scopeTenant                  // touches at least one tenant table
+)
+
+// classify decides what kind of data a statement touches. It fails closed:
+// tables the catalog does not know, views without a tenant column (which may
+// wrap tenant tables), and calls to application-defined functions (whose
+// bodies the proxy cannot read) all make the answer "unknown", not "untenanted".
+func (a *Attributor) classify(st *state, x Stmt) scope {
+	if a.cat == nil || !a.cat.Loaded() {
+		return scopeUnknown
+	}
+	tenant, unsure := false, false
+	for _, t := range x.Tables {
+		ti, ok := a.cat.Table(t, st.searchPath(), st.user)
+		switch {
+		case !ok:
+			unsure = true
+		case a.hasTenantCol(ti):
+			tenant = true
+		case (ti.Kind == 'v' || ti.Kind == 'm') && !isSystemSchema(ti.Schema):
+			unsure = true
+		}
+	}
+	for _, f := range x.Funcs {
+		if a.cat.UserFunc(f, st.searchPath(), st.user) {
+			unsure = true
+		}
+	}
+	switch {
+	case tenant:
+		return scopeTenant
+	case unsure:
+		return scopeUnknown
+	}
+	return scopeUntenanted
 }
 
 // handle queues x for reply matching and attributes it. pt is nil for the
@@ -307,20 +458,29 @@ func (a *Attributor) handle(s *proxy.Session, st *state, x Stmt, pt *portal) {
 	p := &pending{stmt: x}
 	st.queue = append(st.queue, p)
 
+	if x.Set != nil {
+		a.applySet(st, x.Set)
+	}
 	switch x.Txn {
 	case txnBegin:
 		st.inTxn = true
 		return
 	case txnEnd:
-		st.inTxn, st.txnTenant = false, nil
+		st.resetTxn()
 		return
 	}
 	if !x.DML {
 		return
 	}
 
+	var ti *TableInfo
+	if x.Table.Name != "" {
+		ti, _ = a.resolve(st, x.Table)
+		p.table = tableKey(x.Table, ti)
+	}
+
 	// INSERT without a column list: the schema says which position is the tenant.
-	x.Inserts = append(x.Inserts, a.rawInserts(x)...)
+	x.Inserts = append(x.Inserts, a.rawInserts(x, ti)...)
 
 	// Tenant values named by the statement, including bound parameters.
 	tenants := append([]string(nil), x.Tenants...)
@@ -344,7 +504,7 @@ func (a *Attributor) handle(s *proxy.Session, st *state, x Stmt, pt *portal) {
 		}
 		for _, k := range r.Keys {
 			if kv, ok := pt.resolve(k.Op); ok {
-				p.learn = append(p.learn, learned{cacheKey{x.Table, k.Col, normVal(kv)}, tv})
+				p.learn = append(p.learn, learned{cacheKey{p.table, k.Col, normVal(kv)}, tv})
 			}
 		}
 	}
@@ -352,60 +512,255 @@ func (a *Attributor) handle(s *proxy.Session, st *state, x Stmt, pt *portal) {
 		for _, pr := range x.Keys {
 			for _, o := range pr.Ops {
 				if v, ok := pt.resolve(o); ok {
-					p.forget = append(p.forget, cacheKey{x.Table, pr.Col, normVal(v)})
+					p.forget = append(p.forget, cacheKey{p.table, pr.Col, normVal(v)})
 				}
 			}
 		}
 	}
 
+	sc := a.classify(st, x)
 	ev := Event{SessionID: s.ID, User: s.User, DB: s.DB, SQL: x.SQL}
+	ev.Scan = sc == scopeTenant && !x.Filtered && !x.Insert
+
 	switch {
 	case len(tenants) > 0:
 		ev.Tenants, ev.Source = tenants, SourceExplicit
-	case a.untenanted(x):
+	case sc == scopeUntenanted:
 		ev.Source = SourceUntenanted
 	default:
-		if t, ok := a.lookup(x, pt); ok {
-			ev.Tenants, ev.Source = t, SourceCache
-		} else if st.inTxn && len(st.txnTenant) > 0 {
-			ev.Tenants, ev.Source = append([]string(nil), st.txnTenant...), SourceTransaction
-		} else {
-			ev.Source = SourceUnknown
+		have, need, ok := a.keyTenants(p.table, x, pt)
+		switch {
+		case ok && len(need) == 0:
+			ev.Tenants, ev.Source = have, SourceCache
+		case ok && a.lk != nil && sc == scopeTenant && ti != nil && len(need) <= maxLookupKeys:
+			// Ask the database, off the query path; the event is emitted when
+			// the answer arrives.
+			if tcol, _ := a.scopeOf(ti); tcol != "" && hasCols(ti, need) {
+				go a.resolveAsync(st, ev, ti, tcol, have, need, st.txnGen)
+				return
+			}
 		}
 	}
+	a.settle(st, &ev, true)
+}
 
-	if ev.Source == SourceExplicit || ev.Source == SourceCache {
-		if st.inTxn {
+func hasCols(ti *TableInfo, need []keyReq) bool {
+	for _, k := range need {
+		found := false
+		for _, c := range ti.Cols {
+			if c == k.col {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+// resolveAsync finishes an event whose rows were not all cached by asking the
+// database for the missing ones.
+func (a *Attributor) resolveAsync(st *state, ev Event, ti *TableInfo, tcol string, have []string, need []keyReq, gen uint64) {
+	ctx, cancel := context.WithTimeout(context.Background(), lookupTimeout)
+	defer cancel()
+	found := append([]string(nil), have...)
+	failed := false
+	for _, k := range need {
+		ts, err := a.lk.tenants(ctx, ti, tcol, k.col, k.val)
+		if err != nil {
+			failed = true
+			continue
+		}
+		if len(ts) == 1 {
+			a.cache.Put(ti.Key(), k.col, k.val, ts[0])
+		}
+		found = append(found, ts...)
+	}
+	found = dedupe(found)
+
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	switch {
+	case len(found) > 0:
+		ev.Tenants, ev.Source = found, SourceLookup
+	case !failed:
+		ev.Source = SourceNoMatch
+	}
+	// If the transaction ended while we waited, its tenant no longer applies.
+	a.settle(st, &ev, gen == st.txnGen)
+}
+
+// settle fills in whatever the statement itself did not determine, in order of
+// how directly it was declared: the connection's tag, then the transaction,
+// then the fact that nothing restricts the statement (scan), then unknown. It
+// also flags disagreement between sources. Must be called with st.mu held.
+func (a *Attributor) settle(st *state, ev *Event, txnOK bool) {
+	tag := st.curTag()
+	switch ev.Source {
+	case SourceUntenanted, SourceNoMatch:
+	case SourceExplicit, SourceCache, SourceLookup:
+		if tag != "" && !sameSet([]string{tag}, ev.Tenants) {
+			ev.Conflict = true
+		}
+		if txnOK && st.inTxn {
 			if len(st.txnTenant) > 0 && !sameSet(st.txnTenant, ev.Tenants) {
 				ev.Conflict = true
 			}
 			st.txnTenant = dedupe(append(st.txnTenant, ev.Tenants...))
 		}
-	}
-	a.onEvent(ev)
-}
-
-// lookup resolves a statement's key predicates through the row cache. It
-// succeeds only if every key value is cached.
-func (a *Attributor) lookup(x Stmt, pt *portal) ([]string, bool) {
-	var out []string
-	for _, pr := range x.Keys {
-		for _, o := range pr.Ops {
-			v, ok := pt.resolve(o)
-			if !ok {
-				return nil, false
-			}
-			t, hit := a.cache.Get(x.Table, pr.Col, v)
-			if !hit {
-				return nil, false
-			}
-			out = append(out, t)
+	default:
+		switch {
+		case tag != "":
+			ev.Tenants, ev.Source = []string{tag}, SourceSession
+		case txnOK && st.inTxn && len(st.txnTenant) > 0:
+			ev.Tenants, ev.Source = append([]string(nil), st.txnTenant...), SourceTransaction
+		case ev.Scan:
+			ev.Source = SourceScan
+		default:
+			ev.Source = SourceUnknown
 		}
 	}
-	if len(out) == 0 {
-		return nil, false
+	a.onEvent(*ev)
+}
+
+// keyTenants resolves a statement's key predicates through the row cache. ok
+// is false if the statement has no usable key predicate. need lists the keys
+// that were not cached.
+func (a *Attributor) keyTenants(table string, x Stmt, pt *portal) (have []string, need []keyReq, ok bool) {
+	if table == "" || len(x.Keys) == 0 {
+		return nil, nil, false
 	}
-	return dedupe(out), true
+	n := 0
+	for _, pr := range x.Keys {
+		for _, o := range pr.Ops {
+			v, resolved := pt.resolve(o)
+			if !resolved {
+				return nil, nil, false
+			}
+			n++
+			if t, hit := a.cache.Get(table, pr.Col, v); hit {
+				have = append(have, t)
+			} else {
+				need = append(need, keyReq{pr.Col, v})
+			}
+		}
+	}
+	return dedupe(have), need, n > 0
+}
+
+// applySet records changes to the variables the attributor cares about.
+func (a *Attributor) applySet(st *state, sv *SetVar) {
+	if sv.ResetAll {
+		st.path, st.localPath, st.tag, st.localTag = nil, nil, "", ""
+		return
+	}
+	switch sv.Name {
+	case "search_path":
+		var p []string
+		if !sv.Reset {
+			for _, v := range sv.Values {
+				p = append(p, splitPath(v)...)
+			}
+		}
+		if sv.Local {
+			st.localPath = p
+		} else {
+			st.path = p
+		}
+	case a.tagVar:
+		tag := ""
+		if !sv.Reset && len(sv.Values) > 0 {
+			tag = sv.Values[0]
+		}
+		if sv.Local {
+			st.localTag = tag
+		} else {
+			st.tag = tag
+		}
+	}
+}
+
+// splitPath turns "a, \"B\", $user" into schema names.
+func splitPath(v string) []string {
+	var out []string
+	for _, p := range strings.Split(v, ",") {
+		p = strings.TrimSpace(p)
+		if len(p) >= 2 && p[0] == '"' && p[len(p)-1] == '"' {
+			p = p[1 : len(p)-1]
+		} else {
+			p = strings.ToLower(p)
+		}
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// parseStartupOptions reads the `options` startup parameter, e.g.
+// "-c search_path=tenant1 -c tenantdb.tenant=acme".
+func parseStartupOptions(opts string) map[string]string {
+	out := map[string]string{}
+	toks := strings.Fields(opts)
+	add := func(kv string) {
+		if k, v, ok := strings.Cut(kv, "="); ok {
+			out[strings.ToLower(k)] = v
+		}
+	}
+	for i := 0; i < len(toks); i++ {
+		switch t := toks[i]; {
+		case t == "-c" && i+1 < len(toks):
+			i++
+			add(toks[i])
+		case strings.HasPrefix(t, "-c"):
+			add(t[2:])
+		case strings.HasPrefix(t, "--"):
+			add(t[2:])
+		}
+	}
+	return out
+}
+
+// rawInserts turns the rows of a column-less INSERT into InsRows using the
+// table's column order from the catalog. It returns nothing if the table is
+// unknown or has no tenant column.
+func (a *Attributor) rawInserts(x Stmt, ti *TableInfo) []InsRow {
+	if len(x.RawInserts) == 0 || ti == nil {
+		return nil
+	}
+	tIdx := -1
+	keyIdx := map[string]int{}
+	for i, c := range ti.Cols {
+		switch {
+		case tIdx < 0 && a.tenants[c]:
+			tIdx = i
+		case a.ex.keys[c]:
+			keyIdx[c] = i
+		}
+	}
+	if tIdx < 0 {
+		return nil
+	}
+	var out []InsRow
+	for _, row := range x.RawInserts {
+		if tIdx >= len(row) {
+			continue
+		}
+		r := InsRow{Tenant: row[tIdx]}
+		for c, i := range keyIdx {
+			if i < len(row) {
+				r.Keys = append(r.Keys, KeyOp{Col: c, Op: row[i]})
+			}
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+func isDDL(tag string) bool {
+	return strings.HasPrefix(tag, "CREATE ") || strings.HasPrefix(tag, "ALTER ") || strings.HasPrefix(tag, "DROP ")
 }
 
 func sameSet(a, b []string) bool {
@@ -469,69 +824,4 @@ func dedupe(in []string) []string {
 		}
 	}
 	return out
-}
-
-// rawInserts turns the rows of a column-less INSERT into InsRows using the
-// table's column order from the catalog. It returns nothing if the table is
-// unknown, ambiguous, or has no tenant column.
-func (a *Attributor) rawInserts(x Stmt) []InsRow {
-	if len(x.RawInserts) == 0 || a.cat == nil {
-		return nil
-	}
-	ti, ok := a.cat.Table(x.Table)
-	if !ok || ti.Ambiguous {
-		return nil
-	}
-	tIdx := -1
-	keyIdx := map[string]int{}
-	for i, c := range ti.Cols {
-		switch {
-		case tIdx < 0 && a.tenants[c]:
-			tIdx = i
-		case a.ex.keys[c]:
-			keyIdx[c] = i
-		}
-	}
-	if tIdx < 0 {
-		return nil
-	}
-	var out []InsRow
-	for _, row := range x.RawInserts {
-		if tIdx >= len(row) {
-			continue
-		}
-		r := InsRow{Tenant: row[tIdx]}
-		for c, i := range keyIdx {
-			if i < len(row) {
-				r.Keys = append(r.Keys, KeyOp{Col: c, Op: row[i]})
-			}
-		}
-		out = append(out, r)
-	}
-	return out
-}
-
-// untenanted reports whether every table x touches is known to have no tenant
-// column. Anything the catalog cannot vouch for (unknown or ambiguous tables,
-// functions in FROM, no catalog at all) is not untenanted.
-func (a *Attributor) untenanted(x Stmt) bool {
-	if a.cat == nil || !a.cat.Loaded() || x.Opaque {
-		return false
-	}
-	for _, t := range x.Tables {
-		ti, ok := a.cat.Table(t)
-		if !ok || ti.Ambiguous {
-			return false
-		}
-		for _, c := range ti.Cols {
-			if a.tenants[c] {
-				return false
-			}
-		}
-	}
-	return true
-}
-
-func isDDL(tag string) bool {
-	return strings.HasPrefix(tag, "CREATE ") || strings.HasPrefix(tag, "ALTER ") || strings.HasPrefix(tag, "DROP ")
 }
