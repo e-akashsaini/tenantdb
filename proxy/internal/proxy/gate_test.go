@@ -76,13 +76,30 @@ func serveFakeExt(c net.Conn, seen *seenLog) {
 	}
 	row := &pgproto3.RowDescription{Fields: []pgproto3.FieldDescription{{Name: []byte("v"), DataTypeOID: 25, DataTypeSize: -1, TypeModifier: -1}}}
 	stmts, portals := map[string]string{}, map[string]string{}
+	copyRows := 0
 	for {
 		msg, err := b.Receive()
 		if err != nil {
 			return
 		}
 		switch m := msg.(type) {
+		case *pgproto3.CopyData:
+			copyRows++
+		case *pgproto3.CopyDone:
+			b.Send(&pgproto3.CommandComplete{CommandTag: []byte(fmt.Sprintf("COPY %d", copyRows))})
+			b.Send(&pgproto3.ReadyForQuery{TxStatus: tx})
+			if b.Flush() != nil {
+				return
+			}
 		case *pgproto3.Query:
+			if strings.HasPrefix(strings.ToUpper(m.String), "COPY ") {
+				copyRows = 0
+				b.Send(&pgproto3.CopyInResponse{})
+				if b.Flush() != nil {
+					return
+				}
+				continue
+			}
 			seen.add("query:" + m.String)
 			switch strings.ToUpper(strings.TrimSpace(m.String)) {
 			case "BEGIN":
@@ -154,20 +171,22 @@ func newBlockGate() *blockGate {
 	return &blockGate{stmts: map[string]string{}, portals: map[string]string{}}
 }
 
-func (g *blockGate) Gate(_ *Session, msg pgproto3.FrontendMessage) *Rejection {
+func (g *blockGate) Gate(s *Session, msg pgproto3.FrontendMessage) *Rejection {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	// Names are per connection: two sessions both have an unnamed statement.
+	key := func(name string) string { return fmt.Sprintf("%d/%s", s.ID, name) }
 	g.sawFrames = append(g.sawFrames, fmt.Sprintf("%T", msg))
 	var sql string
 	switch m := msg.(type) {
 	case *pgproto3.Query:
 		sql = m.String
 	case *pgproto3.Parse:
-		g.stmts[m.Name] = m.Query
+		g.stmts[key(m.Name)] = m.Query
 	case *pgproto3.Bind:
-		g.portals[m.DestinationPortal] = m.PreparedStatement
+		g.portals[key(m.DestinationPortal)] = key(m.PreparedStatement)
 	case *pgproto3.Execute:
-		sql = g.stmts[g.portals[m.Portal]]
+		sql = g.stmts[g.portals[key(m.Portal)]]
 	}
 	if strings.Contains(sql, "BLOCKME") {
 		g.rejected++

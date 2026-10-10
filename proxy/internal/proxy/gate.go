@@ -77,8 +77,9 @@ func isBatchMessage(msg pgproto3.FrontendMessage) bool {
 func (s *Server) pumpClientGated(log *slog.Logger, sess *Session, gate Gate, backend *pgproto3.Backend, frontend *pgproto3.Frontend) {
 	var (
 		held       []pgproto3.FrontendMessage // extended-protocol messages waiting for Sync
-		partial    bool                       // part of the current unsynced batch has already gone upstream
-		discarding bool                       // a batch was rejected; drop everything until Sync
+		heldBytes  int
+		partial    bool // part of the current unsynced batch has already gone upstream
+		discarding bool // a batch was rejected; drop everything until Sync
 	)
 	send := func(msgs ...pgproto3.FrontendMessage) bool {
 		for _, m := range msgs {
@@ -124,7 +125,7 @@ func (s *Server) pumpClientGated(log *slog.Logger, sess *Session, gate Gate, bac
 				_ = writeClient(sess, backend, errorResponse("FATAL", rej))
 				return
 			}
-			held = nil
+			held, heldBytes = nil, 0
 			if _, isQuery := msg.(*pgproto3.Query); isQuery {
 				if writeClient(sess, backend, errorResponse("ERROR", rej), &pgproto3.ReadyForQuery{TxStatus: 'I'}) != nil {
 					return
@@ -149,11 +150,11 @@ func (s *Server) pumpClientGated(log *slog.Logger, sess *Session, gate Gate, bac
 			if !send(append(held, msg)...) {
 				return
 			}
-			held = nil
+			held, heldBytes = nil, 0
 		case *pgproto3.Sync:
 			sess.gs.ready.Store(false)
 			batch := append(held, msg)
-			held, partial = nil, false
+			held, heldBytes, partial = nil, 0, false
 			if !send(batch...) {
 				return
 			}
@@ -162,6 +163,12 @@ func (s *Server) pumpClientGated(log *slog.Logger, sess *Session, gate Gate, bac
 			return
 		default:
 			if isBatchMessage(msg) {
+				heldBytes += frontendSize(msg)
+				if heldBytes > s.cfg.MaxHeldBytes {
+					_ = writeClient(sess, backend, errorResponse("FATAL", &Rejection{Code: "54000",
+						Message: "tenantdb: too much was sent without a Sync to check it"}))
+					return
+				}
 				held = append(held, cloneFrontend(msg))
 				continue
 			}
@@ -201,4 +208,19 @@ func cloneFrontend(msg pgproto3.FrontendMessage) pgproto3.FrontendMessage {
 		return &pgproto3.Execute{Portal: m.Portal, MaxRows: m.MaxRows}
 	}
 	return msg
+}
+
+// frontendSize approximates how much memory holding a message costs.
+func frontendSize(msg pgproto3.FrontendMessage) int {
+	switch m := msg.(type) {
+	case *pgproto3.Parse:
+		return 64 + len(m.Name) + len(m.Query) + 4*len(m.ParameterOIDs)
+	case *pgproto3.Bind:
+		n := 64 + len(m.DestinationPortal) + len(m.PreparedStatement) + 2*(len(m.ParameterFormatCodes)+len(m.ResultFormatCodes))
+		for _, p := range m.Parameters {
+			n += 8 + len(p)
+		}
+		return n
+	}
+	return 64
 }

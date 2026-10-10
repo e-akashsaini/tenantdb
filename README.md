@@ -87,6 +87,9 @@ Prefer the environment variable over `-schema-dsn`: command-line flags show up i
 
 **Row-level security.** A role subject to RLS can't see all rows, so lookups and pre-warming through it would silently miss some. The proxy detects this at start-up, warns, and skips those tables (their statements fall back to `unknown`). Give the schema role `BYPASSRLS` (it stays read-only) to fix it.
 
+### Next to a connection pooler
+Put tenantdb **in front of** a pooler such as PgBouncer (app -> tenantdb -> PgBouncer -> Postgres). Each client connection is then seen on its own, so connection tags, transactions and `search_path` follow the client the way they should. [`bench/compat`](bench/compat) runs the same workload through psycopg2, psycopg3, asyncpg, SQLAlchemy and node-postgres in every arrangement, PgBouncer in either order included.
+
 ### Encrypting client connections
 ```bash
 ./tenantdb -tls-cert server.crt -tls-key server.key            # clients may use TLS

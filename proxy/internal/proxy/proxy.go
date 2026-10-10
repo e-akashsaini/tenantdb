@@ -38,6 +38,19 @@ type Config struct {
 	TLS *tls.Config
 	// RequireTLS refuses clients that do not encrypt. Needs TLS.
 	RequireTLS bool
+	// MaxMessageBytes caps the size of one message from a client (default 128 MiB).
+	// The protocol allows a message to claim a length of a gigabyte before sending
+	// a byte of it; without a cap a handful of connections could make the proxy
+	// allocate memory for messages that never arrive.
+	MaxMessageBytes int
+	// MaxHeldBytes caps what a gated session may leave unsynced (default 64 MiB).
+	// A Gate has to see a whole batch before any of it is forwarded, so the proxy
+	// holds extended-protocol messages until Sync; a client that never syncs would
+	// otherwise grow that without bound.
+	MaxHeldBytes int
+	// StartupTimeout is how long a client has to send its startup packet (default
+	// 30s), so connections that say nothing cannot pile up.
+	StartupTimeout time.Duration
 	// GateFailClosed makes a Gate that panics reject the statement instead of
 	// letting it through. For block mode: a statement nobody could check is not
 	// one anybody should run.
@@ -61,6 +74,15 @@ type Server struct {
 func New(cfg Config) *Server {
 	if cfg.DialTimeout == 0 {
 		cfg.DialTimeout = 10 * time.Second
+	}
+	if cfg.MaxMessageBytes <= 0 {
+		cfg.MaxMessageBytes = 128 << 20
+	}
+	if cfg.MaxHeldBytes <= 0 {
+		cfg.MaxHeldBytes = 64 << 20
+	}
+	if cfg.StartupTimeout <= 0 {
+		cfg.StartupTimeout = 30 * time.Second
 	}
 	if cfg.Observer == nil {
 		cfg.Observer = NopObserver{}
@@ -149,7 +171,9 @@ func (s *Server) track(c net.Conn, add bool) {
 func (s *Server) handle(client net.Conn) {
 	id := s.nextID.Add(1)
 	log := s.log.With("session", id, "client", client.RemoteAddr().String())
-	backend := pgproto3.NewBackend(client, client)
+	backend := s.newBackend(client)
+	// A client must get on with its startup packet.
+	_ = client.SetReadDeadline(time.Now().Add(s.cfg.StartupTimeout))
 
 	var startup *pgproto3.StartupMessage
 	secure := false
@@ -183,7 +207,7 @@ func (s *Server) handle(client net.Conn) {
 			}
 			_ = tc.SetDeadline(time.Time{})
 			client, secure = tc, true
-			backend = pgproto3.NewBackend(tc, tc)
+			backend = s.newBackend(tc)
 		case *pgproto3.GSSEncRequest:
 			if _, err := client.Write([]byte{'N'}); err != nil {
 				return
@@ -197,6 +221,7 @@ func (s *Server) handle(client net.Conn) {
 		}
 	}
 
+	_ = client.SetReadDeadline(time.Time{})
 	if s.cfg.RequireTLS && !secure {
 		sendFatal(backend, "28000", "tenantdb: this server requires an encrypted (TLS) connection")
 		return
@@ -370,4 +395,11 @@ func logRelayErr(log *slog.Logger, what string, err error) {
 		return
 	}
 	log.Debug(what, "err", err)
+}
+
+// newBackend reads client messages, refusing any longer than MaxMessageBytes.
+func (s *Server) newBackend(c net.Conn) *pgproto3.Backend {
+	b := pgproto3.NewBackend(c, c)
+	b.SetMaxBodyLen(s.cfg.MaxMessageBytes)
+	return b
 }
