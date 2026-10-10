@@ -43,6 +43,12 @@ type Leaf struct {
 	Mentions []CRef
 }
 
+// OutCol is one output column of a SELECT: its name and, if it is a plain column, where it comes from.
+type OutCol struct {
+	Name string
+	Ref  *CRef
+}
+
 // InSub is the subquery of `x IN (SELECT out ...)`.
 type InSub struct {
 	Q   *QueryNode
@@ -86,8 +92,12 @@ type QueryNode struct {
 	Occs  []Occ
 	Conds []Scoped
 	// Out is the one column a plain SELECT returns, if that is all it returns.
-	Out  *CRef
-	Subs []*QueryNode // nested queries: subselects anywhere, CTEs, derived tables, set-operation branches
+	Out *CRef
+	// Outs lists what a plain SELECT returns, and Simple says it is a
+	// select-project-join (see views.go).
+	Outs   []OutCol
+	Simple bool
+	Subs   []*QueryNode // nested queries: subselects anywhere, CTEs, derived tables, set-operation branches
 	// Unsupported marks constructs whose reads cannot be bounded (MERGE ...).
 	Unsupported bool
 }
@@ -109,6 +119,7 @@ func (s *bscope) lookup(name string) (string, bool) {
 
 type builder struct {
 	e       *Extractor
+	prefix  string // keeps occurrence ids of an expanded view apart from the statement's
 	n       int
 	subSeen map[*pg_query.SubLink]bool
 	subNode map[*pg_query.SubLink]*QueryNode
@@ -214,6 +225,7 @@ func (b *builder) selectStmt(s *pg_query.SelectStmt, parent *bscope) *QueryNode 
 	}
 	b.cond(q, sc, s.WhereClause, nil)
 	b.sweep(q, sc, &pg_query.Node{Node: &pg_query.Node_SelectStmt{SelectStmt: s}})
+	b.outputs(q, sc, s)
 	if len(s.TargetList) == 1 && len(s.GroupClause) == 0 {
 		if rt := s.TargetList[0].GetResTarget(); rt != nil {
 			if c, ok := b.colRef(sc, rt.Val); ok {
@@ -262,7 +274,7 @@ func (b *builder) addOcc(q *QueryNode, sc *bscope, rv *pg_query.RangeVar) string
 		}
 	}
 	b.n++
-	o := Occ{ID: "o" + itoa(b.n), Ref: ref}
+	o := Occ{ID: b.prefix + "o" + itoa(b.n), Ref: ref}
 	sc.names[ref.Name] = o.ID
 	if rv.Alias != nil && rv.Alias.Aliasname != "" {
 		o.Alias = strings.ToLower(rv.Alias.Aliasname)
@@ -524,4 +536,49 @@ func (b *builder) eqLeaf(sc *bscope, lhs *pg_query.Node, rhs []*pg_query.Node, x
 		return other()
 	}
 	return &Leaf{L: lc, Eq: true, Ops: ops}
+}
+
+// outputs records what a plain SELECT returns, for view expansion.
+func (b *builder) outputs(q *QueryNode, sc *bscope, s *pg_query.SelectStmt) {
+	simple := len(s.GroupClause) == 0 && s.HavingClause == nil && len(s.WindowClause) == 0 &&
+		s.LimitCount == nil && s.LimitOffset == nil && s.WithClause == nil && s.IntoClause == nil && len(s.ValuesLists) == 0
+	for _, d := range s.DistinctClause {
+		if d.GetNode() != nil {
+			simple = false // DISTINCT ON
+		}
+	}
+	for _, t := range s.TargetList {
+		rt := t.GetResTarget()
+		if rt == nil {
+			simple = false
+			continue
+		}
+		oc := OutCol{Name: strings.ToLower(rt.Name)}
+		if rt.Val != nil {
+			walk(rt.Val.ProtoReflect(), func(m proto.Message) bool {
+				switch m.(type) {
+				case *pg_query.FuncCall, *pg_query.SubLink, *pg_query.WindowDef:
+					simple = false // aggregates and windows change what a row is
+				}
+				return true
+			})
+			if c, ok := b.colRef(sc, rt.Val); ok && unwrap(rt.Val).GetColumnRef() != nil {
+				oc.Ref = &c
+				if oc.Name == "" {
+					oc.Name = c.Col
+				}
+			}
+		}
+		q.Outs = append(q.Outs, oc)
+	}
+	q.Simple = simple
+}
+
+// buildSelect builds the model of a view's SELECT, its occurrence ids starting with prefix.
+func (e *Extractor) buildSelect(sel *pg_query.SelectStmt, prefix string) *QueryNode {
+	if sel.Op != pg_query.SetOperation_SETOP_NONE {
+		return nil
+	}
+	b := &builder{e: e, prefix: prefix, subSeen: map[*pg_query.SubLink]bool{}, subNode: map[*pg_query.SubLink]*QueryNode{}}
+	return b.selectStmt(sel, &bscope{names: map[string]string{}})
 }

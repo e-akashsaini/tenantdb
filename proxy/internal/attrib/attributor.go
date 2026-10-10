@@ -681,11 +681,19 @@ func (a *Attributor) analyze(st *state, x Stmt, pt *portal, depth int, owners ow
 			case tempTainted:
 				r.unsure = true
 			}
+		case ti.Kind == 'v' && r.cr.expanded[ti]:
+			// read through its definition: the tables it is made of were analysed
 		case a.hasTenantCol(ti):
 			direct = true
 		case (ti.Kind == 'v' || ti.Kind == 'm') && !isSystemSchema(ti.Schema):
 			r.unsure = true
 		}
+	}
+	if r.cr.unsure {
+		r.unsure = true
+	}
+	if len(r.cr.expanded) > 0 && r.cr.tenantOccs > 0 {
+		direct = true
 	}
 	if direct {
 		r.tenantTouched = true

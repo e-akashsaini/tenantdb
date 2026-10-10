@@ -79,9 +79,11 @@ type confResult struct {
 	tenants    []string
 	// scan: some tenant table is read with nothing at all restricting it.
 	scan      bool
-	needs     []keyReq // rows whose owner was not cached; a lookup could settle them
-	viaKeys   bool     // some confinement came from a row's owner
-	viaLookup bool     // ... and some of those owners came from asking the database
+	unsure    bool                // something the statement reads through a view could not be seen
+	expanded  map[*TableInfo]bool // views whose definition was read
+	needs     []keyReq            // rows whose owner was not cached; a lookup could settle them
+	viaKeys   bool                // some confinement came from a row's owner
+	viaLookup bool                // ... and some of those owners came from asking the database
 }
 
 type occRes struct {
@@ -90,6 +92,8 @@ type occRes struct {
 	ti     *TableInfo
 	tenant bool   // it carries a tenant column
 	tcol   string // which
+
+	viewMap map[string]CRef // a merged view: its columns, and the columns of the underlying tables they are
 }
 
 type joinEq struct{ a, b, ca, cb string }
@@ -116,7 +120,13 @@ type confEval struct {
 	pt     *portal
 	owners ownerSet
 
-	occ        map[string]*occRes
+	occ      map[string]*occRes
+	merged   map[*QueryNode]*flat // what each level gains from the views merged into it
+	inner    map[string][]string  // a merged view's occurrence -> the occurrences standing in for it
+	expanded map[*TableInfo]bool
+	viewOccs int
+	unsure   bool
+
 	links      []inLink
 	bridge     map[string][]bridgeKey // non-tenant occurrences pinned to one row by a unique key
 	conf       map[string]*tset
@@ -134,8 +144,9 @@ func (a *Attributor) confine(st *state, x Stmt, pt *portal, owners ownerSet) con
 		return confResult{}
 	}
 	ev := &confEval{a: a, st: st, pt: pt, owners: owners,
-		occ: map[string]*occRes{}, bridge: map[string][]bridgeKey{}, conf: map[string]*tset{}, restricted: map[string]bool{}, needSeen: map[ownerKey]bool{}}
-	ev.collect(x.Q)
+		occ: map[string]*occRes{}, bridge: map[string][]bridgeKey{}, conf: map[string]*tset{},
+		merged: map[*QueryNode]*flat{}, inner: map[string][]string{}, expanded: map[*TableInfo]bool{}, restricted: map[string]bool{}, needSeen: map[ownerKey]bool{}}
+	ev.collect(x.Q, 0)
 	ev.level(x.Q)
 	// `x IN (SELECT y ...)` hands the subquery's confinement to x's table, which
 	// can in turn confine others through joins: go round until nothing moves.
@@ -159,8 +170,10 @@ func unsupported(q *QueryNode) bool {
 }
 
 // collect resolves every table occurrence of the statement.
-func (ev *confEval) collect(q *QueryNode) {
+func (ev *confEval) collect(q *QueryNode, depth int) {
 	catalog := ev.a.cat != nil && ev.a.cat.Loaded()
+	mg := &flat{}
+	ev.merged[q] = mg
 	for _, o := range q.Occs {
 		r := &occRes{id: o.ID, ref: o.Ref}
 		ti, tmp, ok := ev.a.tableFor(ev.st, o.Ref)
@@ -180,21 +193,42 @@ func (ev *confEval) collect(q *QueryNode) {
 			r.tcol, _ = ev.a.scopeOf(r.ti)
 		}
 		ev.occ[o.ID] = r
+		switch {
+		case depth > 0 && !ok && catalog:
+			ev.unsure = true // a table inside a view that the catalog does not know
+		case ok && tmp == nil && ti != nil && ti.Kind == 'v' && !isSystemSchema(ti.Schema):
+			if !ev.expandView(q, mg, o, r, depth) && depth > 0 {
+				ev.unsure = true
+			}
+		case ok && tmp == nil && ti != nil && ti.Kind == 'm' && depth > 0 && !isSystemSchema(ti.Schema):
+			ev.unsure = true // a materialised view hides what it was made from
+		}
 	}
 	for _, s := range q.Subs {
-		ev.collect(s)
+		ev.collect(s, depth)
 	}
 }
 
 // level confines the occurrences of one query level from its conditions, then
 // does the same for the queries nested in it.
 func (ev *confEval) level(q *QueryNode) {
+	mg := ev.merged[q]
+	if mg == nil {
+		mg = &flat{}
+	}
 	own := map[string]bool{}
 	for _, o := range q.Occs {
 		own[o.ID] = true
 	}
+	for _, o := range mg.occs {
+		own[o.ID] = true
+	}
+	conds := q.Conds
+	if len(mg.conds) > 0 {
+		conds = append(append([]Scoped(nil), q.Conds...), mg.conds...)
+	}
 	var props []propItem
-	for _, sc := range q.Conds {
+	for _, sc := range conds {
 		out := ev.cond(sc.C)
 		updatable := own
 		if sc.Confines != nil {
@@ -202,6 +236,11 @@ func (ev *confEval) level(q *QueryNode) {
 			for _, id := range sc.Confines {
 				if own[id] {
 					updatable[id] = true
+				}
+				for _, in := range ev.inner[id] {
+					if own[in] {
+						updatable[in] = true
+					}
 				}
 			}
 		}
@@ -263,6 +302,9 @@ func (ev *confEval) level(q *QueryNode) {
 	for _, s := range q.Subs {
 		ev.level(s)
 	}
+	for _, s := range mg.subs {
+		ev.level(s)
+	}
 }
 
 // applyLinks: o.ocol IN (SELECT so.socol ...) means every row of o that can
@@ -314,6 +356,9 @@ func (ev *confEval) related(src *occRes, scol string, dst *occRes, dcol string) 
 	if a.cat == nil || src.ti == nil || dst.ti == nil {
 		return false
 	}
+	if src.ti == dst.ti && scol == dcol && src.ti.IsUnique(scol) {
+		return true // the same column of the same table, unique: the same row
+	}
 	if fk, ok := a.cat.FK(dst.ti, dcol); ok && fk.ParentKey == src.ti.Key() && fk.ParentCol == scol {
 		return true
 	}
@@ -323,27 +368,43 @@ func (ev *confEval) related(src *occRes, scol string, dst *occRes, dcol string) 
 	return false
 }
 
-func (ev *confEval) resolve(r CRef) (*occRes, bool) {
-	if r.Occ != "" {
-		o := ev.occ[r.Occ]
-		return o, o != nil
-	}
-	var found *occRes
-	for _, id := range r.Cands {
-		o := ev.occ[id]
-		if o == nil || o.ti == nil {
-			continue
-		}
-		for _, c := range o.ti.Cols {
-			if c == r.Col {
-				if found != nil {
-					return nil, false // ambiguous
+// resolve finds the table occurrence a column reference belongs to and the
+// column it really is: a column of a merged view is a column of one of the
+// tables the view was made from.
+func (ev *confEval) resolve(r CRef) (*occRes, string, bool) {
+	for hops := 0; hops <= maxViewDepth+1; hops++ {
+		var o *occRes
+		if r.Occ != "" {
+			o = ev.occ[r.Occ]
+		} else {
+			for _, id := range r.Cands {
+				c := ev.occ[id]
+				if c == nil || c.ti == nil {
+					continue
 				}
-				found = o
+				for _, col := range c.ti.Cols {
+					if col == r.Col {
+						if o != nil {
+							return nil, "", false // ambiguous
+						}
+						o = c
+					}
+				}
 			}
 		}
+		if o == nil {
+			return nil, "", false
+		}
+		if o.viewMap == nil {
+			return o, r.Col, true
+		}
+		m, ok := o.viewMap[r.Col]
+		if !ok {
+			return nil, "", false
+		}
+		r = m
 	}
-	return found, found != nil
+	return nil, "", false
 }
 
 func (ev *confEval) cond(c *Cond) condOut {
@@ -415,11 +476,11 @@ func (ev *confEval) cond(c *Cond) condOut {
 // statement is restricting itself by something, so it is not a blind scan.
 func (ev *confEval) mention(refs []CRef, out *condOut) {
 	for _, r := range refs {
-		o, ok := ev.resolve(r)
+		o, col, ok := ev.resolve(r)
 		if !ok || !o.tenant {
 			continue
 		}
-		if ev.restrictsBy(o, r.Col) {
+		if ev.restrictsBy(o, col) {
 			out.restricted[o.id] = true
 		}
 	}
@@ -459,18 +520,18 @@ func (ev *confEval) values(ops []Operand) ([]string, bool) {
 func (ev *confEval) leaf(l *Leaf, out *condOut) {
 	if l.In != nil {
 		ev.mention(l.Mentions, out)
-		o, ok1 := ev.resolve(l.L)
-		so, ok2 := ev.resolve(l.In.Out)
+		o, ocol, ok1 := ev.resolve(l.L)
+		so, scol, ok2 := ev.resolve(l.In.Out)
 		if ok1 && ok2 && o.tenant && so.tenant {
-			out.links = append(out.links, inLink{o.id, l.L.Col, so.id, l.In.Out.Col})
+			out.links = append(out.links, inLink{o.id, ocol, so.id, scol})
 		}
 		return
 	}
 	if l.R != nil {
-		a, ok1 := ev.resolve(l.L)
-		b, ok2 := ev.resolve(*l.R)
+		a, ac, ok1 := ev.resolve(l.L)
+		b, bc, ok2 := ev.resolve(*l.R)
 		if ok1 && ok2 {
-			out.eqs = append(out.eqs, joinEq{a.id, b.id, l.L.Col, l.R.Col})
+			out.eqs = append(out.eqs, joinEq{a.id, b.id, ac, bc})
 			out.restricted[a.id], out.restricted[b.id] = true, true
 		}
 		return
@@ -479,12 +540,12 @@ func (ev *confEval) leaf(l *Leaf, out *condOut) {
 		ev.mention(l.Mentions, out)
 		return
 	}
-	o, ok := ev.resolve(l.L)
-	if ok && !o.tenant && o.ti != nil && o.ti.IsUnique(l.L.Col) && ev.a.lk != nil {
+	o, lcol, ok := ev.resolve(l.L)
+	if ok && !o.tenant && o.ti != nil && o.ti.IsUnique(lcol) && ev.a.lk != nil {
 		// A credential-style lookup on a table with no tenant column: `token = $1`.
 		// Alone it says nothing, but joined to a tenant table it pins that table.
 		if vals, resolved := ev.values(l.Ops); resolved {
-			out.bridge[o.id] = append(out.bridge[o.id], bridgeKey{col: l.L.Col, vals: vals})
+			out.bridge[o.id] = append(out.bridge[o.id], bridgeKey{col: lcol, vals: vals})
 		}
 		return
 	}
@@ -492,17 +553,17 @@ func (ev *confEval) leaf(l *Leaf, out *condOut) {
 		return
 	}
 	vals, resolved := ev.values(l.Ops)
-	if ev.restrictsBy(o, l.L.Col) {
+	if ev.restrictsBy(o, lcol) {
 		out.restricted[o.id] = true
 	}
 	switch {
-	case ev.a.tenants[l.L.Col]:
+	case ev.a.tenants[lcol]:
 		if resolved {
 			out.conf[o.id] = setOf(vals...)
 		}
-	case ev.identifying(o, l.L.Col):
+	case ev.identifying(o, lcol):
 		if resolved {
-			if set, ok := ev.ownersOf(o, l.L.Col, vals); ok {
+			if set, ok := ev.ownersOf(o, lcol, vals); ok {
 				out.conf[o.id] = set
 			}
 		}
@@ -573,18 +634,18 @@ func (ev *confEval) poly(c *Cond, out *condOut) {
 			continue
 		}
 		idLeaf := k.Leaf
-		o, ok := ev.resolve(idLeaf.L)
-		base, isID := strings.CutSuffix(idLeaf.L.Col, "_id")
-		if !ok || !o.tenant || o.ti == nil || !isID || !o.ti.HasPolyID(idLeaf.L.Col) {
+		o, idcol, ok := ev.resolve(idLeaf.L)
+		base, isID := strings.CutSuffix(idcol, "_id")
+		if !ok || !o.tenant || o.ti == nil || !isID || !o.ti.HasPolyID(idcol) {
 			continue
 		}
 		out.restricted[o.id] = true
 		for _, s := range c.Kids {
-			if s.Kind != CondLeaf || s.Leaf == nil || !s.Leaf.Eq || s.Leaf.R != nil || s.Leaf.L.Col != base+"_type" || len(s.Leaf.Ops) != 1 {
+			if s.Kind != CondLeaf || s.Leaf == nil || !s.Leaf.Eq || s.Leaf.R != nil || len(s.Leaf.Ops) != 1 {
 				continue
 			}
-			so, ok := ev.resolve(s.Leaf.L)
-			if !ok || so.id != o.id {
+			so, scol, ok := ev.resolve(s.Leaf.L)
+			if !ok || so.id != o.id || scol != base+"_type" {
 				continue
 			}
 			class, resolved := ev.st.val(ev.pt, s.Leaf.Ops[0])
@@ -613,7 +674,8 @@ func (ev *confEval) poly(c *Cond, out *condOut) {
 }
 
 func (ev *confEval) result() confResult {
-	r := confResult{confined: true, needs: ev.needs, viaKeys: ev.viaKeys, viaLookup: ev.viaLookup}
+	r := confResult{confined: true, needs: ev.needs, viaKeys: ev.viaKeys, viaLookup: ev.viaLookup,
+		unsure: ev.unsure, expanded: ev.expanded}
 	var all *tset
 	for id, o := range ev.occ {
 		if !o.tenant {

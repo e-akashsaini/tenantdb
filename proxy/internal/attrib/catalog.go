@@ -22,6 +22,9 @@ type TableInfo struct {
 
 	unique map[string]bool // columns with a single-column, non-partial unique index
 	rls    bool            // row-level security is enabled
+
+	viewDef string    // a view's definition (schema-qualified), if it could be read
+	vp      viewParse // ... parsed once (views.go)
 }
 
 // Key is the name the row cache uses for this table.
@@ -145,6 +148,14 @@ WHERE n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIK
   AND NOT EXISTS (SELECT 1 FROM pg_depend d
                   WHERE d.classid = 'pg_proc'::regclass AND d.objid = p.oid AND d.deptype = 'e')`
 
+// View definitions, with every name schema-qualified (an empty search path makes
+// pg_get_viewdef spell out the schema), so they mean the same to every session.
+const viewDefSQL = `
+SELECT n.nspname, c.relname, pg_get_viewdef(c.oid, false)
+FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind = 'v' AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%'
+  AND n.nspname NOT LIKE 'pg_temp%'`
+
 const roleSettingSQL = `
 SELECT COALESCE(r.rolname, ''), COALESCE(d.datname, ''), s.setconfig
 FROM pg_db_role_setting s
@@ -178,6 +189,7 @@ type snapshotData struct {
 	baseSearch []string
 	fks        map[string]map[string]FKRef // tests only; Load computes them itself
 	polys      map[string]map[string]map[string]FKRef
+	viewdefs   map[string]string // table key -> definition
 }
 
 // Load replaces the snapshot with the current schema.
@@ -252,6 +264,8 @@ func (c *Catalog) Load(ctx context.Context) error {
 		return err
 	}
 
+	d.viewdefs = loadViewDefs(ctx, conn)
+
 	// Row-level security can blind the lookup role; know whether it is subject to it.
 	if err := conn.QueryRow(ctx, `SELECT COALESCE((SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname = current_user), false)`).Scan(&d.bypassRLS); err != nil {
 		return fmt.Errorf("catalog rls: %w", err)
@@ -288,6 +302,36 @@ func (c *Catalog) Load(ctx context.Context) error {
 	return nil
 }
 
+// loadViewDefs reads every view's definition. A role that cannot read some of
+// them simply gets none for those: the views stay opaque, as before.
+func loadViewDefs(ctx context.Context, conn *pgx.Conn) map[string]string {
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return nil
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SET LOCAL search_path = pg_catalog`); err != nil {
+		return nil
+	}
+	rows, err := tx.Query(ctx, viewDefSQL)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var s, n string
+		var def *string
+		if err := rows.Scan(&s, &n, &def); err != nil {
+			return out
+		}
+		if def != nil && len(*def) <= 1<<20 {
+			out[strings.ToLower(s+"."+n)] = *def
+		}
+	}
+	return out
+}
+
 func (c *Catalog) apply(d snapshotData) {
 	m := map[string]*TableInfo{}
 	for _, r := range d.cols {
@@ -298,7 +342,7 @@ func (c *Catalog) apply(d snapshotData) {
 			if kind == 0 {
 				kind = 'r'
 			}
-			ti = &TableInfo{Schema: r.schema, Name: r.table, Kind: kind, rls: r.rls, unique: d.unique[key]}
+			ti = &TableInfo{Schema: r.schema, Name: r.table, Kind: kind, rls: r.rls, unique: d.unique[key], viewDef: d.viewdefs[key]}
 			m[key] = ti
 		}
 		ti.Cols = append(ti.Cols, strings.ToLower(r.col))
