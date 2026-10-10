@@ -117,3 +117,21 @@ func (c *RowCache) Len() int {
 	defer c.mu.Unlock()
 	return c.ll.Len()
 }
+
+// Clear forgets everything.
+func (c *RowCache) Clear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ll.Init()
+	c.m = map[cacheKey]*list.Element{}
+}
+
+// bridgeTTL: what a credential maps to is trusted only briefly, whatever the
+// row cache is set to. Tokens are revoked and sessions end.
+func bridgeTTL(rowTTL time.Duration) time.Duration {
+	const max = time.Minute
+	if rowTTL > 0 && rowTTL < max {
+		return rowTTL
+	}
+	return max
+}

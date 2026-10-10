@@ -110,6 +110,7 @@ type Attributor struct {
 	tenants map[string]bool
 	cat     *Catalog
 	lk      rowLookup
+	bridge  *RowCache // credential-style lookups (viaBridge), keyed by a hash of the credential
 	tagVar  string
 
 	strict    StrictMode
@@ -130,6 +131,7 @@ func New(opt Options, onEvent func(Event)) *Attributor {
 		cat:     opt.Catalog,
 		tagVar:  strings.ToLower(opt.TagVar),
 	}
+	a.bridge = NewRowCacheTTL(opt.CacheSize, bridgeTTL(opt.CacheTTL))
 	a.strict = opt.Strict.Mode
 	if a.strict == "" {
 		a.strict = StrictOff
@@ -235,6 +237,7 @@ type keyReq struct {
 	col, val string
 	ti       *TableInfo
 	tcol     string
+	via      *bridgeSpec // set: ti is the tenant table a credential-style row points at (see viaBridge)
 }
 
 type state struct {
@@ -444,6 +447,7 @@ func (a *Attributor) OnBackend(s *proxy.Session, msg pgproto3.BackendMessage) {
 	case *pgproto3.CommandComplete:
 		if a.cat != nil && isDDL(string(m.CommandTag)) {
 			a.cat.ReloadAsync()
+			a.bridge.Clear()
 		}
 		if p := st.pop(); p != nil {
 			for _, l := range p.learn {
@@ -457,6 +461,9 @@ func (a *Attributor) OnBackend(s *proxy.Session, msg pgproto3.BackendMessage) {
 			}
 			for _, k := range p.dropKeys {
 				a.cache.DropTable(k)
+			}
+			if len(p.dropKeys) > 0 || p.dropTable {
+				a.bridge.Clear()
 			}
 			for _, n := range p.dropTemps {
 				delete(st.temps, n)
@@ -1001,7 +1008,7 @@ func claimEvent(ev *Event, tenants []string, cr confResult, insert bool) {
 // lookupable: every row can be asked about, and the database role sees all of it.
 func (a *Attributor) lookupable(need []keyReq) bool {
 	for _, k := range need {
-		if k.ti == nil || k.tcol == "" || !a.cat.CanRead(k.ti) {
+		if k.ti == nil || k.tcol == "" || !a.cat.CanRead(k.ti) || (k.via != nil && !a.cat.CanRead(k.via.b)) {
 			return false
 		}
 	}
@@ -1016,6 +1023,24 @@ func (a *Attributor) lookupOwners(need []keyReq) (owners ownerSet, failed bool) 
 	defer cancel()
 	owners = ownerSet{}
 	for _, k := range need {
+		if k.via != nil {
+			bl, ok := a.lk.(bridgeLookup)
+			if !ok {
+				failed = true
+				continue
+			}
+			ts, err := bl.viaTenants(ctx, *k.via, k.val)
+			if err != nil {
+				failed = true
+				continue
+			}
+			hv := bridgeVal(normVal(k.val))
+			owners[ownerKey{k.via.table(), k.col, hv}] = ts
+			if len(ts) == 1 {
+				a.bridge.Put(k.via.table(), k.col, hv, ts[0])
+			}
+			continue
+		}
 		ts, err := a.lk.tenants(ctx, k.ti, k.tcol, k.col, k.val)
 		if err != nil {
 			failed = true

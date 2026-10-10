@@ -37,6 +37,8 @@ var dTables = map[string]*dtable{
 	"orders":    {"orders", true, []dcol{{"id", "int"}, {"tenant_id", "text"}, {"customer_id", "int"}, {"status", "text"}, {"amount", "int"}}},
 	"items":     {"items", true, []dcol{{"id", "int"}, {"tenant_id", "text"}, {"order_id", "int"}, {"sku", "text"}, {"qty", "int"}}},
 	"countries": {"countries", false, []dcol{{"code", "text"}, {"name", "text"}}},
+	// a credential table: no tenant column, a unique token, and an owner pointer that nothing names
+	"tokens": {"tokens", false, []dcol{{"id", "int"}, {"owner", "int"}, {"token", "text"}}},
 	// ord points at orders.id but nothing in its name says so: only the joins reveal it
 	"shipments": {"shipments", true, []dcol{{"id", "int"}, {"tenant_id", "text"}, {"ord", "int"}, {"carrier", "text"}}},
 }
@@ -55,6 +57,8 @@ CREATE TABLE tdbdiff.customers (id bigint PRIMARY KEY, tenant_id text, name text
 CREATE TABLE tdbdiff.orders (id bigint PRIMARY KEY, tenant_id text, customer_id bigint, status text, amount int);
 CREATE TABLE tdbdiff.items (id bigint PRIMARY KEY, tenant_id text, order_id bigint, sku text, qty int);
 CREATE TABLE tdbdiff.countries (code text PRIMARY KEY, name text);
+CREATE TABLE tdbdiff.tokens (id bigint PRIMARY KEY, owner bigint, token text UNIQUE);
+INSERT INTO tdbdiff.tokens SELECT n, ((n*7)%48)+1, 'k'||n FROM generate_series(1,48) n;
 CREATE TABLE tdbdiff.shipments (id bigint PRIMARY KEY, tenant_id text, ord bigint, carrier text);
 INSERT INTO tdbdiff.shipments SELECT id, 't'||((id-1)/50), ((id-1)/50)*40 + (id%40) + 1, (ARRAY['dhl','ups'])[id%2+1] FROM generate_series(1,200) id;
 INSERT INTO tdbdiff.customers SELECT t*12+i, 't'||t, 'n'||i, 's'||(t*12+i), CASE WHEN i%2=0 THEN 'eu' ELSE 'us' END
@@ -202,7 +206,44 @@ type dquery struct {
 
 func (g *dgen) selectQuery() dquery {
 	names := []string{"customers", "orders", "items", "countries", "shipments"}
-	switch g.r.Intn(10) {
+	switch g.r.Intn(12) {
+	case 5, 6: // a credential row (no tenant column) pins a tenant row through a join
+		cust := dTables["customers"]
+		ca, ka := g.newAlias(), g.newAlias()
+		tok := func() string { return "'k" + g.num(48) + "'" }
+		var key string
+		switch g.r.Intn(7) {
+		case 0, 1:
+			key = ka + ".token = " + tok()
+		case 2:
+			key = fmt.Sprintf("%s.token IN (%s, %s)", ka, tok(), tok())
+		case 3:
+			key = ka + ".id = " + g.num(48)
+		case 4:
+			key = fmt.Sprintf("%s.token = %s OR %s.token = %s", ka, tok(), ka, tok())
+		case 5:
+			key = fmt.Sprintf("(%s.token = %s OR %s)", ka, tok(), g.pred(ca, cust, 1))
+		case 6:
+			key = fmt.Sprintf("NOT (%s.token = %s)", ka, tok())
+		}
+		kind := g.pick("JOIN", "INNER JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL JOIN")
+		join := fmt.Sprintf("%s.owner = %s.id", ka, ca)
+		extra := g.pick("", "", " AND "+g.pred(ca, cust, 1))
+		var from, where string
+		first, second := fmt.Sprintf("tdbdiff.customers %s", ca), fmt.Sprintf("tdbdiff.tokens %s", ka)
+		if g.r.Intn(2) == 0 {
+			first, second = second, first
+		}
+		if g.r.Intn(2) == 0 {
+			from, where = fmt.Sprintf("%s %s %s ON %s", first, kind, second, join), key+extra
+		} else {
+			from, where = fmt.Sprintf("%s %s %s ON %s AND %s", first, kind, second, join, key), "true"+extra
+		}
+		return dquery{
+			sql:    fmt.Sprintf("SELECT %s.* FROM %s WHERE %s", ca, from, where),
+			truth:  []string{fmt.Sprintf("SELECT DISTINCT %s.tenant_id FROM %s WHERE %s", ca, from, where)},
+			tenant: true,
+		}
 	case 0, 1: // join along a foreign key
 		j := dJoins[g.r.Intn(len(dJoins))]
 		child, parent := dTables[j[0]], dTables[j[2]]

@@ -1,6 +1,8 @@
 package attrib
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"sort"
 	"strings"
 )
@@ -93,6 +95,7 @@ type occRes struct {
 type joinEq struct{ a, b, ca, cb string }
 
 type condOut struct {
+	bridge     map[string][]bridgeKey
 	conf       map[string]*tset
 	eqs        []joinEq
 	restricted map[string]bool
@@ -110,6 +113,7 @@ type confEval struct {
 	owners ownerSet
 
 	occ        map[string]*occRes
+	bridge     map[string][]bridgeKey // non-tenant occurrences pinned to one row by a unique key
 	conf       map[string]*tset
 	restricted map[string]bool
 	needs      []keyReq
@@ -125,7 +129,7 @@ func (a *Attributor) confine(st *state, x Stmt, pt *portal, owners ownerSet) con
 		return confResult{}
 	}
 	ev := &confEval{a: a, st: st, pt: pt, owners: owners,
-		occ: map[string]*occRes{}, conf: map[string]*tset{}, restricted: map[string]bool{}, needSeen: map[ownerKey]bool{}}
+		occ: map[string]*occRes{}, bridge: map[string][]bridgeKey{}, conf: map[string]*tset{}, restricted: map[string]bool{}, needSeen: map[ownerKey]bool{}}
 	ev.collect(x.Q)
 	ev.level(x.Q)
 	return ev.result()
@@ -198,6 +202,11 @@ func (ev *confEval) level(q *QueryNode) {
 		for id := range out.restricted {
 			ev.restricted[id] = true
 		}
+		for id, ks := range out.bridge {
+			if updatable[id] {
+				ev.bridge[id] = append(ev.bridge[id], ks...)
+			}
+		}
 		for _, e := range out.eqs {
 			props = append(props, propItem{e, updatable})
 		}
@@ -213,6 +222,10 @@ func (ev *confEval) level(q *QueryNode) {
 					srcID, dstID, sc, dc = dstID, srcID, dc, sc
 				}
 				src, dst := ev.occ[srcID], ev.occ[dstID]
+				if ev.viaBridge(src, sc, dst, dc, p.updatable[dstID]) {
+					changed = true
+					continue
+				}
 				if src == nil || dst == nil || !p.updatable[dstID] || !dst.tenant || ev.conf[srcID] == nil {
 					continue
 				}
@@ -294,7 +307,7 @@ func (ev *confEval) resolve(r CRef) (*occRes, bool) {
 }
 
 func (ev *confEval) cond(c *Cond) condOut {
-	out := condOut{conf: map[string]*tset{}, restricted: map[string]bool{}}
+	out := condOut{conf: map[string]*tset{}, restricted: map[string]bool{}, bridge: map[string][]bridgeKey{}}
 	switch c.Kind {
 	case CondLeaf:
 		ev.leaf(c.Leaf, &out)
@@ -308,6 +321,9 @@ func (ev *confEval) cond(c *Cond) condOut {
 			}
 			for id := range ko.restricted {
 				out.restricted[id] = true
+			}
+			for id, ks := range ko.bridge {
+				out.bridge[id] = append(out.bridge[id], ks...)
 			}
 			out.eqs = append(out.eqs, ko.eqs...)
 		}
@@ -414,6 +430,14 @@ func (ev *confEval) leaf(l *Leaf, out *condOut) {
 		return
 	}
 	o, ok := ev.resolve(l.L)
+	if ok && !o.tenant && o.ti != nil && o.ti.IsUnique(l.L.Col) && ev.a.lk != nil {
+		// A credential-style lookup on a table with no tenant column: `token = $1`.
+		// Alone it says nothing, but joined to a tenant table it pins that table.
+		if vals, resolved := ev.values(l.Ops); resolved {
+			out.bridge[o.id] = append(out.bridge[o.id], bridgeKey{col: l.L.Col, vals: vals})
+		}
+		return
+	}
 	if !ok || !o.tenant {
 		return
 	}
@@ -563,4 +587,76 @@ func (ev *confEval) result() confResult {
 		r.tenants = all.list()
 	}
 	return r
+}
+
+// bridgeKey: occurrence.col = one of vals, where col is a unique column of a
+// table that has no tenant column of its own.
+type bridgeKey struct {
+	col  string
+	vals []string
+}
+
+// bridgeSpec names a probe: the tenants of the t rows joined (t.tjoin = b.bfk) to
+// the one b row whose unique column bk has a given value.
+type bridgeSpec struct {
+	b, t           *TableInfo
+	bk, bfk, tjoin string
+	ttenant        string
+}
+
+func (s bridgeSpec) table() string {
+	return "via:" + s.b.Key() + "." + s.bfk + ">" + s.t.Key() + "." + s.tjoin
+}
+
+// bridgeVal keeps the credential itself out of the cache and the owner sets.
+func bridgeVal(v string) string {
+	h := sha256.Sum256([]byte(v))
+	return hex.EncodeToString(h[:16])
+}
+
+// viaBridge: src is a non-tenant occurrence pinned to one row by a unique key
+// (an access token, a session id) and dst a tenant occurrence joined to it. The
+// dst rows that can match are the ones that row points at, whatever the
+// relationship is called: the probe asks for exactly those, with the statement's
+// own join, so no foreign key needs to be known. It reports whether dst was newly
+// confined.
+func (ev *confEval) viaBridge(src *occRes, scol string, dst *occRes, dcol string, updatable bool) bool {
+	if src == nil || dst == nil || src.tenant || !dst.tenant || !updatable || len(ev.bridge[src.id]) == 0 ||
+		src.ti == nil || dst.ti == nil || dst.tcol == "" || ev.a.lk == nil {
+		return false
+	}
+	changed := false
+	for _, bk := range ev.bridge[src.id] {
+		spec := bridgeSpec{b: src.ti, t: dst.ti, bk: bk.col, bfk: scol, tjoin: dcol, ttenant: dst.tcol}
+		set, all := setOf(), true
+		for _, v := range bk.vals {
+			k := ownerKey{spec.table(), bk.col, bridgeVal(normVal(v))}
+			if ts, found := ev.owners[k]; found {
+				for _, t := range ts {
+					set.m[t] = true
+				}
+				ev.viaKeys, ev.viaLookup = true, true
+				continue
+			}
+			if t, hit := ev.a.bridge.Get(spec.table(), bk.col, bridgeVal(normVal(v))); hit {
+				set.m[t] = true
+				ev.viaKeys = true
+				continue
+			}
+			all = false
+			if !ev.needSeen[k] {
+				ev.needSeen[k] = true
+				ev.needs = append(ev.needs, keyReq{col: bk.col, val: v, ti: dst.ti, tcol: dst.tcol, via: &spec})
+			}
+		}
+		if !all {
+			continue
+		}
+		n := inter(ev.conf[dst.id], set)
+		if ev.conf[dst.id] == nil || len(n.m) != len(ev.conf[dst.id].m) {
+			ev.conf[dst.id] = n
+			changed = true
+		}
+	}
+	return changed
 }
