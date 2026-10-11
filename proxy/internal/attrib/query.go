@@ -471,11 +471,81 @@ func (b *builder) expr(q *QueryNode, sc *bscope, n *pg_query.Node) *Cond {
 					Mentions: b.mentions(sc, n)}}
 			}
 		}
+		if sl.SubLinkType == pg_query.SubLinkType_EXISTS_SUBLINK {
+			if c := b.existsLinks(sl, b.subNode[sl]); c != nil {
+				return c
+			}
+		}
 	}
 	return &Cond{Kind: CondOther, Mentions: b.mentions(sc, n)}
 }
 
-// leaf reads `col = value`, `col IN (values)`, `col = ANY (ARRAY[values])` and
+// existsLinks reads a correlated EXISTS as the semi-join it is: in
+//
+//	WHERE EXISTS (SELECT ... FROM s WHERE s.x = o.y AND ...)
+//
+// only rows of o whose y some row of s has can be returned, which is what
+// `o.y IN (SELECT s.x FROM s WHERE ...)` says. It returns nil unless the
+// subquery is a plain select that returns a row if and only if its FROM and WHERE
+// produce one: no set operation, grouping, aggregate or window function, which
+// can return a row when nothing matches.
+func (b *builder) existsLinks(sl *pg_query.SubLink, sub *QueryNode) *Cond {
+	if sub == nil {
+		return nil
+	}
+	ss := sl.Subselect.GetSelectStmt()
+	if ss == nil || ss.Op != pg_query.SetOperation_SETOP_NONE || len(ss.GroupClause) > 0 ||
+		ss.HavingClause != nil || len(ss.WindowClause) > 0 || len(ss.ValuesLists) > 0 {
+		return nil
+	}
+	for _, t := range ss.TargetList {
+		rt := t.GetResTarget()
+		if rt == nil || (rt.Val.GetColumnRef() == nil && rt.Val.GetAConst() == nil) {
+			return nil
+		}
+	}
+	own := map[string]bool{}
+	for _, o := range sub.Occs {
+		own[o.ID] = true
+	}
+	var kids []*Cond
+	var scan func(c *Cond)
+	scan = func(c *Cond) {
+		switch c.Kind {
+		case CondAnd:
+			for _, k := range c.Kids {
+				scan(k)
+			}
+		case CondLeaf:
+			l := c.Leaf
+			if l.R == nil || l.L.Occ == "" || l.R.Occ == "" {
+				return
+			}
+			inner, outer := l.L, *l.R
+			if own[outer.Occ] && !own[inner.Occ] {
+				inner, outer = outer, inner
+			}
+			if own[inner.Occ] && !own[outer.Occ] {
+				kids = append(kids, &Cond{Kind: CondLeaf, Leaf: &Leaf{L: outer, In: &InSub{Q: sub, Out: inner},
+					Mentions: []CRef{outer}}})
+			}
+		}
+	}
+	for _, sc := range sub.Conds {
+		if sc.Confines == nil {
+			scan(sc.C)
+		}
+	}
+	switch len(kids) {
+	case 0:
+		return nil
+	case 1:
+		return kids[0]
+	}
+	return &Cond{Kind: CondAnd, Kids: kids}
+}
+
+// leaf reads `col = value`,`col IN (values)`, `col = ANY (ARRAY[values])` and
 // `col = col'; any other comparison becomes a leaf that only mentions columns.
 func (b *builder) leaf(sc *bscope, x *pg_query.A_Expr) *Leaf {
 	isEq := len(x.Name) == 1 && x.Name[0].GetString_().GetSval() == "="

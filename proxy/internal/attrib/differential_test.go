@@ -211,7 +211,45 @@ type dquery struct {
 
 func (g *dgen) selectQuery() dquery {
 	names := []string{"customers", "orders", "items", "countries", "shipments", "folders"}
-	switch g.r.Intn(14) {
+	switch g.r.Intn(17) {
+	case 14, 15, 16: // EXISTS (SELECT ... WHERE s.y = o.x ...): the same carry, written as a semi-join
+		j := dJoins[g.r.Intn(len(dJoins))]
+		child, parent := dTables[j[0]], dTables[j[2]]
+		oa, sa, sb := g.newAlias(), g.newAlias(), g.newAlias()
+		var outer, sub *dtable
+		var ocol, scol string
+		switch g.r.Intn(3) {
+		case 0:
+			outer, sub, ocol, scol = child, parent, j[1], j[3]
+		case 1:
+			outer, sub, ocol, scol = parent, child, j[3], j[1]
+		default:
+			outer, sub, ocol, scol = dTables[g.pick("customers", "orders", "items")], dTables[g.pick("customers", "orders", "items")], "tenant_id", "tenant_id"
+		}
+		subWhere := g.pred(sa, sub, 1)
+		eq := g.pick(fmt.Sprintf("%s.%s = %s.%s", sa, scol, oa, ocol), fmt.Sprintf("%s.%s = %s.%s", oa, ocol, sa, scol),
+			fmt.Sprintf("%s.%s = %s.%s", sa, scol, oa, ocol), fmt.Sprintf("(%s.%s = %s.%s OR %s.id = %s)", sa, scol, oa, ocol, sa, g.num(60)),
+			fmt.Sprintf("%s.%s = %s.%s + 0", sa, scol, oa, ocol))
+		inner := g.pick(eq+" AND "+subWhere, eq+" AND "+subWhere, eq+" AND ("+subWhere+" OR "+g.pred(sa, sub, 1)+")", "("+eq+" AND "+subWhere+") OR "+g.pred(sa, sub, 1), eq)
+		target := g.pick("1", "1", sa+".*", "count(*)", "max("+sa+".id)")
+		tail := g.pick("", "", "", " LIMIT 1", " GROUP BY "+sa+".id", " HAVING count(*) > 0")
+		if strings.Contains(tail, "GROUP") || strings.Contains(tail, "HAVING") {
+			target = "1"
+			if strings.Contains(tail, "HAVING") {
+				target = "count(*)"
+			}
+		}
+		op := g.pick("EXISTS", "EXISTS", "EXISTS", "NOT EXISTS")
+		ex := fmt.Sprintf("%s (SELECT %s FROM tdbdiff.%s %s WHERE %s%s)", op, target, sub.name, sa, inner, tail)
+		where := g.pick(ex, ex, ex, ex+" AND "+g.pred(oa, outer, 1), ex+" OR "+g.pred(oa, outer, 1), g.pred(oa, outer, 1)+" AND "+ex)
+		return dquery{
+			sql: fmt.Sprintf("SELECT %s.* FROM tdbdiff.%s %s WHERE %s", oa, outer.name, oa, where),
+			truth: []string{
+				fmt.Sprintf("SELECT DISTINCT %s.tenant_id FROM tdbdiff.%s %s WHERE %s", oa, outer.name, oa, where),
+				fmt.Sprintf("SELECT DISTINCT %s.tenant_id FROM tdbdiff.%s %s, tdbdiff.%s %s WHERE (%s) AND (%s)", sb, sub.name, sb, outer.name, oa, where, strings.ReplaceAll(inner, sa+".", sb+".")),
+			},
+			tenant: true,
+		}
 	case 12, 13: // x IN (SELECT y ...): the subquery's confinement may carry to the outer table
 		j := dJoins[g.r.Intn(len(dJoins))]
 		child, parent := dTables[j[0]], dTables[j[2]]

@@ -6,7 +6,7 @@ All notable changes. The project follows [semantic versioning](https://semver.or
 
 ### Attribution
 - **Credential lookups** (`WHERE token = $1` joined to the user): attributed through the row the credential points at, with a hashed, short-lived cache.
-- **`IN (SELECT ...)` / `= ANY (SELECT ...)`**: the subquery's confinement carries to the outer table when the columns are provably related.
+- **`IN (SELECT ...)` / `= ANY (SELECT ...)`**: the subquery's confinement carries to the outer table when the columns are provably related. A correlated `EXISTS (SELECT ... WHERE s.x = o.y ...)` is read the same way.
 - **Views** are read through their definitions: simple views are merged into the query (renamed tenant columns, per-tenant views, `current_setting` views), others are analysed as subqueries.
 - **Learned relationships**: a join the application runs (`a.x = b.y`, `b.y` unique) becomes a foreign key candidate, verified against the data before it is used.
 - **Row-level security**: policies are credited as an extra condition for roles that are subject to them (superuser, `BYPASSRLS`, owner and `FORCE` are handled; `SET ROLE` is tracked).
