@@ -1,3 +1,8 @@
 *.exe
 *.test
 /bin/
+
+# generated certificates and keys
+*.key
+*.crt
+*.pem
