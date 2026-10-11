@@ -8,8 +8,9 @@ COPY proxy/go.mod proxy/go.sum ./
 RUN go mod download
 COPY proxy/ ./
 ARG VERSION=dev
+ARG COMMIT=
 # cgo: the SQL parser is PostgreSQL's own, compiled in.
-RUN CGO_ENABLED=1 go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /out/tenantdb ./cmd/tenantdb
+RUN CGO_ENABLED=1 go build -trimpath -ldflags "-s -w -X main.version=${VERSION} -X main.commitStamp=${COMMIT}" -o /out/tenantdb ./cmd/tenantdb
 
 FROM gcr.io/distroless/base-debian12:nonroot
 COPY --from=build /out/tenantdb /usr/local/bin/tenantdb

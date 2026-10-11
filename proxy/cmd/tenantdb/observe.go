@@ -18,6 +18,10 @@ import (
 // version is set at build time: go build -ldflags "-X main.version=v1.2.3".
 var version = "dev"
 
+// commitStamp is the commit, set at build time when git metadata is not available:
+// go build -ldflags "-X main.commitStamp=$SHA".
+var commitStamp string
+
 // buildInfo describes this binary: its version, the commit it was built from and
 // the Go toolchain.
 func buildInfo() (ver, commit, goVer string) {
@@ -35,6 +39,12 @@ func buildInfo() (ver, commit, goVer string) {
 					commit += "-dirty"
 				}
 			}
+		}
+	}
+	if commit == "" && commitStamp != "" {
+		commit = commitStamp // a build without git metadata (the container image)
+		if len(commit) > 12 {
+			commit = commit[:12]
 		}
 	}
 	return
