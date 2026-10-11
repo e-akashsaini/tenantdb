@@ -13,6 +13,8 @@ app ──TLS──▶ tenantdb :6432 ──▶ PostgreSQL :5432
                └─ read-only connection ──▶ schema, function bodies, row ownership, cache warm-up
 ```
 
+**New here?** [docs/QUICKSTART.md](docs/QUICKSTART.md) takes five minutes and needs only Docker. [docs/WRITEUP.md](docs/WRITEUP.md) tells the story of running it on a real Rails app.
+
 ## Why
 
 Multi-tenant apps on a shared database depend on every query remembering `WHERE tenant_id = ...`. One forgotten filter leaks another customer's data. tenantdb makes that visible, and optionally impossible, without touching application code.
