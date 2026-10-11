@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/akashsaini/tenantdb/internal/proxy"
+	"github.com/e-akashsaini/tenantdb/internal/proxy"
 )
 
 // answerLookup says who owns a row, and counts how often it was asked.

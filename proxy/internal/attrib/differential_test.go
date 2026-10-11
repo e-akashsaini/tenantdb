@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/akashsaini/tenantdb/internal/proxy"
+	"github.com/e-akashsaini/tenantdb/internal/proxy"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgproto3"
 )

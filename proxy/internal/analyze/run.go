@@ -8,8 +8,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/akashsaini/tenantdb/internal/attrib"
-	"github.com/akashsaini/tenantdb/internal/proxy"
+	"github.com/e-akashsaini/tenantdb/internal/attrib"
+	"github.com/e-akashsaini/tenantdb/internal/proxy"
 	"github.com/jackc/pgx/v5/pgproto3"
 )
 

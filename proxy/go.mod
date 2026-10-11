@@ -1,4 +1,4 @@
-module github.com/akashsaini/tenantdb
+module github.com/e-akashsaini/tenantdb
 
 go 1.27.2
 

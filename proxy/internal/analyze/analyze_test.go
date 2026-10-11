@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/akashsaini/tenantdb/internal/attrib"
+	"github.com/e-akashsaini/tenantdb/internal/attrib"
 	"github.com/jackc/pgx/v5"
 )
 

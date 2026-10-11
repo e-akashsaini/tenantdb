@@ -7,7 +7,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/akashsaini/tenantdb/internal/attrib"
+	"github.com/e-akashsaini/tenantdb/internal/attrib"
 )
 
 // Report is the result of analysing a workload. Counts are weighted by how many

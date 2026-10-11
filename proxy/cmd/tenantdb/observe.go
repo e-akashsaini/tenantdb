@@ -9,9 +9,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/akashsaini/tenantdb/internal/attrib"
-	"github.com/akashsaini/tenantdb/internal/metrics"
-	"github.com/akashsaini/tenantdb/internal/proxy"
+	"github.com/e-akashsaini/tenantdb/internal/attrib"
+	"github.com/e-akashsaini/tenantdb/internal/metrics"
+	"github.com/e-akashsaini/tenantdb/internal/proxy"
 	"github.com/jackc/pgx/v5/pgproto3"
 )
 

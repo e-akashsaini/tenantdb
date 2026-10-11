@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/akashsaini/tenantdb/internal/analyze"
-	"github.com/akashsaini/tenantdb/internal/attrib"
+	"github.com/e-akashsaini/tenantdb/internal/analyze"
+	"github.com/e-akashsaini/tenantdb/internal/attrib"
 )
 
 // runAnalyze implements `tenantdb analyze`: attribute a recorded workload
