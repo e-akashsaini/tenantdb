@@ -24,7 +24,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: proxy/go.mod
           cache-dependency-path: proxy/go.sum
@@ -42,7 +42,7 @@ jobs:
           cp ../docs/OPERATIONS.md "$NAME"/
           tar -czf "$NAME.tar.gz" "$NAME"
           rm -rf "$NAME" tenantdb
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist-${{ matrix.goos }}-${{ matrix.goarch }}
           path: dist/*.tar.gz
