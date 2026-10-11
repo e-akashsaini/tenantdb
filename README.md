@@ -96,6 +96,12 @@ Prefer the environment variable over `-schema-dsn`: command-line flags show up i
 
 **Row-level security.** A role subject to RLS can't see all rows, so lookups and pre-warming through it would silently miss some. The proxy detects this at start-up, warns, and skips those tables (their statements fall back to `unknown`). Give the schema role `BYPASSRLS` (it stays read-only) to fix it.
 
+### Docker and releases
+```bash
+docker run -d -p 6432:6432 -e TENANTDB_UPSTREAM=db.internal:5432 ghcr.io/e-akashsaini/tenantdb:0.1.0
+```
+Binaries for Linux and macOS (amd64, arm64), checksums and an SBOM are on the [releases page](https://github.com/e-akashsaini/tenantdb/releases). Each is signed with cosign through this repository's GitHub Actions identity: `cosign verify-blob --bundle FILE.sigstore.json --certificate-identity-regexp 'https://github.com/e-akashsaini/tenantdb/' --certificate-oidc-issuer https://token.actions.githubusercontent.com FILE`.
+
 ### Next to a connection pooler
 Put tenantdb **in front of** a pooler such as PgBouncer (app -> tenantdb -> PgBouncer -> Postgres). Each client connection is then seen on its own, so connection tags, transactions and `search_path` follow the client the way they should. [`bench/compat`](bench/compat) runs the same workload through psycopg2, psycopg3, asyncpg, SQLAlchemy and node-postgres in every arrangement, PgBouncer in either order included.
 
