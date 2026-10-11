@@ -1,0 +1,35 @@
+name: Statement attributed wrongly
+description: tenantdb named the wrong tenant, flagged something it should not, or missed something
+labels: [attribution]
+body:
+  - type: textarea
+    id: sql
+    attributes:
+      label: The statement
+      description: Remove real data first. Parameters can be shown as $1, $2.
+      render: sql
+    validations: {required: true}
+  - type: textarea
+    id: schema
+    attributes:
+      label: The schema
+      description: CREATE TABLE statements for the tables involved, with keys and foreign keys.
+      render: sql
+    validations: {required: true}
+  - type: textarea
+    id: got
+    attributes:
+      label: What tenantdb said
+      description: The log line or event (source, tenants, violation).
+    validations: {required: true}
+  - type: textarea
+    id: want
+    attributes:
+      label: What you expected
+    validations: {required: true}
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `tenantdb -version`
+    validations: {required: true}

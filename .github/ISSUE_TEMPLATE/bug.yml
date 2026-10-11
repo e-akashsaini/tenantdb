@@ -1,0 +1,21 @@
+name: Bug
+description: Something other than attribution is broken (crash, connection problem, a flag that misbehaves)
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected
+    validations: {required: true}
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce it
+      description: Command line, client and driver, Postgres version.
+    validations: {required: true}
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `tenantdb -version`
+    validations: {required: true}
