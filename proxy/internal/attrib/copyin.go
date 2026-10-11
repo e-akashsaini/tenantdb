@@ -375,9 +375,6 @@ type copyIn struct {
 // column's position in the rows is certain.
 func (a *Attributor) beginCopy(st *state, ev Event, x Stmt) bool {
 	sp := x.Copy
-	if a.strict == StrictBlock {
-		return false // the verdict has to be given before the rows are sent
-	}
 	if sp == nil || (sp.Format != "csv" && sp.Format != "text") || a.cat == nil || !a.cat.Loaded() {
 		return false
 	}

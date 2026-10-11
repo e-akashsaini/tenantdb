@@ -119,12 +119,14 @@ type snapshot struct {
 	txnTenant       []string
 	path, localPath []string
 	tag, localTag   string
+	copyIn          *copyIn
 }
 
 func (st *state) snapshot() snapshot {
 	return snapshot{
 		queueLen: len(st.queue), inTxn: st.inTxn, txnTenant: append([]string(nil), st.txnTenant...),
 		path: st.path, localPath: st.localPath, tag: st.tag, localTag: st.localTag,
+		copyIn: st.copyIn,
 	}
 }
 
@@ -137,6 +139,7 @@ func (st *state) reject(snap snapshot) {
 	}
 	st.inTxn, st.txnTenant = snap.inTxn, snap.txnTenant
 	st.path, st.localPath, st.tag, st.localTag = snap.path, snap.localPath, snap.tag, snap.localTag
+	st.copyIn = snap.copyIn // a COPY the database never received has no rows to read
 	// Everything registered in the current batch, including this message.
 	for _, n := range st.batchParsed {
 		delete(st.prepared, n)
@@ -149,6 +152,14 @@ func (st *state) reject(snap snapshot) {
 
 // gate observes one client message and decides whether it may be forwarded.
 func (a *Attributor) gate(s *proxy.Session, msg pgproto3.FrontendMessage) *proxy.Rejection {
+	switch msg.(type) {
+	case *pgproto3.CopyData:
+		a.onCopyFrontend(s, msg) // rows are read as they pass; the verdict comes at CopyDone
+		return nil
+	case *pgproto3.CopyFail:
+		a.onCopyFrontend(s, msg) // the client gave up: nothing ran, nothing to refuse
+		return nil
+	}
 	st := a.st(s)
 	st.mu.Lock()
 	snap := st.snapshot()
@@ -176,6 +187,7 @@ func (a *Attributor) gate(s *proxy.Session, msg pgproto3.FrontendMessage) *proxy
 	for _, ev := range evs {
 		if ev.Violation != "" {
 			rej = &proxy.Rejection{Code: "42501", Message: rejectionText(ev)}
+			_, rej.AbortCopy = msg.(*pgproto3.CopyDone)
 			break
 		}
 	}

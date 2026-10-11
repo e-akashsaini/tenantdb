@@ -167,7 +167,7 @@ A statement **violates** when it is:
 - `scan`: tenant data with no tenant or key filter,
 - a `conflict`: a different tenant than the connection's tag or the transaction's.
 
-`untenanted` statements and `nomatch` rows never violate. Things that can't be inspected are `unknown`: `COPY ... FROM STDIN` (tenants in the data stream), and legacy fast-path function calls (large-object calls such as `\lo_import`).
+`untenanted` statements and `nomatch` rows never violate. Things that can't be inspected are `unknown`: binary `COPY ... FROM STDIN` and legacy fast-path function calls (large-object calls such as `\lo_import`). In `block` mode a text or CSV `COPY ... FROM STDIN` is read as it streams and judged when the data ends; if a row names no tenant, or the tenants conflict, the proxy aborts the load (`CopyFail`), so PostgreSQL rolls it back and the session stays usable.
 
 Two role lists relax the policy:
 - `-strict-exempt=migrator,admin`: never held to the policy (migrations, admin tools, bulk `COPY` loads).

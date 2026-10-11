@@ -121,7 +121,9 @@ func TestCopyParserReadsTheTenantColumn(t *testing.T) {
 	}
 }
 
-func copyHarness() *harness {
+func copyHarness() *harness { return copyHarnessWith(StrictOptions{}) }
+
+func copyHarnessWith(opt StrictOptions) *harness {
 	sp := soundSpec()
 	sp.rows = append(sp.rows, tbl("public", "gen", 'r', "id", "tenant_id", "g")...)
 	for i := range sp.rows {
@@ -129,7 +131,7 @@ func copyHarness() *harness {
 			sp.rows[i].generated = true
 		}
 	}
-	return specHarness(sp, StrictOptions{})
+	return specHarness(sp, opt)
 }
 
 func (h *harness) copyIn(chunks ...string) {

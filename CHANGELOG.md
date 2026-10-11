@@ -11,7 +11,7 @@ All notable changes. The project follows [semantic versioning](https://semver.or
 - **Learned relationships**: a join the application runs (`a.x = b.y`, `b.y` unique) becomes a foreign key candidate, verified against the data before it is used.
 - **Row-level security**: policies are credited as an extra condition for roles that are subject to them (superuser, `BYPASSRLS`, owner and `FORCE` are handled; `SET ROLE` is tracked).
 - **Triggers** are analysed with `NEW`/`OLD` bound to the row's tenant; writes to tables with rules are flagged.
-- **`COPY ... FROM STDIN`** streams (text and CSV) are read, and the load is attributed to the tenants its rows name.
+- **`COPY ... FROM STDIN`** streams (text and CSV) are read, and the load is attributed to the tenants its rows name. In `block` mode the load is judged when the data ends and aborted with `CopyFail` (rolled back by PostgreSQL) if it violates the policy; binary streams are still refused up front.
 - **`EXECUTE`** of a literal or `format()` string inside functions is read.
 - PL/pgSQL bodies that `RETURN` a value, `RETURN NEXT/QUERY`, or assign variables are now readable (they used to be opaque).
 - Two occurrences of the same table joined on a unique column are the same row, and so the same tenant.

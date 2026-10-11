@@ -13,6 +13,13 @@ import (
 type Rejection struct {
 	Code    string // SQLSTATE, e.g. "42501"
 	Message string
+
+	// AbortCopy is set when the rejected message ends a COPY ... FROM STDIN
+	// (CopyDone). The database is waiting for the rest of the stream, so the
+	// proxy sends it a CopyFail carrying Message instead: the statement is
+	// rolled back and the database's own error and ReadyForQuery reach the
+	// client, which keeps the session usable.
+	AbortCopy bool
 }
 
 // Gate is an Observer that can also veto client messages. When the configured
@@ -116,6 +123,15 @@ func (s *Server) pumpClientGated(log *slog.Logger, sess *Session, gate Gate, bac
 		var rej *Rejection
 		if s.safeObserve(log, func() { rej = gate.Gate(sess, msg) }) && s.cfg.GateFailClosed {
 			rej = &Rejection{Code: "XX000", Message: "tenantdb: internal error while checking the statement; refusing to run it"}
+		}
+
+		if rej != nil && rej.AbortCopy {
+			log.Info("copy aborted", "code", rej.Code, "message", rej.Message)
+			s.stats.RejectedSoft.Add(1)
+			if !send(&pgproto3.CopyFail{Message: rej.Message}) {
+				return
+			}
+			continue
 		}
 
 		if rej != nil {

@@ -440,8 +440,17 @@ func TestFastPathFunctionCallIsUnknownAndBlockable(t *testing.T) {
 
 func TestCopyFromIsBlockedUnlessExempt(t *testing.T) {
 	h := specHarness(limitsSpec(), StrictOptions{Mode: StrictBlock})
-	if rej := h.gateQuery(`COPY orders FROM STDIN`); rej == nil {
+	// The rows decide: the statement goes through and the load is aborted at the
+	// end of the stream if some row names no tenant.
+	if rej := h.gateQuery(`COPY orders (id, tenant_id) FROM STDIN`); rej != nil {
+		t.Errorf("the verdict waits for the rows: %+v", rej)
+	}
+	h.gate(&pgproto3.CopyData{Data: []byte("1\t\\N\n")})
+	if rej := h.gate(&pgproto3.CopyDone{}); rej == nil || !rej.AbortCopy {
 		t.Error("bulk-loading rows of unknown tenants must be refused")
+	}
+	if rej := h.gateQuery(`COPY orders FROM STDIN WITH (FORMAT binary)`); rej == nil {
+		t.Error("a stream that cannot be read must be refused up front")
 	}
 	if rej := h.gateQuery(`COPY orders TO STDOUT`); rej == nil {
 		t.Error("an unfiltered export spans every tenant")
