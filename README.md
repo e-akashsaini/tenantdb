@@ -296,3 +296,7 @@ bench/docuseal/            run a real Rails app (DocuSeal) behind the proxy and 
 bench/compat/              the same operations through psycopg, asyncpg, node-postgres, SQLAlchemy, with and without a pooler
 bench/ops/e2e.sh           end-to-end check of config, logs, metrics and graceful shutdown against a real server
 ```
+
+## Licence
+
+Apache-2.0. See [LICENSE](LICENSE); third-party notices are in [NOTICE](NOTICE). Security reports: [SECURITY.md](SECURITY.md).

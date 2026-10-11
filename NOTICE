@@ -1,0 +1,25 @@
+tenantdb
+Copyright 2026 Akash Saini
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product includes software developed by others, used under their own
+licences. Their notices follow.
+
+github.com/jackc/pgx/v5               MIT   Copyright (c) 2013-2021 Jack Christensen
+github.com/jackc/puddle/v2            MIT   Copyright (c) 2018 Jack Christensen
+github.com/jackc/pgpassfile           MIT   Copyright (c) 2019 Jack Christensen
+github.com/jackc/pgservicefile        MIT   Copyright (c) 2020 Jack Christensen
+
+github.com/pganalyze/pg_query_go/v6   BSD-3-Clause
+    Copyright (c) 2015, Lukas Fittl <lukas@fittl.com>
+    Copyright (c) 2016-2025, Duboce Labs, Inc. (pganalyze) <team@pganalyze.com>
+    It embeds the PostgreSQL parser, which is released under the PostgreSQL
+    License; see the LICENSE file in that module.
+
+golang.org/x/text                     BSD-3-Clause   Copyright 2009 The Go Authors.
+golang.org/x/sync                     BSD-3-Clause   Copyright 2009 The Go Authors.
+google.golang.org/protobuf            BSD-3-Clause   Copyright (c) 2018 The Go Authors. All rights reserved.
+
+The full text of each licence is in the module's LICENSE file (for example
+`go mod download -json <module>` shows where Go keeps it).
