@@ -87,7 +87,7 @@ jobs:
           go-version-file: proxy/go.mod
           cache-dependency-path: proxy/go.sum
       - run: sudo apt-get update && sudo apt-get install -y postgresql-client
-      - run: bench/ops/e2e.sh
+      - run: bash bench/ops/e2e.sh
         env:
           PGHOST: 127.0.0.1
           PGPORT: "5432"
