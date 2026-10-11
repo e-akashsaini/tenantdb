@@ -164,3 +164,131 @@ func checkEvent(t *testing.T, e Event, sql string) {
 	}
 	_ = reflect.DeepEqual
 }
+
+// richSpec is a schema with views, triggers, rules and row-level security, so the
+// fuzzers reach the code that reads them.
+func richSpec() catSpec {
+	sp := viewSpec()
+	sp.rows = append(sp.rows, tbl("public", "audit_log", 'r', "id", "tenant_id", "msg")...)
+	sp.unique["public.audit_log"] = []string{"id"}
+	tf := func(name, src string) *FuncDef {
+		return &FuncDef{Schema: "public", Name: name, Lang: "plpgsql", Kind: 'f', Src: src, Ret: "trigger"}
+	}
+	sp.funcs = append(sp.funcs,
+		tf("audit_row", `BEGIN INSERT INTO audit_log (tenant_id, msg) VALUES (NEW.tenant_id, 'x'); RETURN NEW; END`),
+		tf("wipe", `BEGIN DELETE FROM audit_log WHERE msg = 'x'; RETURN NEW; END`))
+	sp.triggers = map[string][]trigRow{
+		"public.items":     {{typ: trigInsert | trigUpdate, fn: "public.audit_row"}},
+		"public.customers": {{typ: trigDelete, fn: "public.wipe"}},
+	}
+	sp.ruled = map[string]bool{"public.countries": true}
+	sp.rls = []string{"public.orders"}
+	sp.rlsd = &rlsData{
+		roles:    map[string]roleInfo{"app": {}, "admin": {super: true}},
+		members:  map[string][]string{},
+		tables:   map[string]rlsTable{"public.orders": {owner: "owner"}},
+		policies: map[string][]policy{"public.orders": {{cmd: '*', permissive: true, qual: "(tenant_id = current_setting('app.tenant'::text))"}}},
+	}
+	return sp
+}
+
+func FuzzAttributorRich(f *testing.F) {
+	fuzzSeeds(f)
+	for _, s := range []string{
+		`SELECT * FROM acme_orders WHERE amount > 5`, `SELECT * FROM cur_orders`, `SELECT * FROM orders_t WHERE t = 't2'`,
+		`SELECT * FROM big_orders`, `SELECT * FROM order_customer WHERE tid = 't3'`, `SELECT * FROM limited`,
+		`INSERT INTO items (id, tenant_id, order_id) VALUES (1, 't1', 2)`, `DELETE FROM customers WHERE tenant_id = 't1'`,
+		`UPDATE items SET sku = 'a' WHERE order_id IN (SELECT id FROM orders WHERE customer_id IN (SELECT id FROM customers WHERE tenant_id = 't1'))`,
+		`SET ROLE admin`, `RESET ROLE`, `SET LOCAL ROLE app`, `SET SESSION AUTHORIZATION admin`, `SET app.tenant = 't2'`,
+		`SELECT * FROM orders`, `UPDATE orders SET status = 'x'`, `COPY orders (id, tenant_id) FROM STDIN`,
+		`COPY orders FROM STDIN WITH (FORMAT csv, HEADER true, DELIMITER ';')`, `COPY audit_log FROM STDIN`,
+		`SELECT * FROM orders WHERE customer_id = ANY (SELECT id FROM customers)`,
+		`SELECT * FROM items i JOIN audit_log a ON a.id = i.id WHERE a.tenant_id = 't1'`,
+	} {
+		f.Add(s)
+	}
+	cat := richSpec().build()
+	f.Fuzz(func(t *testing.T, sql string) {
+		var events []Event
+		a := New(Options{TenantColumns: []string{"tenant_id"}, KeyColumns: []string{"id"}, Catalog: cat,
+			Strict: StrictOptions{Mode: StrictAlert}}, func(e Event) { events = append(events, e) })
+		s := &proxy.Session{ID: 1, User: "app", DB: "d"}
+		a.Cache().Put("public.orders", "id", "1", "t1")
+		a.OnFrontend(s, &pgproto3.Query{String: `SET app.tenant = 't1'`})
+		a.OnBackend(s, &pgproto3.CommandComplete{CommandTag: []byte("SET")})
+		a.OnBackend(s, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+
+		a.OnFrontend(s, &pgproto3.Query{String: sql})
+		// a COPY waits for its data; feed some and finish
+		a.OnFrontend(s, &pgproto3.CopyData{Data: []byte("1\tt1\tx\n2\tt2\ty\n")})
+		a.OnFrontend(s, &pgproto3.CopyDone{})
+		a.OnBackend(s, &pgproto3.CommandComplete{CommandTag: []byte("OK")})
+		a.OnBackend(s, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+		a.OnFrontend(s, &pgproto3.Parse{Name: "p", Query: sql})
+		a.OnFrontend(s, &pgproto3.Bind{PreparedStatement: "p", Parameters: [][]byte{[]byte("t1"), []byte("1"), nil}})
+		a.OnFrontend(s, &pgproto3.Execute{})
+		a.OnFrontend(s, &pgproto3.Sync{})
+		a.OnBackend(s, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+		a.OnFrontend(s, &pgproto3.Query{String: `RESET ROLE`})
+		a.OnBackend(s, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+		a.OnFrontend(s, &pgproto3.Query{String: `SELECT * FROM public.customers WHERE tenant_id = 'after'`})
+
+		for _, e := range events {
+			checkEvent(t, e, sql)
+		}
+		if len(events) == 0 {
+			t.Fatalf("no events at all for %.80q", sql)
+		}
+	})
+}
+
+func FuzzCopyParser(f *testing.F) {
+	f.Add([]byte("1\tacme\tx\n2\tglobex\ty\n"), byte('\t'), false, false, uint8(3))
+	f.Add([]byte("id,tenant,note\n1,\"a,b\",x\n2,\"say \"\"hi\"\"\",y\n"), byte(','), true, true, uint8(1))
+	f.Add([]byte(`\N`+"\t"+`\\`+"\t"+`\x41`+"\n"+`\.`+"\nafter\n"), byte('\t'), false, false, uint8(7))
+	f.Add([]byte("a|\"b\nc\"|d\r\n"), byte('|'), true, false, uint8(2))
+	f.Fuzz(func(t *testing.T, data []byte, delim byte, csv, header bool, chunk uint8) {
+		if delim == '\n' || delim == '\r' || delim == '\\' || delim == '"' || delim == 0 {
+			delim = ','
+		}
+		sp := &CopySpec{Format: "text", Delim: delim, Null: `\N`, Quote: '"', Escape: '"', Header: header}
+		if csv {
+			sp.Format, sp.Null = "csv", ""
+		}
+		rows := 0
+		p := newCopyParser(sp, 1, func(v string, null, ok bool) {
+			rows++
+			if !ok && (v != "" || null) {
+				t.Fatalf("a row that could not be read carries a value: %q %v", v, null)
+			}
+			if len(v) > copyMaxField {
+				t.Fatalf("a value longer than the cap: %d", len(v))
+			}
+		})
+		n := int(chunk%16) + 1
+		for b := data; len(b) > 0; {
+			k := n
+			if k > len(b) {
+				k = len(b)
+			}
+			p.Write(b[:k])
+			b = b[k:]
+		}
+		p.Close()
+		// reading the same bytes in one piece gives the same rows
+		var one, split []copyRow
+		collect := func(dst *[]copyRow) *copyParser {
+			return newCopyParser(sp, 1, func(v string, null, ok bool) { *dst = append(*dst, copyRow{v, null, ok}) })
+		}
+		a, b := collect(&one), collect(&split)
+		a.Write(data)
+		a.Close()
+		for i := 0; i < len(data); i++ {
+			b.Write(data[i : i+1])
+		}
+		b.Close()
+		if !reflect.DeepEqual(one, split) {
+			t.Fatalf("chunking changed the result:\n whole %+v\n bytes %+v\n for %q", one, split, data)
+		}
+	})
+}
