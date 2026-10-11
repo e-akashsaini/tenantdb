@@ -15,6 +15,7 @@ All notable changes. The project follows [semantic versioning](https://semver.or
 - **`EXECUTE`** of a literal or `format()` string inside functions is read.
 - PL/pgSQL bodies that `RETURN` a value, `RETURN NEXT/QUERY`, or assign variables are now readable (they used to be opaque).
 - Two occurrences of the same table joined on a unique column are the same row, and so the same tenant.
+- Events leave a session in the order its statements were sent, even when an earlier one waits on a row lookup.
 
 ### Operations
 - Prometheus metrics, `/healthz`, `/readyz`, `/version` (`-admin-addr`).

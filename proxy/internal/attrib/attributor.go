@@ -298,6 +298,11 @@ type state struct {
 	gather   bool    // Gate is collecting events instead of emitting them
 	gathered []Event // events produced while gathering
 
+	// Events leave a session in the order its statements arrived. A statement
+	// waiting on a lookup holds a slot; the events after it queue behind it.
+	out  []*outSlot
+	fill *outSlot // the slot the event being settled belongs to
+
 	// Names registered since the last Sync/Flush, so a rejected batch can be
 	// forgotten (the database never saw it).
 	batchParsed, batchBound []string
@@ -1081,12 +1086,26 @@ func (a *Attributor) handle(s *proxy.Session, st *state, x Stmt, pt *portal) {
 		} else {
 			gen := st.txnGen
 			needs := r.cr.needs
+			slot := &outSlot{}
+			st.out = append(st.out, slot)
 			go func() {
 				owners, failed := a.lookupOwners(needs)
 				st.mu.Lock()
 				defer st.mu.Unlock()
+				defer func() {
+					// Whatever happens, the events queued behind this one must not wait forever.
+					if !slot.ready {
+						st.fill = nil
+						slot.ev, slot.ready = ev, true
+						slot.ev.Source = SourceUnknown
+						slot.ev.Violation = a.violation(slot.ev)
+						a.flush(st)
+					}
+				}()
 				// If the transaction ended while we waited, its tenant no longer applies.
+				st.fill = slot
 				a.finishLookup(st, ev, x, pt, owners, failed, gen == st.txnGen)
+				st.fill = nil
 			}()
 		}
 		return

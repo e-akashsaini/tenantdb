@@ -90,7 +90,33 @@ func (a *Attributor) emit(st *state, ev Event) {
 		st.gathered = append(st.gathered, ev)
 		return
 	}
-	a.onEvent(ev)
+	switch {
+	case st.fill != nil:
+		st.fill.ev, st.fill.ready = ev, true
+		st.fill = nil
+		a.flush(st)
+	case len(st.out) > 0:
+		st.out = append(st.out, &outSlot{ev: ev, ready: true})
+	default:
+		a.onEvent(ev)
+	}
+}
+
+// outSlot is a place in a session's event order. It is empty until the lookup
+// the statement waits for has finished.
+type outSlot struct {
+	ev    Event
+	ready bool
+}
+
+// flush delivers the events at the head of the queue that are ready.
+// st.mu must be held.
+func (a *Attributor) flush(st *state) {
+	for len(st.out) > 0 && st.out[0].ready {
+		ev := st.out[0].ev
+		st.out = st.out[1:]
+		a.onEvent(ev)
+	}
 }
 
 // Observer returns what to hand the proxy. In block mode that is a Gate, which
