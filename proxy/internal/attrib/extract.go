@@ -225,12 +225,34 @@ func (e *Extractor) addValue(n *pg_query.Node, vals map[string]bool, params map[
 	}
 }
 
-// unwrap strips casts such as 'acme'::text or $1::uuid.
+// unwrap strips casts such as 'acme'::text or $1::uuid. A cast that changes the
+// value (varchar(4) cuts it short, char(n) pads it, name cuts at 63 bytes) is
+// kept: what is compared is no longer what the text says.
 func unwrap(n *pg_query.Node) *pg_query.Node {
 	for n != nil && n.GetTypeCast() != nil {
-		n = n.GetTypeCast().Arg
+		tc := n.GetTypeCast()
+		if changesValue(tc.TypeName) {
+			return n
+		}
+		n = tc.Arg
 	}
 	return n
+}
+
+func changesValue(tn *pg_query.TypeName) bool {
+	if tn == nil {
+		return true
+	}
+	if len(tn.Typmods) > 0 {
+		return true
+	}
+	if len(tn.Names) > 0 {
+		switch strings.ToLower(tn.Names[len(tn.Names)-1].GetString_().GetSval()) {
+		case "name", "char", "bpchar":
+			return true
+		}
+	}
+	return false
 }
 
 func walk(m protoreflect.Message, fn func(proto.Message) bool) {

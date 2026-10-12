@@ -284,7 +284,10 @@ type state struct {
 
 	temps    map[string]*tempTable // this session's temporary tables
 	txnTemps []string              // the ones created in the current transaction
-	sqlPrep  map[string]Stmt       // SQL-level PREPAREd statements
+	// txnLearned: what the cache was taught during the current transaction, to be
+	// forgotten if it does not commit.
+	txnLearned []cacheKey
+	sqlPrep    map[string]Stmt // SQL-level PREPAREd statements
 
 	prepared map[string]*prepared
 	portals  map[string]*portal
@@ -514,10 +517,15 @@ func (a *Attributor) OnBackend(s *proxy.Session, msg pgproto3.BackendMessage) {
 		}
 		if p := st.pop(); p != nil {
 			if p.stmt.Txn == txnEnd {
-				st.dropTxnTemps(string(m.CommandTag) == "COMMIT") // a rollback, or a commit that turned into one, keeps nothing
+				if string(m.CommandTag) == "COMMIT" {
+					a.txnCommitted(st)
+				} else {
+					a.txnRolledBack(st) // a rollback, or a commit that turned into one, keeps nothing
+				}
 			}
 			for _, l := range p.learn {
 				a.cache.Put(l.key.table, l.key.col, l.key.val, l.tenant)
+				st.txnLearned = append(st.txnLearned, l.key)
 			}
 			for _, k := range p.forget {
 				a.cache.Delete(k.table, k.col, k.val)
@@ -542,13 +550,13 @@ func (a *Attributor) OnBackend(s *proxy.Session, msg pgproto3.BackendMessage) {
 		st.pop()
 	case *pgproto3.ErrorResponse:
 		st.queue = nil
-		st.dropTxnTemps(false) // the statement, or the whole transaction, was rolled back
-		a.endCopy(st, false)   // the load stopped: what it had named so far is what it addressed
+		a.txnRolledBack(st)  // the statement, or the whole transaction, was rolled back
+		a.endCopy(st, false) // the load stopped: what it had named so far is what it addressed
 	case *pgproto3.ReadyForQuery:
 		st.queue = nil
 		a.endCopy(st, false)
 		if m.TxStatus == 'I' {
-			st.dropTxnTemps(true) // the implicit transaction committed
+			a.txnCommitted(st) // the implicit transaction committed
 			st.resetTxn()
 		} else {
 			st.inTxn = true
@@ -1016,6 +1024,22 @@ func (a *Attributor) registerTemp(st *state, reg *tempReg) {
 	st.txnTemps = append(st.txnTemps, def.Name)
 }
 
+// txnCommitted: what the transaction created is permanent now (except ON COMMIT DROP tables).
+func (a *Attributor) txnCommitted(st *state) {
+	st.dropTxnTemps(true)
+	st.txnLearned = nil
+}
+
+// txnRolledBack forgets what a transaction that did not commit taught the cache
+// and the temporary tables it made.
+func (a *Attributor) txnRolledBack(st *state) {
+	st.dropTxnTemps(false)
+	for _, k := range st.txnLearned {
+		a.cache.Delete(k.table, k.col, k.val)
+	}
+	st.txnLearned = nil
+}
+
 // dropTxnTemps forgets the temporary tables created in the current transaction:
 // all of them (a rollback, an error), or only those made ON COMMIT DROP (a
 // commit). A name that is forgotten means the real table again, or an unknown
@@ -1087,7 +1111,7 @@ func (a *Attributor) handle(s *proxy.Session, st *state, x Stmt, pt *portal) {
 		st.temps, st.txnTemps = map[string]*tempTable{}, nil
 	}
 	if x.RollbackTo {
-		st.dropTxnTemps(false) // part of the transaction is undone: which temporary tables survive is not known
+		a.txnRolledBack(st) // part of the transaction is undone: what survives is not known
 	}
 	switch x.Txn {
 	case txnBegin:

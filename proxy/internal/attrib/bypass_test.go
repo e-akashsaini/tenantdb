@@ -224,3 +224,118 @@ func TestTagStillAttributesIdentifyingLookups(t *testing.T) {
 		}
 	}
 }
+
+// A cast that shortens or pads a value changes what is compared; only casts that
+// leave the value alone can be looked through.
+func TestLossyCastsAreNotLookedThrough(t *testing.T) {
+	h := soundHarness()
+	for _, sql := range []string{
+		`SELECT * FROM orders WHERE tenant_id::varchar(4) = 'acme'`,
+		`SELECT * FROM orders WHERE tenant_id::varchar(1) = 'z'`,
+		`SELECT * FROM orders WHERE tenant_id = 'acme'::varchar(2)`,
+		`SELECT * FROM orders WHERE tenant_id::char(1) = 't'`,
+		`SELECT * FROM orders WHERE tenant_id::name = 't1'`,
+		`SELECT * FROM orders WHERE id::varchar(1) = '5'`,
+	} {
+		e := h.attributed(t, sql)
+		switch e.Source {
+		case SourceExplicit, SourceCache, SourceLookup, SourceNoMatch, SourceDerived:
+			t.Errorf("%s\n  was credited: %s %v", sql, e.Source, e.Tenants)
+		}
+		if h2 := strictHarness(StrictOptions{Mode: StrictBlock}); h2.gateQuery(sql) == nil {
+			t.Errorf("%s\n  was allowed in block mode", sql)
+		}
+	}
+}
+
+func TestHarmlessCastsAreStillLookedThrough(t *testing.T) {
+	h := soundHarness()
+	for _, sql := range []string{
+		`SELECT * FROM orders WHERE tenant_id = 't1'::text`,
+		`SELECT * FROM orders WHERE tenant_id = 't1'::varchar`,
+		`SELECT * FROM orders WHERE tenant_id::text = 't1'`,
+		`SELECT * FROM orders WHERE tenant_id = CAST('t1' AS text)`,
+	} {
+		e := h.attributed(t, sql)
+		if !confinedTo(e, "t1") {
+			t.Errorf("%s\n  got %s %v", sql, e.Source, e.Tenants)
+		}
+	}
+}
+
+// What an INSERT teaches the cache is only true if the transaction commits.
+func TestRolledBackInsertsAreForgotten(t *testing.T) {
+	for name, finish := range map[string]func(h *harness){
+		"ROLLBACK": func(h *harness) {
+			h.query(`ROLLBACK`)
+			h.reply(nil, nil, "ROLLBACK")
+			h.rfq('I')
+		},
+		"an error": func(h *harness) {
+			h.query(`SELECT 1/0`)
+			h.a.OnBackend(h.s, &pgproto3.ErrorResponse{Code: "22012", Message: "division by zero"})
+			h.rfq('E')
+			h.query(`ROLLBACK`)
+			h.reply(nil, nil, "ROLLBACK")
+			h.rfq('I')
+		},
+		"ROLLBACK TO": func(h *harness) {
+			h.query(`ROLLBACK TO SAVEPOINT s`)
+			h.reply(nil, nil, "ROLLBACK")
+			h.rfq('T')
+			h.query(`COMMIT`)
+			h.reply(nil, nil, "COMMIT")
+			h.rfq('I')
+		},
+		"a multi-statement query that fails": nil,
+	} {
+		h := soundHarness()
+		if finish == nil {
+			// INSERT ...; SELECT 1/0 in one Query is one implicit transaction
+			h.query(`INSERT INTO orders (id, tenant_id) VALUES (30, 't1'); SELECT 1/0`)
+			h.reply(nil, nil, "INSERT 0 1")
+			h.a.OnBackend(h.s, &pgproto3.ErrorResponse{Code: "22012", Message: "division by zero"})
+			h.rfq('I')
+		} else {
+			h.query(`BEGIN`)
+			h.reply(nil, nil, "BEGIN")
+			h.rfq('T')
+			h.query(`INSERT INTO orders (id, tenant_id) VALUES (30, 't1')`)
+			h.reply(nil, nil, "INSERT 0 1")
+			h.rfq('T')
+			if name == "ROLLBACK TO" {
+				h.query(`SAVEPOINT s`)
+				h.reply(nil, nil, "SAVEPOINT")
+				h.rfq('T')
+				h.query(`INSERT INTO orders (id, tenant_id) VALUES (31, 't1')`)
+				h.reply(nil, nil, "INSERT 0 1")
+				h.rfq('T')
+			}
+			finish(h)
+		}
+		// row 31 / 30 was never committed
+		for _, id := range []string{"30", "31"} {
+			if name == "ROLLBACK TO" && id == "30" {
+				continue // inserted before the savepoint: it does survive the commit; forgetting it is only cautious
+			}
+			e := h.attributed(t, `SELECT * FROM orders WHERE id = `+id)
+			if e.Source == SourceCache {
+				t.Errorf("%s: id %s is still in the cache after the transaction ended without it", name, id)
+			}
+		}
+	}
+	// ... and a committed one stays
+	h := soundHarness()
+	h.query(`BEGIN`)
+	h.reply(nil, nil, "BEGIN")
+	h.rfq('T')
+	h.query(`INSERT INTO orders (id, tenant_id) VALUES (40, 't1')`)
+	h.reply(nil, nil, "INSERT 0 1")
+	h.rfq('T')
+	h.query(`COMMIT`)
+	h.reply(nil, nil, "COMMIT")
+	h.rfq('I')
+	if e := h.attributed(t, `SELECT * FROM orders WHERE id = 40`); e.Source != SourceCache {
+		t.Errorf("a committed insert should be remembered: %+v", e)
+	}
+}
