@@ -16,6 +16,12 @@ type TempDef struct {
 	OnCommitDrop bool       // ON COMMIT DROP: gone when the transaction ends
 }
 
+// SavepointOp is SAVEPOINT (Op 's'), RELEASE ('r') or ROLLBACK TO ('b').
+type SavepointOp struct {
+	Op   byte
+	Name string
+}
+
 // SQLPrepare is a SQL-level PREPARE name AS query.
 type SQLPrepare struct {
 	Name string
@@ -116,8 +122,14 @@ func (e *Extractor) stmtFor(text string, node *pg_query.Node) Stmt {
 		case pg_query.TransactionStmtKind_TRANS_STMT_COMMIT, pg_query.TransactionStmtKind_TRANS_STMT_ROLLBACK,
 			pg_query.TransactionStmtKind_TRANS_STMT_PREPARE:
 			st.Txn = txnEnd
+			st.TxnRollback = n.TransactionStmt.Kind == pg_query.TransactionStmtKind_TRANS_STMT_ROLLBACK
 		case pg_query.TransactionStmtKind_TRANS_STMT_ROLLBACK_TO:
 			st.RollbackTo = true
+			st.SP = &SavepointOp{Op: 'b', Name: n.TransactionStmt.SavepointName}
+		case pg_query.TransactionStmtKind_TRANS_STMT_SAVEPOINT:
+			st.SP = &SavepointOp{Op: 's', Name: n.TransactionStmt.SavepointName}
+		case pg_query.TransactionStmtKind_TRANS_STMT_RELEASE:
+			st.SP = &SavepointOp{Op: 'r', Name: n.TransactionStmt.SavepointName}
 		}
 	}
 	if st.DML {

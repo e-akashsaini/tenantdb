@@ -145,6 +145,9 @@ func (e *Extractor) shape(n *pg_query.Node, st *Stmt) {
 			for _, t := range u.TargetList {
 				name := strings.ToLower(t.GetResTarget().GetName())
 				st.SetCols = append(st.SetCols, name)
+				if op := e.operand(t.GetResTarget().Val); op.Set {
+					st.SetVals = append(st.SetVals, KeyOp{Col: name, Op: op})
+				}
 				if e.keys[name] || e.cols[name] {
 					st.SetsKey = true
 				}

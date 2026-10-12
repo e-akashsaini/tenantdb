@@ -66,7 +66,7 @@ jobs:
       - name: random statements, run for real, compared with what was claimed
         run: |
           for seed in 101 102 103 104; do
-            TENANTDB_FUZZ_N=6000 TENANTDB_FUZZ_SEED=$seed go test -count=1 -run 'TestDifferential|TestCopyParserAgreesWithPostgres' ./internal/attrib
+            TENANTDB_FUZZ_N=6000 TENANTDB_FUZZ_SEED=$seed go test -count=1 -run 'TestDifferential|TestCopyParserAgreesWithPostgres|TestSessionFuzz' ./internal/attrib
           done
 
   e2e:

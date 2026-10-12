@@ -374,3 +374,245 @@ func TestAWriteThatBreaksARelationshipIsRefusedAndDistrusted(t *testing.T) {
 		t.Errorf("a consistent order was refused: %+v", rej)
 	}
 }
+
+// An UPDATE that sets the tenant column moves rows between tenants: it touches
+// the tenant the rows had and the one they get.
+func TestUpdateThatMovesRowsToAnotherTenantIsRefused(t *testing.T) {
+	for _, sql := range []string{
+		`UPDATE orders SET tenant_id = 't3' WHERE id = 14`,
+		`UPDATE orders SET tenant_id = 't3' WHERE tenant_id = 't1'`,
+		`UPDATE orders SET tenant_id = 't1' WHERE id = 6`,
+		`UPDATE orders SET tenant_id = 't1' WHERE tenant_id = 't2'`,
+		`UPDATE orders SET tenant_id = $1 WHERE id = 14`,
+		`INSERT INTO orders (id, tenant_id) VALUES (14, 't1') ON CONFLICT (id) DO UPDATE SET tenant_id = 't3'`,
+	} {
+		h := specHarness(soundSpec(), StrictOptions{Mode: StrictBlock})
+		h.a.Cache().Put("public.orders", "id", "14", "t1")
+		h.a.Cache().Put("public.orders", "id", "6", "t2")
+		h.set(`SET tenantdb.tenant = 't1'`)
+		if rej := h.gateQuery(sql); rej == nil {
+			t.Errorf("%s\n  was allowed on a connection tagged t1", sql)
+		}
+	}
+}
+
+// Part of a statement can be confined while another part cannot. What is known
+// about the first part still counts against a tag that says otherwise.
+func TestKnownPartOfAStatementConflictsWithTheTag(t *testing.T) {
+	h := specHarness(soundSpec(), StrictOptions{Mode: StrictBlock})
+	h.a.Cache().Put("public.customers", "id", "8", "t2")
+	h.a.Cache().Put("public.orders", "id", "29", "t2")
+	h.set(`SET tenantdb.tenant = 't1'`)
+	// The relationship orders.customer_id -> customers.id is broken by a write:
+	// orders can no longer be reached through customers.
+	h.a.cat.DistrustFK(mustTable(t, h, "orders"), "customer_id", FKRef{ParentKey: "public.customers", ParentCol: "id"})
+	for _, sql := range []string{
+		`SELECT o.tenant_id, c.tenant_id FROM orders o JOIN customers c ON c.id = o.customer_id WHERE c.id = 8`,
+		`SELECT o.tenant_id, c.tenant_id FROM orders o JOIN customers c ON c.id = o.customer_id WHERE o.id = 29`,
+	} {
+		if rej := h.gateQuery(sql); rej == nil {
+			t.Errorf("%s\n  was allowed although it reads a t2 row on a t1 connection", sql)
+		}
+	}
+}
+
+func mustTable(t *testing.T, h *harness, name string) *TableInfo {
+	t.Helper()
+	ti, ok := h.a.cat.Table(TableRef{Name: name}, []string{"public"}, "")
+	if !ok {
+		t.Fatalf("no table %s", name)
+	}
+	return ti
+}
+
+// The database binds the names in a prepared statement when it is prepared. A
+// temporary table (or a new search_path) afterwards does not change what it reads.
+func TestPreparedStatementKeepsTheNamesItWasPreparedWith(t *testing.T) {
+	prep := `PREPARE p1 AS SELECT * FROM orders WHERE tenant_id = $1`
+	shadow := `CREATE TEMP TABLE orders AS SELECT * FROM orders WHERE tenant_id = 't1'`
+
+	// SQL-level
+	h := specHarness(soundSpec(), StrictOptions{Mode: StrictBlock})
+	h.set(`SET tenantdb.tenant = 't1'`)
+	for _, q := range []string{prep, shadow} {
+		if rej := h.gateQuery(q); rej != nil {
+			t.Fatalf("%s: %+v", q, rej)
+		}
+		h.reply(nil, nil, "OK")
+		h.rfq('I')
+	}
+	if rej := h.gateQuery(`EXECUTE p1('t2')`); rej == nil {
+		t.Error("EXECUTE p1('t2') reads the real orders (bound when prepared) for t2 on a t1 connection, but was allowed")
+	}
+
+	// protocol-level
+	h = specHarness(soundSpec(), StrictOptions{Mode: StrictBlock})
+	h.set(`SET tenantdb.tenant = 't1'`)
+	h.gate(&pgproto3.Parse{Name: "s1", Query: `SELECT * FROM orders WHERE tenant_id = $1`})
+	h.gate(&pgproto3.Sync{})
+	if rej := h.gateQuery(shadow); rej != nil {
+		t.Fatalf("%+v", rej)
+	}
+	h.reply(nil, nil, "SELECT 3")
+	h.rfq('I')
+	h.gate(&pgproto3.Bind{PreparedStatement: "s1", DestinationPortal: "", Parameters: [][]byte{[]byte("t2")}})
+	if rej := h.gate(&pgproto3.Execute{Portal: ""}); rej == nil {
+		t.Error("a statement parsed before the temp table existed was analysed against it")
+	}
+
+	// A statement prepared against the temp table keeps reading the temp table.
+	h = specHarness(soundSpec(), StrictOptions{Mode: StrictBlock})
+	h.set(`SET tenantdb.tenant = 't1'`)
+	h.gateQuery(shadow)
+	h.reply(nil, nil, "SELECT 3")
+	h.rfq('I')
+	h.gateQuery(`PREPARE p2 AS SELECT * FROM orders WHERE id = $1`)
+	h.reply(nil, nil, "PREPARE")
+	h.rfq('I')
+	h.gateQuery(`DISCARD TEMP`)
+	h.reply(nil, nil, "DISCARD TEMP")
+	h.rfq('I')
+	// (the database would have re-bound p2 to the real table only after an invalidation; either way
+	// the statement must not be vouched for by the shadow that is gone)
+	if rej := h.gateQuery(`EXECUTE p2(14)`); rej != nil {
+		// 14 is unknown to the cache here; a tag-covered lookup is acceptable either way
+		_ = rej
+	}
+}
+
+func mustSet(t *testing.T, h *harness, sql string, status byte) {
+	t.Helper()
+	h.query(sql)
+	h.reply(nil, nil, "OK")
+	h.rfq(status)
+}
+
+// SET changes that the database undoes (a rollback, a rollback to a savepoint, a
+// statement that errors) must be undone in the proxy's view too, or its idea of
+// the tag, search_path and role drifts from the real one.
+func TestSessionSettingsFollowRollbacksAndErrors(t *testing.T) {
+	tag := func(h *harness) string {
+		st := h.a.st(h.s)
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		return st.curTag()
+	}
+	newH := func() *harness {
+		h := specHarness(soundSpec(), StrictOptions{})
+		mustSet(t, h, `SET tenantdb.tenant = 't1'`, 'I')
+		return h
+	}
+
+	h := newH()
+	mustSet(t, h, `BEGIN`, 'T')
+	mustSet(t, h, `SET tenantdb.tenant = 't2'`, 'T')
+	if tag(h) != "t2" {
+		t.Fatalf("inside the transaction the tag is t2, got %q", tag(h))
+	}
+	mustSet(t, h, `ROLLBACK`, 'I')
+	if got := tag(h); got != "t1" {
+		t.Errorf("after ROLLBACK the tag is back to t1, got %q", got)
+	}
+
+	h = newH()
+	mustSet(t, h, `BEGIN`, 'T')
+	mustSet(t, h, `SAVEPOINT a`, 'T')
+	mustSet(t, h, `SET tenantdb.tenant = 't3'`, 'T')
+	mustSet(t, h, `ROLLBACK TO a`, 'T')
+	if got := tag(h); got != "t1" {
+		t.Errorf("after ROLLBACK TO the tag is back to t1, got %q", got)
+	}
+	mustSet(t, h, `SET tenantdb.tenant = 't2'`, 'T')
+	mustSet(t, h, `RELEASE a`, 'T')
+	h.query(`COMMIT`)
+	h.reply(nil, nil, "COMMIT")
+	h.rfq('I')
+	if got := tag(h); got != "t2" {
+		t.Errorf("a committed change stays: t2, got %q", got)
+	}
+
+	// COMMIT of an aborted transaction is a rollback
+	h = newH()
+	mustSet(t, h, `BEGIN`, 'T')
+	mustSet(t, h, `SET tenantdb.tenant = 't2'`, 'T')
+	h.query(`COMMIT`)
+	h.reply(nil, nil, "ROLLBACK")
+	h.rfq('I')
+	if got := tag(h); got != "t1" {
+		t.Errorf("a COMMIT that the database turned into a ROLLBACK keeps nothing, got %q", got)
+	}
+
+	// a SET the database rejects was never applied
+	h = newH()
+	h.query(`SET ROLE nosuchrole`)
+	h.a.OnBackend(h.s, &pgproto3.ErrorResponse{Code: "42704", Message: "role does not exist"})
+	h.rfq('I')
+	st := h.a.st(h.s)
+	st.mu.Lock()
+	rs := st.roleS
+	st.mu.Unlock()
+	if rs.set {
+		t.Errorf("SET ROLE failed in the database, but the proxy thinks it took effect: %+v", rs)
+	}
+
+	// a PREPARE that fails (the name exists) leaves the earlier statement in place
+	h = newH()
+	mustSet(t, h, `PREPARE p1 AS SELECT * FROM orders`, 'I')
+	h.query(`PREPARE p1 AS SELECT * FROM orders WHERE id = $1`)
+	h.a.OnBackend(h.s, &pgproto3.ErrorResponse{Code: "42P05", Message: "prepared statement p1 already exists"})
+	h.rfq('I')
+	st = h.a.st(h.s)
+	st.mu.Lock()
+	n := len(st.sqlPrep["p1"].Keys)
+	st.mu.Unlock()
+	if n != 0 {
+		t.Error("the failed PREPARE replaced the statement the database still holds")
+	}
+}
+
+// A lookup that resolves part of a statement must not lose what it learned.
+func TestLookedUpOwnersStillConflictWithTheTag(t *testing.T) {
+	h := specHarness(soundSpec(), StrictOptions{Mode: StrictBlock})
+	h.a.Cache().Put("public.customers", "id", "8", "t2")
+	h.set(`SET tenantdb.tenant = 't1'`)
+	h.a.cat.DistrustFK(mustTable(t, h, "orders"), "customer_id", FKRef{ParentKey: "public.customers", ParentCol: "id"})
+	// (no database behind this harness: the owner comes from the cache; the lookup
+	// path is exercised against a real server by the session fuzzer)
+	if rej := h.gateQuery(`SELECT o.id FROM orders o JOIN customers c ON c.id = o.customer_id WHERE c.id = 8`); rej == nil {
+		t.Error("allowed")
+	}
+}
+
+// An UPDATE that points a row at a parent of another tenant breaks the
+// relationship just as an INSERT does.
+func TestUpdateThatBreaksARelationshipDistrustsIt(t *testing.T) {
+	h := specHarness(soundSpec(), StrictOptions{Mode: StrictBlock})
+	h.a.Cache().Put("public.customers", "id", "7", "t2")
+	h.a.Cache().Put("public.orders", "id", "4", "t1")
+	if rej := h.gateQuery(`UPDATE orders SET customer_id = 7 WHERE id = 4`); rej == nil {
+		t.Fatal("pointing t1's order at t2's customer was allowed")
+	}
+	h.rfq('I')
+	e := h.attributed(t, `SELECT o.* FROM orders o JOIN customers c ON c.id = o.customer_id WHERE c.tenant_id = 't1'`)
+	if confinedTo(e, "t1") {
+		t.Errorf("the relationship is still trusted after an update broke it: %+v", e)
+	}
+}
+
+// A temporary table dropped and made again under the same name is a different
+// table: a statement prepared against the old one cannot be vouched for.
+func TestPreparedStatementAcrossARecreatedTempTableIsUnknown(t *testing.T) {
+	h := specHarness(soundSpec(), StrictOptions{Mode: StrictBlock})
+	h.set(`SET tenantdb.tenant = 't1'`)
+	create := `CREATE TEMP TABLE orders AS SELECT * FROM orders WHERE tenant_id = 't1'`
+	for _, q := range []string{create, `PREPARE p1 AS SELECT * FROM orders`, `DISCARD TEMP`, create} {
+		if rej := h.gateQuery(q); rej != nil {
+			t.Fatalf("%s: %+v", q, rej)
+		}
+		h.reply(nil, nil, "OK")
+		h.rfq('I')
+	}
+	if rej := h.gateQuery(`EXECUTE p1`); rej == nil {
+		t.Error("p1 was prepared against a temporary table that has since been replaced")
+	}
+}

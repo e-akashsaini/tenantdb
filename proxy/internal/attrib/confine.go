@@ -82,7 +82,9 @@ type confResult struct {
 	// loose: some tenant table is limited only by a condition that names no
 	// tenant and no particular rows (id > 0, tenant_id <> 'a', LIKE ...). It
 	// reads an unknown number of tenants.
-	loose     bool
+	loose bool
+	// partial: the tenants of the occurrences that are confined, even when others are not.
+	partial   []string
 	unsure    bool                // something the statement reads through a view could not be seen
 	expanded  map[*TableInfo]bool // views whose definition was read
 	needs     []keyReq            // rows whose owner was not cached; a lookup could settle them
@@ -570,7 +572,6 @@ func (ev *confEval) leaf(l *Leaf, out *condOut) {
 		if ok1 && ok2 {
 			out.eqs = append(out.eqs, joinEq{a.id, b.id, ac, bc})
 			out.restricted[a.id], out.restricted[b.id] = true, true
-			out.hard[a.id], out.hard[b.id] = true, true
 		}
 		return
 	}
@@ -738,8 +739,11 @@ func (ev *confEval) result() confResult {
 		}
 		all = union(all, s)
 	}
-	if r.confined && all != nil {
-		r.tenants = all.list()
+	if all != nil {
+		r.partial = all.list()
+		if r.confined {
+			r.tenants = r.partial
+		}
 	}
 	return r
 }

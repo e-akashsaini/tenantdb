@@ -75,6 +75,8 @@ type Event struct {
 	// loose: the statement reads tenant data limited only by a range, a pattern or a
 	// list too long to look up; a tag or transaction tenant does not vouch for it.
 	loose bool
+	// partial: tenants some part of the statement is known to be confined to.
+	partial []string
 }
 
 // Options configures an Attributor.
@@ -188,6 +190,23 @@ func (a *Attributor) Cache() *RowCache { return a.cache }
 
 var _ proxy.Observer = (*Attributor)(nil)
 
+// bindEnv is what a statement's names were resolved against when it was prepared.
+type bindEnv struct {
+	temps map[string]*tempTable
+	path  []string
+}
+
+func (a *Attributor) captureEnv(st *state) *bindEnv {
+	e := &bindEnv{path: a.pathOf(st)}
+	if len(st.temps) > 0 {
+		e.temps = make(map[string]*tempTable, len(st.temps))
+		for k, v := range st.temps {
+			e.temps[k] = v
+		}
+	}
+	return e
+}
+
 type prepared struct {
 	stmts    []Stmt
 	unparsed string // the SQL, if it could not be analysed
@@ -228,6 +247,9 @@ type pending struct {
 	dropTemps []string // temporary tables to forget when it succeeds
 	temp      *tempReg // a temporary table to remember when it succeeds
 	dropTable bool     // the statement may have moved rows between tenants: forget the table's owners
+	// undo puts back the session state the statement changed, if the database
+	// rejects the statement.
+	undo func()
 }
 
 // tempReg is a temporary table created by a statement still awaiting its reply.
@@ -282,8 +304,13 @@ type state struct {
 	mu       sync.Mutex
 	user, db string
 
-	temps    map[string]*tempTable // this session's temporary tables
-	txnTemps []string              // the ones created in the current transaction
+	temps  map[string]*tempTable // this session's temporary tables
+	frozen *bindEnv              // set while analysing a prepared statement: its names mean what they meant when it was prepared
+	// txnStart: the session settings when the explicit transaction began; savepoints
+	// keep theirs. A rollback gives them back, as the database does.
+	txnStart   *settings
+	savepoints []savepoint
+	txnTemps   []string // the ones created in the current transaction
 	// txnLearned: what the cache was taught during the current transaction, to be
 	// forgotten if it does not commit.
 	txnLearned []cacheKey
@@ -324,6 +351,8 @@ type state struct {
 // built-in default.
 func (a *Attributor) pathOf(st *state) []string {
 	switch {
+	case st.frozen != nil:
+		return st.frozen.path
 	case st.localPath != nil:
 		return st.localPath
 	case st.path != nil:
@@ -427,6 +456,10 @@ func (a *Attributor) OnFrontend(s *proxy.Session, msg pgproto3.FrontendMessage) 
 			st.setPrepared(m.Name, &prepared{unparsed: m.Query})
 			return
 		}
+		env := a.captureEnv(st)
+		for i := range stmts {
+			stmts[i].env = env
+		}
 		st.setPrepared(m.Name, &prepared{stmts: stmts})
 	case *pgproto3.Bind:
 		st := a.st(s)
@@ -521,6 +554,9 @@ func (a *Attributor) OnBackend(s *proxy.Session, msg pgproto3.BackendMessage) {
 					a.txnCommitted(st)
 				} else {
 					a.txnRolledBack(st) // a rollback, or a commit that turned into one, keeps nothing
+					if p.undo != nil {
+						p.undo()
+					}
 				}
 			}
 			for _, l := range p.learn {
@@ -549,6 +585,11 @@ func (a *Attributor) OnBackend(s *proxy.Session, msg pgproto3.BackendMessage) {
 	case *pgproto3.PortalSuspended, *pgproto3.EmptyQueryResponse:
 		st.pop()
 	case *pgproto3.ErrorResponse:
+		for i := len(st.queue) - 1; i >= 0; i-- {
+			if u := st.queue[i].undo; u != nil {
+				u() // what the database refused (or never got to) did not happen
+			}
+		}
 		st.queue = nil
 		a.txnRolledBack(st)  // the statement, or the whole transaction, was rolled back
 		a.endCopy(st, false) // the load stopped: what it had named so far is what it addressed
@@ -596,6 +637,61 @@ func (st *state) setPortal(name string, p *portal) {
 		delete(st.portals, name)
 	} else {
 		st.portals[name] = p
+	}
+}
+
+// settings are the session values the proxy tracks that a rollback undoes.
+type settings struct {
+	path, localPath []string
+	tag, localTag   string
+	vars, localVars map[string]string
+	roleS, roleL    roleState
+}
+
+type savepoint struct {
+	name string
+	s    settings
+}
+
+func copyVars(m map[string]string) map[string]string {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+func (st *state) saveSettings() settings {
+	return settings{st.path, st.localPath, st.tag, st.localTag, copyVars(st.vars), copyVars(st.localVars), st.roleS, st.roleL}
+}
+
+func (st *state) restoreSettings(s settings) {
+	st.path, st.localPath, st.tag, st.localTag = s.path, s.localPath, s.tag, s.localTag
+	st.vars, st.localVars = copyVars(s.vars), copyVars(s.localVars)
+	if st.vars == nil {
+		st.vars = map[string]string{}
+	}
+	st.roleS, st.roleL = s.roleS, s.roleL
+}
+
+// undoPoint captures what a statement that changes session state may change, to
+// be put back if the database rejects it.
+func (st *state) undoPoint() func() {
+	s := st.saveSettings()
+	sqlPrep := make(map[string]Stmt, len(st.sqlPrep))
+	for k, v := range st.sqlPrep {
+		sqlPrep[k] = v
+	}
+	prep := make(map[string]*prepared, len(st.prepared))
+	for k, v := range st.prepared {
+		prep[k] = v
+	}
+	return func() {
+		st.restoreSettings(s)
+		st.sqlPrep, st.prepared = sqlPrep, prep
 	}
 }
 
@@ -1024,6 +1120,31 @@ func (a *Attributor) registerTemp(st *state, reg *tempReg) {
 	st.txnTemps = append(st.txnTemps, def.Name)
 }
 
+// savepointOp keeps the settings as they were at each savepoint.
+func (a *Attributor) savepointOp(st *state, sp *SavepointOp) {
+	find := func() int {
+		for i := len(st.savepoints) - 1; i >= 0; i-- {
+			if st.savepoints[i].name == sp.Name {
+				return i
+			}
+		}
+		return -1
+	}
+	switch sp.Op {
+	case 's':
+		st.savepoints = append(st.savepoints, savepoint{sp.Name, st.saveSettings()})
+	case 'r':
+		if i := find(); i >= 0 {
+			st.savepoints = st.savepoints[:i]
+		}
+	case 'b':
+		if i := find(); i >= 0 {
+			st.restoreSettings(st.savepoints[i].s)
+			st.savepoints = st.savepoints[:i+1]
+		}
+	}
+}
+
 // txnCommitted: what the transaction created is permanent now (except ON COMMIT DROP tables).
 func (a *Attributor) txnCommitted(st *state) {
 	st.dropTxnTemps(true)
@@ -1084,6 +1205,9 @@ func (a *Attributor) provenance(st *state, r analysis, tenants []string) (tempKi
 func (a *Attributor) handle(s *proxy.Session, st *state, x Stmt, pt *portal) {
 	p := &pending{stmt: x}
 	st.queue = append(st.queue, p)
+	if x.Set != nil || x.Dealloc != nil || x.Prepare != nil {
+		p.undo = st.undoPoint() // the database may refuse it: a role that does not exist, a name that is taken
+	}
 
 	if x.Set != nil {
 		sv := *x.Set
@@ -1105,7 +1229,9 @@ func (a *Attributor) handle(s *proxy.Session, st *state, x Stmt, pt *portal) {
 		}
 	}
 	if x.Prepare != nil {
-		st.sqlPrep[x.Prepare.Name] = x.Prepare.Stmt
+		ps := x.Prepare.Stmt
+		ps.env = a.captureEnv(st)
+		st.sqlPrep[x.Prepare.Name] = ps
 	}
 	if x.DiscardTemp {
 		st.temps, st.txnTemps = map[string]*tempTable{}, nil
@@ -1113,11 +1239,26 @@ func (a *Attributor) handle(s *proxy.Session, st *state, x Stmt, pt *portal) {
 	if x.RollbackTo {
 		a.txnRolledBack(st) // part of the transaction is undone: what survives is not known
 	}
+	if sp := x.SP; sp != nil && st.inTxn {
+		a.savepointOp(st, sp)
+	}
 	switch x.Txn {
 	case txnBegin:
+		if !st.inTxn {
+			s := st.saveSettings()
+			st.txnStart, st.savepoints = &s, nil
+		}
 		st.inTxn = true
 		return
 	case txnEnd:
+		if start := st.txnStart; start != nil {
+			if x.TxnRollback {
+				st.restoreSettings(*start)
+			} else {
+				p.undo = func() { st.restoreSettings(*start) } // a COMMIT the database turned into a ROLLBACK
+			}
+		}
+		st.txnStart, st.savepoints = nil, nil
 		st.resetTxn()
 		return
 	}
@@ -1153,6 +1294,21 @@ func (a *Attributor) handle(s *proxy.Session, st *state, x Stmt, pt *portal) {
 		prep.SQL = x.SQL
 		x, pt, p.stmt = prep, args, prep
 	}
+	if x.env != nil {
+		// The database binds a prepared statement's names when it is prepared, and
+		// binds them again, with the search_path it was prepared under, whenever the
+		// statement is invalidated (dropping a temporary table it used does that). A
+		// temporary table that has appeared or gone since means the name may now
+		// stand for either table, and neither can be vouched for.
+		for _, ref := range x.Tables {
+			if (ref.Schema == "" || ref.Schema == "pg_temp") && st.temps[ref.Name] != x.env.temps[ref.Name] {
+				a.emit(st, Event{SessionID: s.ID, User: s.User, DB: s.DB, Source: SourceUnknown, SQL: x.SQL})
+				return
+			}
+		}
+		st.frozen = x.env
+		defer func() { st.frozen = nil }()
+	}
 	if !x.DML {
 		return
 	}
@@ -1180,7 +1336,7 @@ func (a *Attributor) handle(s *proxy.Session, st *state, x Stmt, pt *portal) {
 
 	// A row that points at a parent owned by another tenant breaks the assumption
 	// every foreign-key step of the analysis rests on.
-	brokenRelationship := a.checkRelationships(st, pt, ti, x)
+	brokenRelationship := a.checkRelationships(st, pt, ti, x, tenants)
 
 	// What this statement teaches the cache once it succeeds.
 	for _, row := range x.Inserts {
@@ -1210,7 +1366,8 @@ func (a *Attributor) handle(s *proxy.Session, st *state, x Stmt, pt *portal) {
 	ev := Event{SessionID: s.ID, User: s.User, DB: s.DB, SQL: x.SQL, Scan: r.scan, Tables: a.tableNames(st, x), Conflict: brokenRelationship}
 	// A connection tag or a transaction's tenant stands in for what the statement
 	// does not say, but not for one that visibly reads beyond it.
-	ev.loose = r.cr.loose || (sound && len(r.cr.needs) > maxLookupKeys)
+	ev.partial = r.cr.partial
+	ev.loose = r.cr.loose || (sound && len(r.cr.needs) > maxLookupKeys) || a.assignsTenant(x) // moving rows to another tenant is not covered by a tag
 
 	// The statement's own tenants are trustworthy, and either name some, or the
 	// predicates contradict each other so it reads nothing at all.
@@ -1286,11 +1443,31 @@ func claimEvent(ev *Event, tenants []string, cr confResult, insert bool) {
 // the foreign key does not tie rows to one tenant after all: it stops being
 // trusted until it has been re-checked against the data, and the statement is a
 // conflict. It reports whether any row did that.
-func (a *Attributor) checkRelationships(st *state, pt *portal, ti *TableInfo, x Stmt) bool {
-	if ti == nil || a.cat == nil || !x.Insert {
+func (a *Attributor) checkRelationships(st *state, pt *portal, ti *TableInfo, x Stmt, tenants []string) bool {
+	if ti == nil || a.cat == nil {
 		return false
 	}
 	broken := false
+	if len(x.SetVals) > 0 && len(tenants) == 1 {
+		// UPDATE ... SET fk = value: the rows keep their tenant (tenants[0]) and now point at that parent.
+		for _, sv := range x.SetVals {
+			fk, found := a.cat.FK(ti, sv.Col)
+			if !found {
+				continue
+			}
+			rv, ok := st.val(pt, sv.Op)
+			if !ok {
+				continue
+			}
+			if owner, known := a.parentOwner(fk, rv); known && owner != tenants[0] {
+				a.cat.DistrustFK(ti, sv.Col, fk)
+				broken = true
+			}
+		}
+	}
+	if !x.Insert {
+		return broken
+	}
 	for _, row := range x.Inserts {
 		tv, ok := st.val(pt, row.Tenant)
 		if !ok {
@@ -1305,13 +1482,46 @@ func (a *Attributor) checkRelationships(st *state, pt *portal, ti *TableInfo, x 
 			if !ok {
 				continue
 			}
-			if owner, known := a.cache.Get(fk.ParentKey, fk.ParentCol, normVal(rv)); known && owner != tv {
+			if owner, known := a.parentOwner(fk, rv); known && owner != tv {
 				a.cat.DistrustFK(ti, ref.Col, fk)
 				broken = true
 			}
 		}
 	}
 	return broken
+}
+
+// parentOwner is the tenant of the parent row a foreign key value points at: from
+// the cache, or in block mode (where the answer is wanted before the statement
+// runs) from the database.
+func (a *Attributor) parentOwner(fk FKRef, val string) (string, bool) {
+	if owner, ok := a.cache.Get(fk.ParentKey, fk.ParentCol, normVal(val)); ok {
+		return owner, true
+	}
+	if a.strict != StrictBlock || a.lk == nil || a.cat == nil {
+		return "", false
+	}
+	parent, ok := a.cat.TableByKey(fk.ParentKey)
+	if !ok {
+		return "", false
+	}
+	tcol, _ := a.scopeOf(parent)
+	if tcol == "" {
+		return "", false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), lookupTimeout)
+	defer cancel()
+	a.lookups.Add(1)
+	ts, err := a.lk.tenants(ctx, parent, tcol, fk.ParentCol, val)
+	if err != nil {
+		a.lookupFailures.Add(1)
+		return "", false
+	}
+	if len(ts) == 1 {
+		a.cache.Put(fk.ParentKey, fk.ParentCol, normVal(val), ts[0])
+		return ts[0], true
+	}
+	return "", false
 }
 
 // verifyHits re-checks a sample of the owners the cache supplied. The sampling
@@ -1406,7 +1616,16 @@ func (a *Attributor) lookupOwners(need []keyReq) (owners ownerSet, failed bool) 
 // as it would have been had the cache known. st.mu must be held.
 func (a *Attributor) finishLookup(st *state, ev Event, x Stmt, pt *portal, owners ownerSet, failed bool, txnOK bool) {
 	r := a.analyze(st, x, pt, 0, owners)
-	_, trusted, tenants := a.judge(r)
+	sound, trusted, tenants := a.judge(r)
+	// What the lookup taught applies to the verdict too, claimed or not.
+	ev.partial = r.cr.partial
+	ev.loose = r.cr.loose || (sound && len(r.cr.needs) > maxLookupKeys) || a.assignsTenant(x)
+	if x.Table.Name != "" {
+		// Now that the rows' owners are known, a write that points one at another tenant's parent shows.
+		if ti, tmp, ok := a.tableFor(st, x.Table); ok && tmp == nil && a.checkRelationships(st, pt, ti, x, tenants) {
+			ev.Conflict = true
+		}
+	}
 	if trusted && (len(tenants) > 0 || (!x.Insert && r.cr.confined && r.cr.tenantOccs > 0)) {
 		claimEvent(&ev, tenants, r.cr, x.Insert)
 	}
@@ -1452,8 +1671,10 @@ func (a *Attributor) settle(st *state, ev *Event, txnOK bool) {
 			ev.Source = SourceUnknown
 		case tag != "":
 			ev.Tenants, ev.Source = []string{tag}, SourceSession
+			ev.Conflict = ev.Conflict || !subsetOf(ev.partial, []string{tag})
 		case txnOK && st.inTxn && len(st.txnTenant) > 0:
 			ev.Tenants, ev.Source = append([]string(nil), st.txnTenant...), SourceTransaction
+			ev.Conflict = ev.Conflict || !subsetOf(ev.partial, st.txnTenant)
 		case ev.Scan:
 			ev.Source = SourceScan
 		default:
@@ -1728,4 +1949,18 @@ func (a *Attributor) unparsed(s *proxy.Session, st *state, sql string) {
 	}
 	ev := Event{SessionID: s.ID, User: s.User, DB: s.DB, SQL: sql, Source: SourceUnknown, Unparsed: true}
 	a.emit(st, ev)
+}
+
+// subsetOf: is every element of a in b?
+func subsetOf(a, b []string) bool {
+	in := make(map[string]bool, len(b))
+	for _, v := range b {
+		in[v] = true
+	}
+	for _, v := range a {
+		if !in[v] {
+			return false
+		}
+	}
+	return true
 }

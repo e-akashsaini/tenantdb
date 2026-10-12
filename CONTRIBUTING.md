@@ -20,7 +20,8 @@ Tests that need a database read `TENANTDB_TEST_DSN` (for example `postgres://pos
 The project's one hard rule is **soundness**: tenantdb may say "unknown", but it must never claim a tenant set that is smaller than what a statement can really touch. A change to how statements are analysed should come with:
 
 1. a unit test for the new shape and one for the shapes it must still *not* trust;
-2. a run of the differential fuzzer against a real Postgres (`TENANTDB_FUZZ_N=6000 TENANTDB_FUZZ_SEED=1 go test -run TestDifferential ./internal/attrib`), extended with the new shape if the generator does not produce it yet.
+2. a run of the differential fuzzer against a real Postgres (`TENANTDB_FUZZ_N=6000 TENANTDB_FUZZ_SEED=1 go test -run TestDifferential ./internal/attrib`), extended with the new shape if the generator does not produce it yet;
+3. for anything that touches session state (transactions, savepoints, prepared statements, temporary tables, the connection tag), a run of the session fuzzer (`TENANTDB_FUZZ_SEED=1 go test -run TestSessionFuzz ./internal/attrib`), which drives random sessions through the real proxy in block mode and fails if an allowed statement returns another tenant's rows.
 
 Keep changes small and focused. Format with `gofmt`.
 

@@ -17,6 +17,19 @@ All notable changes. The project follows [semantic versioning](https://semver.or
 - Two occurrences of the same table joined on a unique column are the same row, and so the same tenant.
 - Events leave a session in the order its statements were sent, even when an earlier one waits on a row lookup.
 
+### Block-mode fixes from an external review
+Reproduced and fixed, each with a regression test:
+- `INSERT ... ON CONFLICT DO UPDATE` writes the row that is already there, whoever owns it; it is now confined like an `UPDATE`, and nothing is learned into the cache from an upsert.
+- Built-ins that run SQL from a string (`query_to_xml`, `table_to_xml`, `ts_stat`, `dblink`, ...) are no longer trusted.
+- Temporary-table shadows now end with `DISCARD TEMP`, a rollback, an error, `ROLLBACK TO` and `ON COMMIT DROP`.
+- A rejected extended-protocol batch restores the prepared statements it overwrote instead of deleting them; running a statement or portal the proxy has no record of is refused; SQL-level and protocol-level prepared statements share one namespace, as in the database.
+- A prepared statement keeps the `search_path` it was prepared with, and one whose table names may now mean a different (temporary) table is not trusted.
+- A connection tag or open transaction no longer vouches for a statement limited only by a range, pattern, join, or an `UPDATE` that moves rows to another tenant, and what is known about part of a statement counts against the tag.
+- Casts that change a value (`varchar(n)`, `char(n)`, `name`) are not looked through.
+- What a transaction taught the cache is forgotten if it rolls back; session settings follow rollbacks, savepoints and rejected statements.
+- A write that contradicts a foreign key (an `INSERT`, or an `UPDATE` of the key) is refused and the relationship is distrusted; relationships are re-checked every ten minutes (was an hour).
+- New: a session fuzzer drives random multi-statement sessions (transactions, savepoints, temporary tables, prepared statements, upserts, tag changes) through the real proxy in block mode against PostgreSQL, and fails if an allowed statement returns another tenant's rows.
+
 ### Operations
 - Prometheus metrics, `/healthz`, `/readyz`, `/version` (`-admin-addr`).
 - JSON logs (`-log-format json`), log levels, and logs without data values by default (`-log-sql normalized`).
