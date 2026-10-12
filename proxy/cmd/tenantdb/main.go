@@ -38,6 +38,8 @@ func main() {
 		schemaEvery  = flag.Duration("schema-refresh", 5*time.Minute, "how often to re-read the schema")
 		tagVar       = flag.String("tag-var", env("TENANTDB_TAG_VAR", "tenantdb.tenant"), "session variable a connection sets to declare its tenant (SET tenantdb.tenant = 'acme', or startup option -c tenantdb.tenant=acme)")
 		lookupRows   = flag.Bool("lookup", true, "resolve rows missing from the cache by asking the database (needs -schema-dsn)")
+		lookupConns  = flag.Int("lookup-conns", attrib.DefaultLookupConns, "connections the row-ownership lookup pool may open")
+		lookupWait   = flag.Duration("lookup-timeout", attrib.DefaultLookupTimeout, "how long one lookup of who owns a row may take (in block mode a statement waits for it)")
 		strictFlag   = flag.String("strict", env("TENANTDB_STRICT", "off"), "what to do with statements that cannot be pinned to a tenant: off (just report sources), alert (flag violations in the log), block (refuse to forward them; needs -schema-dsn)")
 		strictExempt = flag.String("strict-exempt", env("TENANTDB_STRICT_EXEMPT", ""), "comma-separated roles never held to the policy (migrations, admin tools)")
 		strictScan   = flag.String("strict-allow-scan", env("TENANTDB_STRICT_ALLOW_SCAN", ""), "comma-separated roles allowed to read across all tenants (reports, analytics)")
@@ -203,7 +205,7 @@ func main() {
 	var lookup *attrib.Lookup
 	if catalog != nil && *lookupRows {
 		var err error
-		if lookup, err = attrib.NewLookup(ctx, *schemaDSN); err != nil {
+		if lookup, err = attrib.NewLookupSize(ctx, *schemaDSN, *lookupConns); err != nil {
 			log.Error("lookup disabled", "err", err)
 		} else {
 			defer lookup.Close()
@@ -212,9 +214,10 @@ func main() {
 
 	o := newObservability(ver, commit, goVer, string(mode))
 	attributor := attrib.New(attrib.Options{
-		Catalog: catalog,
-		Lookup:  lookup,
-		TagVar:  *tagVar,
+		Catalog:       catalog,
+		Lookup:        lookup,
+		LookupTimeout: *lookupWait,
+		TagVar:        *tagVar,
 		Strict: attrib.StrictOptions{
 			Mode:      mode,
 			Exempt:    strings.Split(*strictExempt, ","),

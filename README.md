@@ -240,6 +240,8 @@ Each flag also has an environment variable where listed.
 | `-strict` | `TENANTDB_STRICT` | `off` | `off`, `alert` or `block` |
 | `-strict-exempt` | `TENANTDB_STRICT_EXEMPT` | | Roles never held to the policy |
 | `-strict-allow-scan` | `TENANTDB_STRICT_ALLOW_SCAN` | | Roles allowed to scan |
+| `-lookup-conns` | | `8` | Connections the row-ownership lookup pool may open |
+| `-lookup-timeout` | | `3s` | How long one lookup may take; in `block` mode a statement waits for it, and a lookup that times out leaves it unknown |
 | `-shared-tables` | `TENANTDB_SHARED_TABLES` | | Tables that hold data for every tenant although they have a foreign key to a tenant table (see below) |
 | `-strict-on-error` | `TENANTDB_STRICT_ON_ERROR` | `block` | In block mode, what to do with a statement the check itself failed on: `block` or `allow` |
 | `-config` | `TENANTDB_CONFIG` | | File of `name: value` settings, one per flag (the command line overrides it; it overrides the environment) |

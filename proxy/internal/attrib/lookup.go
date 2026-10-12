@@ -37,13 +37,25 @@ type lookupCall struct {
 	err     error
 }
 
+// DefaultLookupConns is how many connections the lookup pool may open.
+const DefaultLookupConns = 8
+
 // NewLookup connects lazily; the pool opens connections as lookups need them.
 func NewLookup(ctx context.Context, dsn string) (*Lookup, error) {
+	return NewLookupSize(ctx, dsn, DefaultLookupConns)
+}
+
+// NewLookupSize is NewLookup with a pool of at most conns connections. Lookups
+// that find every connection busy wait for one, up to the lookup timeout.
+func NewLookupSize(ctx context.Context, dsn string, conns int) (*Lookup, error) {
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		return nil, err
 	}
-	cfg.MaxConns = 4
+	if conns < 1 {
+		conns = DefaultLookupConns
+	}
+	cfg.MaxConns = int32(conns)
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, err

@@ -110,23 +110,28 @@ type Options struct {
 	// Strict configures what happens to statements that cannot be pinned to a
 	// tenant. The zero value only logs.
 	Strict StrictOptions
+	// LookupTimeout bounds one lookup of who owns a row (default 3s). In block
+	// mode a statement waits for it; one that times out is treated as unknown.
+	LookupTimeout time.Duration
 }
 
 const (
 	maxLookupKeys = 20
-	lookupTimeout = 3 * time.Second
+	// DefaultLookupTimeout bounds one lookup of who owns a row.
+	DefaultLookupTimeout = 3 * time.Second
 )
 
 // Attributor is a proxy.Observer that attributes DML statements to tenants.
 type Attributor struct {
-	ex      *Extractor
-	cache   *RowCache
-	onEvent func(Event)
-	tenants map[string]bool
-	cat     *Catalog
-	lk      rowLookup
-	bridge  *RowCache // credential-style lookups (viaBridge), keyed by a hash of the credential
-	tagVar  string
+	ex        *Extractor
+	cache     *RowCache
+	onEvent   func(Event)
+	tenants   map[string]bool
+	cat       *Catalog
+	lk        rowLookup
+	lkTimeout time.Duration
+	bridge    *RowCache // credential-style lookups (viaBridge), keyed by a hash of the credential
+	tagVar    string
 
 	strict    StrictMode
 	exempt    map[string]bool
@@ -181,6 +186,9 @@ func New(opt Options, onEvent func(Event)) *Attributor {
 	}
 	if opt.Lookup != nil {
 		a.lk = opt.Lookup
+	}
+	if a.lkTimeout = opt.LookupTimeout; a.lkTimeout <= 0 {
+		a.lkTimeout = DefaultLookupTimeout
 	}
 	return a
 }
@@ -1547,7 +1555,7 @@ func (a *Attributor) parentOwner(fk FKRef, val string) (string, bool) {
 	if tcol == "" {
 		return "", false
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), lookupTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), a.lkTimeout)
 	defer cancel()
 	a.lookups.Add(1)
 	ts, err := a.lk.tenants(ctx, parent, tcol, fk.ParentCol, val)
@@ -1579,7 +1587,7 @@ func (a *Attributor) verifyHits(hits []cacheHit) {
 }
 
 func (a *Attributor) verifyOne(h cacheHit) {
-	ctx, cancel := context.WithTimeout(context.Background(), lookupTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), a.lkTimeout)
 	defer cancel()
 	ts, err := a.lk.tenants(ctx, h.ti, h.tcol, h.col, h.val)
 	if err != nil {
@@ -1610,7 +1618,7 @@ func (a *Attributor) lookupable(need []keyReq) bool {
 // takes no locks. A row whose lookup failed is simply absent from the result,
 // so it is never mistaken for a row that does not exist.
 func (a *Attributor) lookupOwners(need []keyReq) (owners ownerSet, failed bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), lookupTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), a.lkTimeout)
 	defer cancel()
 	owners = ownerSet{}
 	for _, k := range need {
