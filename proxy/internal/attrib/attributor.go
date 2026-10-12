@@ -72,6 +72,9 @@ type Event struct {
 	// know, or too large or deeply chained to hand to it safely). Nothing can be
 	// said about it, so it is unknown.
 	Unparsed bool
+	// loose: the statement reads tenant data limited only by a range, a pattern or a
+	// list too long to look up; a tag or transaction tenant does not vouch for it.
+	loose bool
 }
 
 // Options configures an Attributor.
@@ -1177,6 +1180,9 @@ func (a *Attributor) handle(s *proxy.Session, st *state, x Stmt, pt *portal) {
 
 	sc := r.scope()
 	ev := Event{SessionID: s.ID, User: s.User, DB: s.DB, SQL: x.SQL, Scan: r.scan, Tables: a.tableNames(st, x)}
+	// A connection tag or a transaction's tenant stands in for what the statement
+	// does not say, but not for one that visibly reads beyond it.
+	ev.loose = r.cr.loose || (sound && len(r.cr.needs) > maxLookupKeys)
 
 	// The statement's own tenants are trustworthy, and either name some, or the
 	// predicates contradict each other so it reads nothing at all.
@@ -1381,6 +1387,8 @@ func (a *Attributor) settle(st *state, ev *Event, txnOK bool) {
 		}
 	default:
 		switch {
+		case ev.loose:
+			ev.Source = SourceUnknown
 		case tag != "":
 			ev.Tenants, ev.Source = []string{tag}, SourceSession
 		case txnOK && st.inTxn && len(st.txnTenant) > 0:

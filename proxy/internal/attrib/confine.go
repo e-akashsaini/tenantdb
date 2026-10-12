@@ -78,7 +78,11 @@ type confResult struct {
 	tenantOccs int  // how many tenant-table occurrences there are
 	tenants    []string
 	// scan: some tenant table is read with nothing at all restricting it.
-	scan      bool
+	scan bool
+	// loose: some tenant table is limited only by a condition that names no
+	// tenant and no particular rows (id > 0, tenant_id <> 'a', LIKE ...). It
+	// reads an unknown number of tenants.
+	loose     bool
 	unsure    bool                // something the statement reads through a view could not be seen
 	expanded  map[*TableInfo]bool // views whose definition was read
 	needs     []keyReq            // rows whose owner was not cached; a lookup could settle them
@@ -115,6 +119,7 @@ type condOut struct {
 	conf       map[string]*tset
 	eqs        []joinEq
 	restricted map[string]bool
+	hard       map[string]bool // restricted by equality, a join or a polymorphic key, not only by a range or a pattern
 }
 
 type propItem struct {
@@ -140,6 +145,7 @@ type confEval struct {
 	bridge     map[string][]bridgeKey // non-tenant occurrences pinned to one row by a unique key
 	conf       map[string]*tset
 	restricted map[string]bool
+	hard       map[string]bool
 	needs      []keyReq
 	needSeen   map[ownerKey]bool
 	viaKeys    bool
@@ -155,7 +161,7 @@ func (a *Attributor) confine(st *state, x Stmt, pt *portal, owners ownerSet, rls
 	}
 	ev := &confEval{a: a, st: st, pt: pt, owners: owners, rls: rls,
 		occ: map[string]*occRes{}, bridge: map[string][]bridgeKey{}, conf: map[string]*tset{},
-		merged: map[*QueryNode]*flat{}, inner: map[string][]string{}, expanded: map[*TableInfo]bool{}, restricted: map[string]bool{}, needSeen: map[ownerKey]bool{}}
+		merged: map[*QueryNode]*flat{}, inner: map[string][]string{}, expanded: map[*TableInfo]bool{}, restricted: map[string]bool{}, hard: map[string]bool{}, needSeen: map[ownerKey]bool{}}
 	ev.collect(x.Q, 0)
 	ev.level(x.Q)
 	// `x IN (SELECT y ...)` hands the subquery's confinement to x's table, which
@@ -264,6 +270,9 @@ func (ev *confEval) level(q *QueryNode) {
 		}
 		for id := range out.restricted {
 			ev.restricted[id] = true
+		}
+		for id := range out.hard {
+			ev.hard[id] = true
 		}
 		for id, ks := range out.bridge {
 			if updatable[id] {
@@ -421,7 +430,7 @@ func (ev *confEval) resolve(r CRef) (*occRes, string, bool) {
 }
 
 func (ev *confEval) cond(c *Cond) condOut {
-	out := condOut{conf: map[string]*tset{}, restricted: map[string]bool{}, bridge: map[string][]bridgeKey{}}
+	out := condOut{conf: map[string]*tset{}, restricted: map[string]bool{}, hard: map[string]bool{}, bridge: map[string][]bridgeKey{}}
 	switch c.Kind {
 	case CondLeaf:
 		ev.leaf(c.Leaf, &out)
@@ -435,6 +444,9 @@ func (ev *confEval) cond(c *Cond) condOut {
 			}
 			for id := range ko.restricted {
 				out.restricted[id] = true
+			}
+			for id := range ko.hard {
+				out.hard[id] = true
 			}
 			for id, ks := range ko.bridge {
 				out.bridge[id] = append(out.bridge[id], ks...)
@@ -478,6 +490,18 @@ func (ev *confEval) cond(c *Cond) condOut {
 			}
 			if all {
 				out.restricted[id] = true
+			}
+		}
+		for id := range kids[0].hard {
+			all := true
+			for _, ko := range kids[1:] {
+				if !ko.hard[id] {
+					all = false
+					break
+				}
+			}
+			if all {
+				out.hard[id] = true
 			}
 		}
 	}
@@ -546,6 +570,7 @@ func (ev *confEval) leaf(l *Leaf, out *condOut) {
 		if ok1 && ok2 {
 			out.eqs = append(out.eqs, joinEq{a.id, b.id, ac, bc})
 			out.restricted[a.id], out.restricted[b.id] = true, true
+			out.hard[a.id], out.hard[b.id] = true, true
 		}
 		return
 	}
@@ -568,6 +593,7 @@ func (ev *confEval) leaf(l *Leaf, out *condOut) {
 	vals, resolved := ev.values(l.Ops)
 	if ev.restrictsBy(o, lcol) {
 		out.restricted[o.id] = true
+		out.hard[o.id] = true
 	}
 	switch {
 	case ev.a.tenants[lcol]:
@@ -654,6 +680,7 @@ func (ev *confEval) poly(c *Cond, out *condOut) {
 			continue
 		}
 		out.restricted[o.id] = true
+		out.hard[o.id] = true
 		for _, s := range c.Kids {
 			if s.Kind != CondLeaf || s.Leaf == nil || !s.Leaf.Eq || s.Leaf.R != nil || len(s.Leaf.Ops) != 1 {
 				continue
@@ -701,6 +728,8 @@ func (ev *confEval) result() confResult {
 			r.confined = false
 			if !ev.restricted[id] {
 				r.scan = true
+			} else if !ev.hard[id] {
+				r.loose = true // limited by a range or a pattern: not by any particular rows or tenant
 			}
 			continue
 		}

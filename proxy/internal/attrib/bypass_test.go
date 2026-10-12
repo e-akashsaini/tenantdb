@@ -177,3 +177,50 @@ func TestBindingAnUnknownStatementIsRefusedInBlockMode(t *testing.T) {
 		t.Error("executing a portal the proxy knows nothing about was allowed")
 	}
 }
+
+// A connection tag or an open transaction supplies the tenant for a statement
+// that does not name one. It must not excuse a statement that visibly reads
+// beyond that tenant.
+func TestTagDoesNotExcuseAStatementThatReadsOtherTenants(t *testing.T) {
+	for _, sql := range []string{
+		`SELECT * FROM orders WHERE tenant_id <> 't1'`,
+		`SELECT * FROM orders WHERE id > 0`,
+		`SELECT * FROM orders WHERE tenant_id LIKE 't%'`,
+		`SELECT * FROM orders WHERE lower(tenant_id) = 't2'`,
+		`SELECT * FROM orders WHERE status = 'open' OR amount > 5`,
+		`SELECT * FROM orders WHERE tenant_id NOT IN ('t1')`,
+	} {
+		h := strictHarness(StrictOptions{Mode: StrictBlock})
+		h.set(`SET tenantdb.tenant = 't1'`)
+		if rej := h.gateQuery(sql); rej == nil {
+			t.Errorf("tagged connection: %s\n  was allowed", sql)
+		}
+		h = strictHarness(StrictOptions{Mode: StrictBlock})
+		h.gateQuery(`BEGIN`)
+		h.rfq('T')
+		if rej := h.gateQuery(`SELECT * FROM orders WHERE tenant_id = 't1'`); rej != nil {
+			t.Fatalf("%+v", rej)
+		}
+		h.rfq('T')
+		if rej := h.gateQuery(sql); rej == nil {
+			t.Errorf("in a transaction that named t1: %s\n  was allowed", sql)
+		}
+	}
+}
+
+// What a tag is for stays working: row lookups and statements the tenant cannot
+// be read from at all (an unfiltered read is a scan and is refused, as before).
+func TestTagStillAttributesIdentifyingLookups(t *testing.T) {
+	h := strictHarness(StrictOptions{Mode: StrictBlock})
+	h.set(`SET tenantdb.tenant = 't1'`)
+	for _, sql := range []string{
+		`SELECT * FROM orders WHERE id = 5`,
+		`SELECT * FROM orders WHERE id IN (1, 2, 3)`,
+		`SELECT * FROM orders WHERE tenant_id = 't1' AND amount > 5`,
+		`SELECT 1`,
+	} {
+		if rej := h.gateQuery(sql); rej != nil {
+			t.Errorf("%s\n  refused: %+v", sql, rej)
+		}
+	}
+}
