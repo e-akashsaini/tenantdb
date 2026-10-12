@@ -31,6 +31,7 @@ func main() {
 		upTLS        = flag.Bool("upstream-tls", env("TENANTDB_UPSTREAM_TLS", "") == "1", "connect to the upstream with TLS")
 		upTLSOff     = flag.Bool("upstream-tls-insecure", false, "skip upstream certificate verification (testing only)")
 		tenantCols   = flag.String("tenant-columns", env("TENANTDB_TENANT_COLUMNS", "tenant_id"), "comma-separated column names that identify the tenant")
+		sharedTables = flag.String("shared-tables", env("TENANTDB_SHARED_TABLES", ""), "comma-separated tables (name or schema.name) that hold data for every tenant although they have a foreign key to a tenant table")
 		keyCols      = flag.String("key-columns", env("TENANTDB_KEY_COLUMNS", "id"), "comma-separated column names that identify a row, used to learn which tenant owns it (empty disables the row cache)")
 		cacheSize    = flag.Int("cache-size", 100000, "maximum rows remembered by the row-to-tenant cache")
 		schemaDSN    = flag.String("schema-dsn", env("TENANTDB_SCHEMA_DSN", ""), "connection string of a read-only role used to read the schema and pre-warm the cache (prefer the TENANTDB_SCHEMA_DSN env var: flags show up in process lists)")
@@ -176,6 +177,7 @@ func main() {
 	if *schemaDSN != "" {
 		catalog = attrib.NewCatalog(*schemaDSN)
 		catalog.TenantColumns = strings.Split(*tenantCols, ",") // foreign keys are verified against it
+		catalog.SharedTables = strings.Split(*sharedTables, ",")
 		lctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		if err := catalog.Load(lctx); err != nil {
 			// Fail open: the proxy still relays and attributes without the schema.

@@ -107,6 +107,8 @@ type occRes struct {
 	tenant bool   // it carries a tenant column
 	tcol   string // which
 
+	derived []DerivedRef // a table with no tenant column that takes its tenant from a parent row
+
 	viewMap map[string]CRef // a merged view: its columns, and the columns of the underlying tables they are
 }
 
@@ -206,6 +208,11 @@ func (ev *confEval) collect(q *QueryNode, depth int) {
 		default:
 			r.ti = ti
 			r.tenant = ev.a.hasTenantCol(ti)
+			if !r.tenant {
+				if d := ev.a.derivedOf(ti); len(d) > 0 {
+					r.tenant, r.derived = true, d
+				}
+			}
 		}
 		if r.tenant && r.ti != nil {
 			r.tcol, _ = ev.a.scopeOf(r.ti)
@@ -580,6 +587,16 @@ func (ev *confEval) leaf(l *Leaf, out *condOut) {
 		return
 	}
 	o, lcol, ok := ev.resolve(l.L)
+	if ok && o.derived != nil && o.ti != nil && o.ti.IsUnique(lcol) && !derivedKey(o, lcol) {
+		// A child table's own key: the row's tenant is its parent's, found by asking.
+		out.restricted[o.id], out.hard[o.id] = true, true
+		if vals, resolved := ev.values(l.Ops); resolved {
+			if set, found := ev.selfOwners(o, lcol, vals); found {
+				out.conf[o.id] = set
+			}
+		}
+		return
+	}
 	if ok && !o.tenant && o.ti != nil && o.ti.IsUnique(lcol) && ev.a.lk != nil {
 		// A credential-style lookup on a table with no tenant column: `token = $1`.
 		// Alone it says nothing, but joined to a tenant table it pins that table.
@@ -608,6 +625,64 @@ func (ev *confEval) leaf(l *Leaf, out *condOut) {
 			}
 		}
 	}
+}
+
+func derivedKey(o *occRes, col string) bool {
+	for _, d := range o.derived {
+		if d.Col == col {
+			return true
+		}
+	}
+	return false
+}
+
+// selfOwners finds the tenants of the child-table rows o.col takes the given
+// values for: the tenants of the parent rows they point at, by asking the
+// database (the answer is cached). With several foreign keys the tenants have to
+// agree, so the sets intersect.
+func (ev *confEval) selfOwners(o *occRes, col string, vals []string) (*tset, bool) {
+	if ev.a.lk == nil || ev.a.cat == nil {
+		return nil, false
+	}
+	var res *tset
+	for _, d := range o.derived {
+		parent, found := ev.a.cat.TableByKey(d.ParentKey)
+		if !found {
+			return nil, false
+		}
+		ptc, _ := ev.a.scopeOf(parent)
+		if ptc == "" {
+			return nil, false
+		}
+		spec := bridgeSpec{b: o.ti, t: parent, bk: col, bfk: d.Col, tjoin: d.ParentCol, ttenant: ptc}
+		set, all := setOf(), true
+		for _, v := range vals {
+			k := ownerKey{spec.table(), col, bridgeVal(normVal(v))}
+			if ts, hit := ev.owners[k]; hit {
+				for _, t := range ts {
+					set.m[t] = true
+				}
+				ev.viaKeys, ev.viaLookup = true, true
+				continue
+			}
+			if t, hit := ev.a.bridge.Get(spec.table(), col, bridgeVal(normVal(v))); hit {
+				set.m[t] = true
+				ev.viaKeys = true
+				continue
+			}
+			all = false
+			if !ev.needSeen[k] {
+				ev.needSeen[k] = true
+				sp := spec
+				ev.needs = append(ev.needs, keyReq{col: col, val: v, ti: parent, tcol: ptc, via: &sp})
+			}
+		}
+		if !all {
+			return nil, false
+		}
+		res = inter(res, set)
+	}
+	return res, res != nil
 }
 
 // ownersOf finds which tenants own the rows o.col takes the given values for:

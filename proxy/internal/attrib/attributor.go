@@ -771,6 +771,15 @@ func tableKey(ref TableRef, ti *TableInfo) string {
 	return ref.String()
 }
 
+// derivedOf lists the foreign keys through which a table with no tenant column of
+// its own takes its tenant from a parent row.
+func (a *Attributor) derivedOf(ti *TableInfo) []DerivedRef {
+	if ti == nil || a.cat == nil || ti.Kind != 'r' || ti.Schema == "pg_temp" || a.hasTenantCol(ti) {
+		return nil
+	}
+	return a.cat.Derived(ti)
+}
+
 func (a *Attributor) hasTenantCol(ti *TableInfo) bool {
 	if ti == nil {
 		return false
@@ -867,7 +876,7 @@ func (a *Attributor) analyze(st *state, x Stmt, pt *portal, depth int, owners ow
 	case r.cr.confined && r.cr.tenantOccs > 0:
 		r.tenants = r.cr.tenants
 	}
-	if a.assignsTenant(x) {
+	if a.movesRows(st, x) {
 		r.tenants, r.unconfined = nil, true // rows may move to a tenant the statement does not name
 	}
 	if a.cat == nil || !a.cat.Loaded() {
@@ -892,7 +901,7 @@ func (a *Attributor) analyze(st *state, x Stmt, pt *portal, depth int, owners ow
 			}
 		case ti.Kind == 'v' && r.cr.expanded[ti]:
 			// read through its definition: the tables it is made of were analysed
-		case a.hasTenantCol(ti):
+		case a.hasTenantCol(ti) || len(a.derivedOf(ti)) > 0:
 			direct = true
 		case (ti.Kind == 'v' || ti.Kind == 'm') && !isSystemSchema(ti.Schema):
 			r.unsure = true
@@ -1073,6 +1082,34 @@ func insertTenants(st *state, x Stmt, pt *portal) []string {
 
 // assignsTenant: does an UPDATE set the tenant column? The rows then move to a
 // tenant the statement's own predicates say nothing about.
+func (a *Attributor) movesRows(st *state, x Stmt) bool {
+	if a.assignsTenant(x) {
+		return true
+	}
+	if len(x.SetCols) == 0 {
+		return false
+	}
+	ref := x.Table
+	if ref.Name == "" {
+		ref = x.SetTable
+	}
+	if ref.Name == "" {
+		return false
+	}
+	ti, tmp, ok := a.tableFor(st, ref)
+	if !ok || tmp != nil {
+		return false
+	}
+	for _, d := range a.derivedOf(ti) {
+		for _, c := range x.SetCols {
+			if c == d.Col {
+				return true // pointing a row at another parent gives it another tenant
+			}
+		}
+	}
+	return false
+}
+
 func (a *Attributor) assignsTenant(x Stmt) bool {
 	for _, c := range x.SetCols {
 		if a.tenants[c] {
@@ -1325,6 +1362,7 @@ func (a *Attributor) handle(s *proxy.Session, st *state, x Stmt, pt *portal) {
 
 	// INSERT without a column list: the schema says which position is the tenant.
 	x.Inserts = append(x.Inserts, a.rawInserts(x, ti)...)
+	a.deriveInsertTenants(st, pt, ti, &x)
 	p.dropTable = x.SetsKey || a.assignsKey(ti, x)
 
 	r := a.analyze(st, x, pt, 0, nil)
@@ -1367,7 +1405,7 @@ func (a *Attributor) handle(s *proxy.Session, st *state, x Stmt, pt *portal) {
 	// A connection tag or a transaction's tenant stands in for what the statement
 	// does not say, but not for one that visibly reads beyond it.
 	ev.partial = r.cr.partial
-	ev.loose = r.cr.loose || (sound && len(r.cr.needs) > maxLookupKeys) || a.assignsTenant(x) // moving rows to another tenant is not covered by a tag
+	ev.loose = r.cr.loose || (sound && len(r.cr.needs) > maxLookupKeys) || a.movesRows(st, x) // moving rows to another tenant is not covered by a tag
 
 	// The statement's own tenants are trustworthy, and either name some, or the
 	// predicates contradict each other so it reads nothing at all.
@@ -1619,7 +1657,7 @@ func (a *Attributor) finishLookup(st *state, ev Event, x Stmt, pt *portal, owner
 	sound, trusted, tenants := a.judge(r)
 	// What the lookup taught applies to the verdict too, claimed or not.
 	ev.partial = r.cr.partial
-	ev.loose = r.cr.loose || (sound && len(r.cr.needs) > maxLookupKeys) || a.assignsTenant(x)
+	ev.loose = r.cr.loose || (sound && len(r.cr.needs) > maxLookupKeys) || a.movesRows(st, x)
 	if x.Table.Name != "" {
 		// Now that the rows' owners are known, a write that points one at another tenant's parent shows.
 		if ti, tmp, ok := a.tableFor(st, x.Table); ok && tmp == nil && a.checkRelationships(st, pt, ti, x, tenants) {
@@ -1695,7 +1733,10 @@ func (a *Attributor) target(ti *TableInfo, col string) (tgt *TableInfo, tcol, pc
 		if tc, _ := a.scopeOf(ti); tc != "" {
 			return ti, tc, col, true
 		}
-		return nil, "", "", false
+		if len(a.derivedOf(ti)) == 0 {
+			return nil, "", "", false
+		}
+		// a child table: the row's tenant comes from its parent (below), if col is the key to it
 	}
 	if fk, found := a.cat.FK(ti, col); found {
 		if parent, found := a.cat.TableByKey(fk.ParentKey); found {
@@ -1807,6 +1848,47 @@ func parseStartupOptions(opts string) map[string]string {
 // rawInserts turns the rows of a column-less INSERT into InsRows using the
 // table's column order from the catalog. It returns nothing if the table is
 // unknown or has no tenant column.
+// deriveInsertTenants gives each row inserted into a child table the tenant of
+// the parent row it points at, where that is known (cached, or in block mode
+// looked up). A row whose parent is unknown keeps no tenant, and the statement
+// stays unattributed.
+func (a *Attributor) deriveInsertTenants(st *state, pt *portal, ti *TableInfo, x *Stmt) {
+	refs := a.derivedOf(ti)
+	if len(refs) == 0 {
+		return
+	}
+	for i := range x.Inserts {
+		row := &x.Inserts[i]
+		owner, ok := "", true
+		for _, d := range refs {
+			var op *Operand
+			for j := range row.Refs {
+				if row.Refs[j].Col == d.Col {
+					op = &row.Refs[j].Op
+				}
+			}
+			if op == nil {
+				ok = false // the foreign key is left to a default
+				break
+			}
+			v, set := st.val(pt, *op)
+			if !set {
+				ok = false
+				break
+			}
+			o, known := a.parentOwner(FKRef{ParentKey: d.ParentKey, ParentCol: d.ParentCol}, v)
+			if !known || (owner != "" && owner != o) {
+				ok = false
+				break
+			}
+			owner = o
+		}
+		if ok && owner != "" {
+			row.Tenant = Operand{Lit: owner, Set: true}
+		}
+	}
+}
+
 func (a *Attributor) rawInserts(x Stmt, ti *TableInfo) []InsRow {
 	if len(x.RawInserts) == 0 || ti == nil {
 		return nil
@@ -1821,15 +1903,18 @@ func (a *Attributor) rawInserts(x Stmt, ti *TableInfo) []InsRow {
 			keyIdx[c] = i
 		}
 	}
-	if tIdx < 0 {
+	if tIdx < 0 && len(a.derivedOf(ti)) == 0 {
 		return nil
 	}
 	var out []InsRow
 	for _, row := range x.RawInserts {
-		if tIdx >= len(row) {
-			continue
+		var r InsRow
+		if tIdx >= 0 {
+			if tIdx >= len(row) {
+				continue
+			}
+			r.Tenant = row[tIdx]
 		}
-		r := InsRow{Tenant: row[tIdx]}
 		for c, i := range keyIdx {
 			if i < len(row) {
 				r.Keys = append(r.Keys, KeyOp{Col: c, Op: row[i]})

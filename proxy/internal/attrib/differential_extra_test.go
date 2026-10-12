@@ -163,10 +163,53 @@ func (g *dgen) viewQuery() dquery {
 	return dquery{sql: fmt.Sprintf("SELECT %s.* FROM tdbdiff.%s %s WHERE %s", a, v.name, a, where), truth: truth, tenant: true}
 }
 
+// remarksQuery reads the child table remarks, which has no tenant column: its rows
+// belong to the tenant of the order they point at.
+func (g *dgen) remarksQuery() dquery {
+	n, o := g.newAlias(), g.newAlias()
+	order := dTables["orders"]
+	atom := func() string {
+		switch g.r.Intn(10) {
+		case 0, 1:
+			return fmt.Sprintf("%s.order_id = %s", n, g.num(160))
+		case 2:
+			return fmt.Sprintf("%s.order_id IN (%s, %s)", n, g.num(160), g.num(160))
+		case 3:
+			return fmt.Sprintf("%s.id = %s", n, g.num(320))
+		case 4:
+			return fmt.Sprintf("%s.body = 'b%d'", n, g.r.Intn(5))
+		case 5:
+			return fmt.Sprintf("%s.order_id %s %s", n, g.pick(">", "<", "<>"), g.num(160))
+		case 6, 7:
+			sa := g.newAlias()
+			return fmt.Sprintf("%s.order_id IN (SELECT %s.id FROM tdbdiff.orders %s WHERE %s)", n, sa, sa, g.pred(sa, order, 1))
+		case 8:
+			sa := g.newAlias()
+			return fmt.Sprintf("EXISTS (SELECT 1 FROM tdbdiff.orders %s WHERE %s.id = %s.order_id AND %s)", sa, sa, n, g.pred(sa, order, 1))
+		}
+		sa := g.newAlias()
+		return fmt.Sprintf("NOT EXISTS (SELECT 1 FROM tdbdiff.orders %s WHERE %s.id = %s.order_id AND %s)", sa, sa, n, g.pred(sa, order, 1))
+	}
+	where := atom()
+	for i := g.r.Intn(3); i > 0; i-- {
+		where = fmt.Sprintf("(%s %s %s)", where, g.pick("AND", "AND", "OR"), atom())
+	}
+	if g.r.Intn(8) == 0 {
+		where = fmt.Sprintf("NOT (%s)", where)
+	}
+	return dquery{
+		sql:    fmt.Sprintf("SELECT %s.* FROM tdbdiff.remarks %s WHERE %s", n, n, where),
+		truth:  []string{fmt.Sprintf("SELECT DISTINCT %s.tenant_id FROM tdbdiff.remarks %s JOIN tdbdiff.orders %s ON %s.id = %s.order_id WHERE %s", o, n, o, o, n, where)},
+		tenant: true,
+	}
+}
+
 // extraQuery generates one of the statement shapes above.
 func (g *dgen) extraQuery() dquery {
 	tid := func() string { return g.tid() }
-	switch g.r.Intn(23) {
+	switch g.r.Intn(26) {
+	case 23, 24, 25:
+		return g.remarksQuery()
 	case 21, 22: // EXISTS over a correlated table, through a relationship the schema does not declare
 		f, sa := g.newAlias(), g.newAlias()
 		var sub, corr string

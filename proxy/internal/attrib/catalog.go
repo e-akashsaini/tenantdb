@@ -90,9 +90,15 @@ type Catalog struct {
 	// TenantColumns names the columns that hold the tenant. Set it before Load:
 	// foreign keys can only be verified when the tenant column is known.
 	TenantColumns []string
-	fks           map[string]map[string]FKRef            // table key -> column -> the verified parent row it points at
-	fkMemo        map[string]fkVerdict                   // verdicts kept across reloads
-	polys         map[string]map[string]map[string]FKRef // table -> association -> type value -> parent
+	// SharedTables names tables ("name" or "schema.name") that hold data for every
+	// tenant even though they have a foreign key to a tenant table. Without this,
+	// a table with no tenant column but a foreign key to one is taken to belong,
+	// row by row, to the tenant of the parent row.
+	SharedTables []string
+	fks          map[string]map[string]FKRef            // table key -> column -> the verified parent row it points at
+	fkMemo       map[string]fkVerdict                   // verdicts kept across reloads
+	derived      map[string][]DerivedRef                // tables that take their tenant from a parent row
+	polys        map[string]map[string]map[string]FKRef // table -> association -> type value -> parent
 
 	// relationships learned from joins in traffic, checked in the background (learn.go)
 	learned map[string]map[string]FKRef
@@ -110,6 +116,13 @@ func NewCatalog(dsn string) *Catalog { return &Catalog{dsn: dsn, fkMemo: map[str
 
 // FKRef says a column points at a column of a parent table.
 type FKRef struct{ ParentKey, ParentCol string }
+
+// DerivedRef says a table with no tenant column of its own belongs, row by row,
+// to the tenant of the parent row its foreign key Col points at.
+type DerivedRef struct {
+	Col                  string
+	ParentKey, ParentCol string
+}
 
 type fkVerdict struct {
 	ok           bool
@@ -216,6 +229,7 @@ type snapshotData struct {
 	roleSearch map[[2]string][]string
 	baseSearch []string
 	fks        map[string]map[string]FKRef // tests only; Load computes them itself
+	derived    map[string][]DerivedRef     // tests only; Load computes them itself
 	polys      map[string]map[string]map[string]FKRef
 	viewdefs   map[string]string // table key -> definition
 	triggers   map[string][]trigRow
@@ -487,6 +501,24 @@ func (c *Catalog) apply(d snapshotData) {
 	if d.fks != nil {
 		c.fks = d.fks
 	}
+	if d.derived != nil {
+		c.derived = d.derived
+		fks := map[string]map[string]FKRef{}
+		for k, v := range c.fks {
+			fks[k] = v
+		}
+		for child, refs := range d.derived {
+			cp := map[string]FKRef{}
+			for k, v := range fks[child] {
+				cp[k] = v
+			}
+			for _, r := range refs {
+				cp[r.Col] = FKRef{ParentKey: r.ParentKey, ParentCol: r.ParentCol}
+			}
+			fks[child] = cp
+		}
+		c.fks = fks
+	}
 	if d.polys != nil {
 		c.polys = d.polys
 	}
@@ -548,6 +580,8 @@ func (c *Catalog) loadFKs(ctx context.Context, conn *pgx.Conn) {
 		}
 	}
 	declared := map[string]bool{}
+	derived := map[string][]DerivedRef{}
+	shared := lowerSet(c.SharedTables)
 	if rows, err := conn.Query(ctx, fkSQL); err == nil {
 		for rows.Next() {
 			var cs, ct, cc, ps, pt, pc string
@@ -557,6 +591,13 @@ func (c *Catalog) loadFKs(ctx context.Context, conn *pgx.Conn) {
 			child, parent := tables[strings.ToLower(cs+"."+ct)], tables[strings.ToLower(ps+"."+pt)]
 			declared[strings.ToLower(cs+"."+ct+"."+cc)] = true
 			add(child, strings.ToLower(cc), parent, strings.ToLower(pc), false)
+			// A table with no tenant column whose foreign key points at a tenant table
+			// belongs to the tenant of the row it points at.
+			if child != nil && parent != nil && child != parent && child.Kind == 'r' && child.Schema != "pg_temp" &&
+				tcol(child) == "" && tcol(parent) != "" && parent.IsUnique(strings.ToLower(pc)) &&
+				!shared[strings.ToLower(child.Name)] && !shared[strings.ToLower(child.Key())] {
+				derived[child.Key()] = append(derived[child.Key()], DerivedRef{Col: strings.ToLower(cc), ParentKey: parent.Key(), ParentCol: strings.ToLower(pc)})
+			}
 		}
 		rows.Close()
 	}
@@ -604,9 +645,17 @@ func (c *Catalog) loadFKs(ctx context.Context, conn *pgx.Conn) {
 		}
 		out[k][f.ccol] = FKRef{ParentKey: f.parent.Key(), ParentCol: f.pcol}
 	}
+	for child, refs := range derived {
+		if out[child] == nil {
+			out[child] = map[string]FKRef{}
+		}
+		for _, r := range refs {
+			out[child][r.Col] = FKRef{ParentKey: r.ParentKey, ParentCol: r.ParentCol}
+		}
+	}
 	polys := c.verifyPolys(ctx, conn, tables, tcol)
 	c.mu.Lock()
-	c.fks, c.polys = c.mergeLearned(out), polys
+	c.fks, c.polys, c.derived = c.mergeLearned(out), polys, derived
 	c.mu.Unlock()
 }
 
@@ -638,6 +687,14 @@ func pluralForms(base string) []string {
 		out = append(out, strings.TrimSuffix(base, "y")+"ies")
 	}
 	return out
+}
+
+// Derived lists the foreign keys through which a table with no tenant column of
+// its own takes its tenant from a parent row (empty for ordinary tables).
+func (c *Catalog) Derived(ti *TableInfo) []DerivedRef {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.derived[ti.Key()]
 }
 
 // FK returns the verified parent row a column of ti points at.

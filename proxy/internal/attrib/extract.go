@@ -52,6 +52,8 @@ type Stmt struct {
 	Delete  bool     // a DELETE statement
 	SetsKey bool     // an UPDATE that assigns a key or tenant column
 	SetCols []string // every column an UPDATE assigns
+	// SetTable: the table an UPDATE assigns to, when the statement is too complex to be given a Table.
+	SetTable TableRef
 	// SetVals: what an UPDATE assigns to each column, where that is a value the proxy can read.
 	SetVals []KeyOp
 	Or      bool // the WHERE clause has an OR: a predicate seen may be only one alternative

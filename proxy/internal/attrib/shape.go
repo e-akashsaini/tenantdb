@@ -142,15 +142,21 @@ func (e *Extractor) shape(n *pg_query.Node, st *Stmt) {
 			st.Aliases = aliasesOf(&pg_query.Node{Node: &pg_query.Node_RangeVar{RangeVar: u.Relation}})
 			st.Keys, st.Or = e.keyPreds(u.WhereClause)
 			e.confine(st, u.WhereClause)
+		}
+		// What is assigned matters however the rest of the statement is shaped.
+		if u.Relation != nil {
 			for _, t := range u.TargetList {
 				name := strings.ToLower(t.GetResTarget().GetName())
 				st.SetCols = append(st.SetCols, name)
-				if op := e.operand(t.GetResTarget().Val); op.Set {
-					st.SetVals = append(st.SetVals, KeyOp{Col: name, Op: op})
-				}
 				if e.keys[name] || e.cols[name] {
 					st.SetsKey = true
 				}
+				if op := e.operand(t.GetResTarget().Val); op.Set {
+					st.SetVals = append(st.SetVals, KeyOp{Col: name, Op: op})
+				}
+			}
+			if st.Table.Name == "" {
+				st.SetTable = relRef(u.Relation)
 			}
 		}
 	case *pg_query.Node_DeleteStmt:
@@ -365,7 +371,7 @@ func (e *Extractor) insertRows(s *pg_query.InsertStmt) []InsRow {
 				r.Refs = append(r.Refs, KeyOp{Col: name, Op: e.operand(items.Items[i])})
 			}
 		}
-		if r.Tenant.Set {
+		if r.Tenant.Set || len(r.Refs) > 0 {
 			out = append(out, r)
 		}
 	}

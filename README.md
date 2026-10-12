@@ -54,6 +54,7 @@ Every event also carries `scan` (reads across tenants, even if a tag attributed 
 - **Relationships it was never told about.** When the application joins `a.x = b.y` and `b.y` is unique, the proxy checks in the background whether every `a` row has the tenant of the `b` row it points at, and if so uses the relationship from then on. Coincidences (equal numbers in different tenants) do not pass the check.
 - **Row-level security.** If a table has policies and the role is subject to them (not a superuser, not `BYPASSRLS`, not the table's owner unless `FORCE ROW LEVEL SECURITY`), the policy is one more condition on every statement: `USING (tenant_id = current_setting('app.tenant'))` attributes an unfiltered `SELECT` to the tenant the session set. `SET ROLE` and `SET LOCAL ROLE` are followed.
 - **Triggers and rules.** A write fires the triggers on its table; their functions are read with `NEW.tenant_id`/`OLD.tenant_id` bound to the tenant of the row, so an audit trigger that writes the row's own tenant adds nothing, and one that touches other tenants' data shows up.
+- **Child tables.** A table with no tenant column whose foreign key points at a tenant table (line items of an order, notes on a ticket) belongs, row by row, to the tenant of the parent row it points at. Reads and writes are confined through that key (`WHERE order_id = 5`, a join to a confined parent, or the table's own id, which is looked up through the parent), and pointing a row at a different parent counts as moving it to another tenant. Tables that really are shared despite such a key are listed in `-shared-tables`.
 - **`COPY ... FROM STDIN`.** The load is attributed to the tenants its rows name (text and CSV, with any delimiter, quote, `NULL` string and header; checked against PostgreSQL's own parser on random input).
 - **Joins and aliases.** `... FROM templates JOIN submissions ... WHERE submissions.id = $1` is read through the qualifier. An unqualified column in a join could belong to either table, so it names none.
 - **`OR`.** A WHERE clause confines a statement to a tenant only if every alternative does: `tenant_id = 'a' AND (x = 1 OR y = 2)` is `a`; `tenant_id = 'a' OR amount > 5` is not attributed to `a`.
@@ -239,6 +240,7 @@ Each flag also has an environment variable where listed.
 | `-strict` | `TENANTDB_STRICT` | `off` | `off`, `alert` or `block` |
 | `-strict-exempt` | `TENANTDB_STRICT_EXEMPT` | | Roles never held to the policy |
 | `-strict-allow-scan` | `TENANTDB_STRICT_ALLOW_SCAN` | | Roles allowed to scan |
+| `-shared-tables` | `TENANTDB_SHARED_TABLES` | | Tables that hold data for every tenant although they have a foreign key to a tenant table (see below) |
 | `-strict-on-error` | `TENANTDB_STRICT_ON_ERROR` | `block` | In block mode, what to do with a statement the check itself failed on: `block` or `allow` |
 | `-config` | `TENANTDB_CONFIG` | | File of `name: value` settings, one per flag (the command line overrides it; it overrides the environment) |
 | `-admin-addr` | `TENANTDB_ADMIN_ADDR` | off | Serve `/metrics`, `/healthz`, `/readyz`, `/version` here (no authentication: keep it internal) |

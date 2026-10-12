@@ -21,6 +21,7 @@ func runAnalyze(args []string) int {
 	var (
 		schemaDSN  = fs.String("schema-dsn", os.Getenv("TENANTDB_SCHEMA_DSN"), "connection string of a (read-only) role on a database with the same schema as the one the workload ran against")
 		tenantCols = fs.String("tenant-columns", env("TENANTDB_TENANT_COLUMNS", "tenant_id"), "comma-separated column names that identify the tenant")
+		sharedTbls = fs.String("shared-tables", env("TENANTDB_SHARED_TABLES", ""), "comma-separated tables that hold data for every tenant although they have a foreign key to a tenant table")
 		keyCols    = fs.String("key-columns", env("TENANTDB_KEY_COLUMNS", "id"), "comma-separated column names that identify a row")
 		format     = fs.String("format", "auto", "input format: auto, sql, csv (pg_stat_statements export) or log (PostgreSQL stderr log)")
 		user       = fs.String("user", "", "database role to assume for statements that do not record one")
@@ -72,6 +73,7 @@ flags:`)
 
 	cat := attrib.NewCatalog(*schemaDSN)
 	cat.TenantColumns = strings.Split(*tenantCols, ",") // foreign keys are verified against it
+	cat.SharedTables = strings.Split(*sharedTbls, ",")
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	err = cat.Load(ctx)
 	cancel()
