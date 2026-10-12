@@ -295,7 +295,12 @@ proxy/
     extract.go shape.go    parse a statement: tenants, keys, tables, calls, SET
     utility.go             CREATE TABLE AS, EXPLAIN ANALYZE, COPY, PREPARE/EXECUTE, temp tables
     funcs.go               read function and DO-block bodies (SQL and PL/pgSQL)
-    attributor.go          per-connection state, sources, analysis of calls and temp tables
+    attributor.go          the Attributor: options, events, and the message entry points
+    handle.go              one statement: attribution, lookups, the final verdict
+    analyze.go             what a statement touches: tables, function bodies, triggers, child tables
+    session.go             per-connection state: settings, transactions, savepoints, rollbacks
+    prepared.go            prepared statements and portals, and what their names were bound to
+    temps.go               temporary tables
     cache.go               shared, bounded, expiring row -> tenant cache (LRU)
     catalog.go             schema snapshot: tables, uniqueness, RLS, functions, search_path
     lookup.go              ask the database who owns a row (de-duplicated)
