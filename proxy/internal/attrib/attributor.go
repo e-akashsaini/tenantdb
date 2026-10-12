@@ -249,9 +249,10 @@ const (
 
 // tempTable is a temporary table of one session.
 type tempTable struct {
-	kind    tempKind
-	tenants []string
-	info    *TableInfo // columns, for tempTenant
+	dropOnCommit bool
+	kind         tempKind
+	tenants      []string
+	info         *TableInfo // columns, for tempTenant
 }
 
 type learned struct {
@@ -278,8 +279,9 @@ type state struct {
 	mu       sync.Mutex
 	user, db string
 
-	temps   map[string]*tempTable // this session's temporary tables
-	sqlPrep map[string]Stmt       // SQL-level PREPAREd statements
+	temps    map[string]*tempTable // this session's temporary tables
+	txnTemps []string              // the ones created in the current transaction
+	sqlPrep  map[string]Stmt       // SQL-level PREPAREd statements
 
 	prepared map[string]*prepared
 	portals  map[string]*portal
@@ -497,6 +499,9 @@ func (a *Attributor) OnBackend(s *proxy.Session, msg pgproto3.BackendMessage) {
 			a.bridge.Clear()
 		}
 		if p := st.pop(); p != nil {
+			if p.stmt.Txn == txnEnd {
+				st.dropTxnTemps(string(m.CommandTag) == "COMMIT") // a rollback, or a commit that turned into one, keeps nothing
+			}
 			for _, l := range p.learn {
 				a.cache.Put(l.key.table, l.key.col, l.key.val, l.tenant)
 			}
@@ -523,11 +528,13 @@ func (a *Attributor) OnBackend(s *proxy.Session, msg pgproto3.BackendMessage) {
 		st.pop()
 	case *pgproto3.ErrorResponse:
 		st.queue = nil
-		a.endCopy(st, false) // the load stopped: what it had named so far is what it addressed
+		st.dropTxnTemps(false) // the statement, or the whole transaction, was rolled back
+		a.endCopy(st, false)   // the load stopped: what it had named so far is what it addressed
 	case *pgproto3.ReadyForQuery:
 		st.queue = nil
 		a.endCopy(st, false)
 		if m.TxStatus == 'I' {
+			st.dropTxnTemps(true) // the implicit transaction committed
 			st.resetTxn()
 		} else {
 			st.inTxn = true
@@ -748,6 +755,12 @@ func (a *Attributor) analyze(st *state, x Stmt, pt *portal, depth int, owners ow
 		r.tenantTouched = true
 		r.scan = r.cr.scan
 	}
+	for _, f := range x.Funcs {
+		if (f.Schema == "" || strings.EqualFold(f.Schema, "pg_catalog")) && sqlRunners[strings.ToLower(f.Name)] {
+			r.unresolvedFn = true // it runs the SQL in its argument: nothing says what that reads
+			r.tenantTouched = true
+		}
+	}
 	own := r.tenants
 	for _, w := range x.Writes {
 		r.merge(a.triggerEffect(st, w, own, depth, owners))
@@ -809,6 +822,19 @@ func (a *Attributor) bodyEffect(st *state, b *FuncBody, args *portal, depth int,
 		r.merge(br)
 	}
 	return r
+}
+
+// sqlRunners are built-in functions that run SQL given to them as a string (or a
+// whole schema's worth of tables) and return what it reads. A statement that
+// calls one reads whatever that SQL reads, which cannot be known from the text.
+var sqlRunners = map[string]bool{
+	"query_to_xml": true, "query_to_xml_and_xmlschema": true, "query_to_xmlschema": true,
+	"table_to_xml": true, "table_to_xml_and_xmlschema": true, "table_to_xmlschema": true,
+	"schema_to_xml": true, "schema_to_xml_and_xmlschema": true, "schema_to_xmlschema": true,
+	"database_to_xml": true, "database_to_xml_and_xmlschema": true, "database_to_xmlschema": true,
+	"cursor_to_xml": true, "cursor_to_xmlschema": true,
+	"ts_stat": true,
+	"dblink":  true, "dblink_exec": true, "dblink_send_query": true, "dblink_connect": true,
 }
 
 // funcBody reads (and caches) a function's code.
@@ -936,7 +962,33 @@ func (a *Attributor) registerTemp(st *state, reg *tempReg) {
 	case !def.FromQuery:
 		t.kind = tempTainted
 	}
+	t.dropOnCommit = def.OnCommitDrop
 	st.temps[def.Name] = t
+	st.txnTemps = append(st.txnTemps, def.Name)
+}
+
+// dropTxnTemps forgets the temporary tables created in the current transaction:
+// all of them (a rollback, an error), or only those made ON COMMIT DROP (a
+// commit). A name that is forgotten means the real table again, or an unknown
+// table, and both are treated with suspicion; a table remembered after it is
+// gone would be treated as the temporary table it no longer is.
+func (st *state) dropTxnTemps(onlyOnCommit bool) {
+	keep := st.txnTemps[:0]
+	for _, n := range st.txnTemps {
+		t := st.temps[n]
+		switch {
+		case t == nil:
+		case !onlyOnCommit || t.dropOnCommit:
+			delete(st.temps, n)
+		default:
+			keep = append(keep, n)
+		}
+	}
+	if onlyOnCommit {
+		st.txnTemps = nil // the transaction is over: the survivors are permanent for the session
+	} else {
+		st.txnTemps = keep[:0]
+	}
 }
 
 // provenance says what a temporary table created from a query inherits.
@@ -978,6 +1030,12 @@ func (a *Attributor) handle(s *proxy.Session, st *state, x Stmt, pt *portal) {
 	}
 	if x.Prepare != nil {
 		st.sqlPrep[x.Prepare.Name] = x.Prepare.Stmt
+	}
+	if x.DiscardTemp {
+		st.temps, st.txnTemps = map[string]*tempTable{}, nil
+	}
+	if x.RollbackTo {
+		st.dropTxnTemps(false) // part of the transaction is undone: which temporary tables survive is not known
 	}
 	switch x.Txn {
 	case txnBegin:
@@ -1040,8 +1098,8 @@ func (a *Attributor) handle(s *proxy.Session, st *state, x Stmt, pt *portal) {
 	// What this statement teaches the cache once it succeeds.
 	for _, row := range x.Inserts {
 		tv, ok := st.val(pt, row.Tenant)
-		if !ok || p.table == "" {
-			continue
+		if !ok || p.table == "" || x.OnConflict {
+			continue // after ON CONFLICT the row may be one that was already there, owned by someone else
 		}
 		for _, k := range row.Keys {
 			if kv, ok := st.val(pt, k.Op); ok && a.keyUsable(ti, k.Col) {

@@ -172,6 +172,13 @@ func (b *builder) stmt(node *pg_query.Node, root *bscope) *QueryNode {
 		q := &QueryNode{}
 		sc := &bscope{parent: root, names: map[string]string{}}
 		b.withClause(q, i.WithClause, sc)
+		if oc := i.OnConflictClause; oc != nil && oc.Action == pg_query.OnConflictAction_ONCONFLICT_UPDATE && !b.arbiterHasTenant(oc) {
+			// DO UPDATE modifies the row already there, whoever owns it: that row
+			// is read and written like the target of an UPDATE, and has to be confined.
+			if id := b.addOcc(q, sc, i.Relation); id != "" {
+				b.cond(q, sc, oc.WhereClause, nil)
+			}
+		}
 		if sel := i.SelectStmt.GetSelectStmt(); sel != nil && len(sel.ValuesLists) == 0 {
 			q.Subs = append(q.Subs, b.selectStmt(sel, sc))
 		}
@@ -239,6 +246,21 @@ func (b *builder) selectStmt(s *pg_query.SelectStmt, parent *bscope) *QueryNode 
 		}
 	}
 	return q
+}
+
+// arbiterHasTenant: does ON CONFLICT (cols) name a tenant column? Then the row in
+// conflict has the tenant of the row being inserted, and DO UPDATE cannot reach
+// another tenant's row.
+func (b *builder) arbiterHasTenant(oc *pg_query.OnConflictClause) bool {
+	if oc.Infer == nil {
+		return false
+	}
+	for _, el := range oc.Infer.IndexElems {
+		if ie := el.GetIndexElem(); ie != nil && b.e.cols[strings.ToLower(ie.Name)] {
+			return true
+		}
+	}
+	return false
 }
 
 func (b *builder) withClause(q *QueryNode, w *pg_query.WithClause, sc *bscope) {

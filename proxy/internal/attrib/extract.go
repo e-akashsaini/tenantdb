@@ -12,18 +12,24 @@ import (
 
 // Stmt is the tenant information found in one parsed statement.
 type Stmt struct {
-	SQL     string
-	DML     bool        // SELECT/INSERT/UPDATE/DELETE/MERGE: statements that should be attributed
-	Insert  bool        // an INSERT
-	Txn     txnKind     // transaction control, if any
-	Tenants []string    // literal tenant values named by the statement (sorted, unique)
-	Params  []int       // 1-based $n parameters compared to the tenant column
-	Set     *SetVar     // a session variable change (SET, RESET, DISCARD ALL, set_config)
-	Temp    *TempDef    // creates a temporary table
-	Prepare *SQLPrepare // SQL-level PREPARE
-	Exec    *SQLExec    // SQL-level EXECUTE
-	Dealloc *string     // DEALLOCATE name ("" for ALL)
-	Drops   []TableRef  // tables dropped or truncated
+	SQL    string
+	DML    bool // SELECT/INSERT/UPDATE/DELETE/MERGE: statements that should be attributed
+	Insert bool // an INSERT
+	// DiscardTemp: DISCARD TEMP or DISCARD ALL, which drop every temporary table.
+	DiscardTemp bool
+	// RollbackTo: ROLLBACK TO SAVEPOINT, which undoes part of the transaction.
+	RollbackTo bool
+	// OnConflict: the INSERT has an ON CONFLICT clause, so a row it names may not have been written (or may have overwritten another tenant's).
+	OnConflict bool
+	Txn        txnKind     // transaction control, if any
+	Tenants    []string    // literal tenant values named by the statement (sorted, unique)
+	Params     []int       // 1-based $n parameters compared to the tenant column
+	Set        *SetVar     // a session variable change (SET, RESET, DISCARD ALL, set_config)
+	Temp       *TempDef    // creates a temporary table
+	Prepare    *SQLPrepare // SQL-level PREPARE
+	Exec       *SQLExec    // SQL-level EXECUTE
+	Dealloc    *string     // DEALLOCATE name ("" for ALL)
+	Drops      []TableRef  // tables dropped or truncated
 
 	// Row-cache inputs, filled only for statements that touch a single table.
 	Table TableRef // zero value when not a single-table statement

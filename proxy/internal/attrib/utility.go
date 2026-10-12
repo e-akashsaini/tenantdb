@@ -9,10 +9,11 @@ import (
 
 // TempDef describes a temporary table being created.
 type TempDef struct {
-	Name      string
-	Cols      []string   // columns named in the definition (CREATE TEMP TABLE t (a int, b text), or AS t(a, b))
-	Like      []TableRef // CREATE TEMP TABLE t (LIKE other)
-	FromQuery bool       // CREATE TEMP TABLE t AS SELECT ... / SELECT ... INTO TEMP t: columns come from a query
+	Name         string
+	Cols         []string   // columns named in the definition (CREATE TEMP TABLE t (a int, b text), or AS t(a, b))
+	Like         []TableRef // CREATE TEMP TABLE t (LIKE other)
+	FromQuery    bool       // CREATE TEMP TABLE t AS SELECT ... / SELECT ... INTO TEMP t: columns come from a query
+	OnCommitDrop bool       // ON COMMIT DROP: gone when the transaction ends
 }
 
 // SQLPrepare is a SQL-level PREPARE name AS query.
@@ -36,6 +37,7 @@ func (e *Extractor) stmtFor(text string, node *pg_query.Node) Stmt {
 	switch n := node.GetNode().(type) {
 	case *pg_query.Node_InsertStmt:
 		st.DML, st.Insert = true, true
+		st.OnConflict = n.InsertStmt.OnConflictClause != nil
 	case *pg_query.Node_SelectStmt:
 		st.DML = true
 		if into := n.SelectStmt.IntoClause; into != nil {
@@ -98,10 +100,14 @@ func (e *Extractor) stmtFor(text string, node *pg_query.Node) Stmt {
 	case *pg_query.Node_VariableSetStmt:
 		st.Set = e.setVar(n.VariableSetStmt)
 	case *pg_query.Node_DiscardStmt:
-		if n.DiscardStmt.Target == pg_query.DiscardMode_DISCARD_ALL {
+		switch n.DiscardStmt.Target {
+		case pg_query.DiscardMode_DISCARD_ALL:
 			st.Set = &SetVar{ResetAll: true}
 			none := ""
 			st.Dealloc = &none
+			st.DiscardTemp = true
+		case pg_query.DiscardMode_DISCARD_TEMP:
+			st.DiscardTemp = true
 		}
 	case *pg_query.Node_TransactionStmt:
 		switch n.TransactionStmt.Kind {
@@ -110,6 +116,8 @@ func (e *Extractor) stmtFor(text string, node *pg_query.Node) Stmt {
 		case pg_query.TransactionStmtKind_TRANS_STMT_COMMIT, pg_query.TransactionStmtKind_TRANS_STMT_ROLLBACK,
 			pg_query.TransactionStmtKind_TRANS_STMT_PREPARE:
 			st.Txn = txnEnd
+		case pg_query.TransactionStmtKind_TRANS_STMT_ROLLBACK_TO:
+			st.RollbackTo = true
 		}
 	}
 	if st.DML {
@@ -177,7 +185,7 @@ func tempOfInto(into *pg_query.IntoClause) *TempDef {
 	if into == nil || into.Rel == nil || into.Rel.Relpersistence != "t" {
 		return nil
 	}
-	t := &TempDef{Name: strings.ToLower(into.Rel.Relname), FromQuery: true}
+	t := &TempDef{Name: strings.ToLower(into.Rel.Relname), FromQuery: true, OnCommitDrop: into.OnCommit == pg_query.OnCommitAction_ONCOMMIT_DROP}
 	for _, c := range into.ColNames {
 		t.Cols = append(t.Cols, strings.ToLower(c.GetString_().GetSval()))
 	}
@@ -185,7 +193,7 @@ func tempOfInto(into *pg_query.IntoClause) *TempDef {
 }
 
 func tempOfCreate(c *pg_query.CreateStmt) *TempDef {
-	t := &TempDef{Name: strings.ToLower(c.Relation.Relname)}
+	t := &TempDef{Name: strings.ToLower(c.Relation.Relname), OnCommitDrop: c.Oncommit == pg_query.OnCommitAction_ONCOMMIT_DROP}
 	for _, el := range c.TableElts {
 		switch {
 		case el.GetColumnDef() != nil:
