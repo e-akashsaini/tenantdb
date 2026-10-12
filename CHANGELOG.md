@@ -4,6 +4,10 @@ All notable changes. The project follows [semantic versioning](https://semver.or
 
 ## Unreleased
 
+## 0.1.1 (2026-10-12)
+
+A security release: it closes block-mode bypasses reported in an external review and found by a new session fuzzer (see "Block-mode fixes" below). Upgrading makes block mode stricter; some statements that a connection tag used to excuse are now refused.
+
 ### Attribution
 - **Credential lookups** (`WHERE token = $1` joined to the user): attributed through the row the credential points at, with a hashed, short-lived cache.
 - **`IN (SELECT ...)` / `= ANY (SELECT ...)`**: the subquery's confinement carries to the outer table when the columns are provably related. A correlated `EXISTS (SELECT ... WHERE s.x = o.y ...)` is read the same way.
