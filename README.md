@@ -4,7 +4,7 @@ A PostgreSQL proxy that works out **which tenant every SQL statement belongs to*
 
 It sits between your application and Postgres, speaks the real wire protocol, and needs **no changes to the application**. You tell it which column holds the tenant (`tenant_id`, `org_id`, ...) and it parses each statement to find the tenant, with the actual Postgres parser (`pg_query_go`).
 
-tenantdb is an **audit and retrofit tool** for multi-tenant apps that already exist: it shows where tenant isolation depends on every query remembering a filter, and can enforce it. It works alongside row-level security rather than replacing it.
+tenantdb is an **audit and retrofit tool** for multi-tenant apps that already exist: it shows where tenant isolation depends on every query remembering a filter, and can refuse statements it cannot attribute. It works alongside row-level security rather than replacing it.
 
 ```
 app ──TLS──▶ tenantdb :6432 ──▶ PostgreSQL :5432
@@ -17,7 +17,7 @@ app ──TLS──▶ tenantdb :6432 ──▶ PostgreSQL :5432
 
 ## Why
 
-Multi-tenant apps on a shared database depend on every query remembering `WHERE tenant_id = ...`. One forgotten filter leaks another customer's data. tenantdb makes that visible, and optionally impossible, without touching application code.
+Multi-tenant apps on a shared database depend on every query remembering `WHERE tenant_id = ...`. One forgotten filter leaks another customer's data. tenantdb makes that visible, and can refuse the statements it cannot tie to a tenant, without touching application code.
 
 Authentication, TLS to the upstream, and query cancel are relayed untouched. Clients can encrypt their connection to the proxy too (`-tls-cert`).
 

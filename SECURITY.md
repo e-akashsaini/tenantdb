@@ -22,6 +22,13 @@ Security fixes are made on the latest minor release.
 
 tenantdb **observes and gates the SQL that passes through it**. It is a control for finding and preventing *application mistakes* (a forgotten tenant filter). It is not, on its own, a defence against a client that already has database credentials and is willing to bypass it by connecting to the database directly. Keep the database reachable only from tenantdb (and your admin tooling), and use the database's own controls (roles, row-level security) as the enforcement layer; tenantdb tells you where that enforcement is missing.
 
+**What block mode checks, and what it takes on trust.** Block mode refuses a statement unless it can show the statement is confined to some tenant. The things it relies on without being able to prove them for every row:
+
+- *The connection tag is declared by the client.* A statement that names no tenant is attributed to the tag; block mode therefore enforces "confined to some tenant", not "to the right one". Treat the tag as a convenience for apps that also use row-level security, not as authentication of the tenant.
+- *Relationships between tables tie rows to one tenant.* A foreign key or learned join (`orders.customer_id -> customers.id`) is used to carry a tenant from one table to another once a sample of the data shows the rows agree, and is re-checked every ten minutes. A row written through tenantdb that contradicts it is refused and the relationship is distrusted; a row written some other way is caught at the next re-check. Composite keys that include the tenant column, or row-level security, make the database enforce this.
+- *A table with no tenant column is shared data.* A child table that lacks its own tenant column (line items that reach their tenant only through an order) is treated as untenanted. Add the column, or read it through a join that names the parent.
+- *Trusted roles are not held to the policy* (`-strict-exempt`).
+
 In block mode it fails closed (see [Failure behaviour](docs/OPERATIONS.md#failure-behaviour)). Its attribution is checked continuously against PostgreSQL itself: a differential fuzzer runs random statements through the analysis and through a real server and fails if the tenants the server returns are not inside what tenantdb claimed; row-level security, `COPY`, triggers, views and other features have their own comparisons against the server.
 
 ## Operating it safely
