@@ -3,6 +3,9 @@ package attrib
 import (
 	"reflect"
 	"testing"
+
+	"github.com/e-akashsaini/tenantdb/internal/proxy"
+	"github.com/jackc/pgx/v5/pgproto3"
 )
 
 // Bypasses reported in an external review. Each test states what is sound: a
@@ -135,4 +138,42 @@ func TestTempTableShadowsEndWhenTheTableDoes(t *testing.T) {
 	h.reply(nil, nil, "ROLLBACK")
 	h.rfq('I')
 	notDerived(h, "an aborted transaction")
+}
+
+// The proxy's view of the connection's prepared statements has to match the
+// database's. A rejected batch never reached the database, so the names it
+// mentioned must go back to what they were, not disappear.
+func TestRejectedBatchDoesNotForgetEarlierPreparedStatements(t *testing.T) {
+	h := strictHarness(StrictOptions{Mode: StrictBlock})
+	g := func(m pgproto3.FrontendMessage) *proxy.Rejection { return h.gate(m) }
+
+	// Batch 1 reaches the database: "u" is prepared (a scan, but nothing runs it yet).
+	if rej := g(&pgproto3.Parse{Name: "u", Query: `SELECT * FROM orders`}); rej != nil {
+		t.Fatalf("a Parse alone is not a read: %+v", rej)
+	}
+	g(&pgproto3.Sync{})
+
+	// Batch 2 mentions "u" again and then trips the policy: it is rejected whole.
+	g(&pgproto3.Parse{Name: "u", Query: `SELECT 1`})
+	g(&pgproto3.Parse{Name: "z", Query: `SELECT * FROM orders`})
+	g(&pgproto3.Bind{PreparedStatement: "z", DestinationPortal: "pz"})
+	if rej := g(&pgproto3.Execute{Portal: "pz"}); rej == nil {
+		t.Fatal("the scan should have been refused")
+	}
+	g(&pgproto3.Sync{})
+
+	// Batch 3 runs the database's "u", the scan from batch 1.
+	g(&pgproto3.Bind{PreparedStatement: "u", DestinationPortal: ""})
+	if rej := g(&pgproto3.Execute{Portal: ""}); rej == nil {
+		t.Error("the database's prepared statement u is a scan; running it was allowed")
+	}
+}
+
+// Naming something the proxy has never seen cannot be vouched for.
+func TestBindingAnUnknownStatementIsRefusedInBlockMode(t *testing.T) {
+	h := strictHarness(StrictOptions{Mode: StrictBlock})
+	h.gate(&pgproto3.Bind{PreparedStatement: "never-parsed", DestinationPortal: ""})
+	if rej := h.gate(&pgproto3.Execute{Portal: ""}); rej == nil {
+		t.Error("executing a portal the proxy knows nothing about was allowed")
+	}
 }

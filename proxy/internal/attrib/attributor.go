@@ -307,7 +307,10 @@ type state struct {
 
 	// Names registered since the last Sync/Flush, so a rejected batch can be
 	// forgotten (the database never saw it).
-	batchParsed, batchBound []string
+	// undo puts back what the messages of the unsynced batch changed (prepared
+	// statements and portals), if the batch is rejected and never reaches the
+	// database, which still holds whatever it held before.
+	undo []func()
 }
 
 // pathOf is the search_path in force: SET LOCAL, then SET, then what the
@@ -415,19 +418,23 @@ func (a *Attributor) OnFrontend(s *proxy.Session, msg pgproto3.FrontendMessage) 
 		st.mu.Lock()
 		defer st.mu.Unlock()
 		if err != nil {
-			st.prepared[m.Name] = &prepared{unparsed: m.Query}
-			st.batchParsed = append(st.batchParsed, m.Name)
+			st.setPrepared(m.Name, &prepared{unparsed: m.Query})
 			return
 		}
-		st.prepared[m.Name] = &prepared{stmts: stmts}
-		st.batchParsed = append(st.batchParsed, m.Name)
+		st.setPrepared(m.Name, &prepared{stmts: stmts})
 	case *pgproto3.Bind:
 		st := a.st(s)
 		st.mu.Lock()
 		defer st.mu.Unlock()
 		p := st.prepared[m.PreparedStatement]
 		if p == nil {
-			delete(st.portals, m.DestinationPortal)
+			// SQL-level PREPARE and protocol-level Parse share one namespace in the database.
+			if sp, ok := st.sqlPrep[m.PreparedStatement]; ok {
+				p = &prepared{stmts: []Stmt{sp}}
+			}
+		}
+		if p == nil {
+			st.setPortal(m.DestinationPortal, nil)
 			return
 		}
 		pt := &portal{stmts: p.stmts, unparsed: p.unparsed, params: make([]string, len(m.Parameters)), valid: make([]bool, len(m.Parameters))}
@@ -436,19 +443,23 @@ func (a *Attributor) OnFrontend(s *proxy.Session, msg pgproto3.FrontendMessage) 
 				pt.params[i], pt.valid[i] = decodeParam(v, formatFor(m.ParameterFormatCodes, i)), true
 			}
 		}
-		st.portals[m.DestinationPortal] = pt
-		st.batchBound = append(st.batchBound, m.DestinationPortal)
+		st.setPortal(m.DestinationPortal, pt)
 	case *pgproto3.Sync, *pgproto3.Flush:
 		st := a.st(s)
 		st.mu.Lock()
 		defer st.mu.Unlock()
-		st.batchParsed, st.batchBound = nil, nil
+		st.undo = nil
 	case *pgproto3.Execute:
 		st := a.st(s)
 		st.mu.Lock()
 		defer st.mu.Unlock()
 		pt := st.portals[m.Portal]
 		if pt == nil {
+			// Running something the proxy never saw created (or has lost track of)
+			// cannot be vouched for.
+			st.queue = append(st.queue, &pending{})
+			a.emit(st, Event{SessionID: s.ID, User: s.User, DB: s.DB, Source: SourceUnknown,
+				SQL: "<execute of a portal the proxy did not see created>"})
 			return
 		}
 		if pt.unparsed != "" {
@@ -473,9 +484,9 @@ func (a *Attributor) OnFrontend(s *proxy.Session, msg pgproto3.FrontendMessage) 
 		st.mu.Lock()
 		defer st.mu.Unlock()
 		if m.ObjectType == 'S' {
-			delete(st.prepared, m.Name)
+			st.setPrepared(m.Name, nil)
 		} else {
-			delete(st.portals, m.Name)
+			st.setPortal(m.Name, nil)
 		}
 	}
 }
@@ -539,6 +550,41 @@ func (a *Attributor) OnBackend(s *proxy.Session, msg pgproto3.BackendMessage) {
 		} else {
 			st.inTxn = true
 		}
+	}
+}
+
+// setPrepared records a named statement (nil removes it), remembering what it
+// replaced so a rejected batch can put it back.
+func (st *state) setPrepared(name string, p *prepared) {
+	old, had := st.prepared[name]
+	st.undo = append(st.undo, func() {
+		if had {
+			st.prepared[name] = old
+		} else {
+			delete(st.prepared, name)
+		}
+	})
+	if p == nil {
+		delete(st.prepared, name)
+	} else {
+		st.prepared[name] = p
+	}
+}
+
+// setPortal is setPrepared for portals.
+func (st *state) setPortal(name string, p *portal) {
+	old, had := st.portals[name]
+	st.undo = append(st.undo, func() {
+		if had {
+			st.portals[name] = old
+		} else {
+			delete(st.portals, name)
+		}
+	})
+	if p == nil {
+		delete(st.portals, name)
+	} else {
+		st.portals[name] = p
 	}
 }
 
@@ -1022,10 +1068,13 @@ func (a *Attributor) handle(s *proxy.Session, st *state, x Stmt, pt *portal) {
 		a.applySet(st, &sv)
 	}
 	if x.Dealloc != nil {
+		// The database keeps SQL-level and protocol-level statements in one place.
 		if *x.Dealloc == "" {
 			st.sqlPrep = map[string]Stmt{}
+			st.prepared = map[string]*prepared{}
 		} else {
 			delete(st.sqlPrep, *x.Dealloc)
+			delete(st.prepared, *x.Dealloc)
 		}
 	}
 	if x.Prepare != nil {
@@ -1061,6 +1110,13 @@ func (a *Attributor) handle(s *proxy.Session, st *state, x Stmt, pt *portal) {
 		// SQL-level EXECUTE runs a statement PREPAREd earlier, with its own arguments.
 		prep, ok := st.sqlPrep[x.Exec.Name]
 		if !ok {
+			// ... or one parsed through the protocol, which shares the namespace.
+			if pr := st.prepared[x.Exec.Name]; pr != nil && len(pr.stmts) == 1 {
+				prep, ok = pr.stmts[0], true
+			}
+		}
+		if !ok {
+			a.emit(st, Event{SessionID: s.ID, User: s.User, DB: s.DB, Source: SourceUnknown, SQL: x.SQL})
 			return
 		}
 		args := &portal{params: make([]string, len(x.Exec.Args)), valid: make([]bool, len(x.Exec.Args))}

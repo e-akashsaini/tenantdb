@@ -70,15 +70,15 @@ func (e *Extractor) stmtFor(text string, node *pg_query.Node) Stmt {
 			st.Temp = tempOfCreate(n.CreateStmt)
 		}
 	case *pg_query.Node_PrepareStmt:
-		st.Prepare = &SQLPrepare{Name: strings.ToLower(n.PrepareStmt.Name), Stmt: e.stmtFor(text, n.PrepareStmt.Query)}
+		st.Prepare = &SQLPrepare{Name: n.PrepareStmt.Name, Stmt: e.stmtFor(text, n.PrepareStmt.Query)}
 	case *pg_query.Node_ExecuteStmt:
-		x := &SQLExec{Name: strings.ToLower(n.ExecuteStmt.Name)}
+		x := &SQLExec{Name: n.ExecuteStmt.Name}
 		for _, a := range n.ExecuteStmt.Params {
 			x.Args = append(x.Args, e.operand(a))
 		}
 		st.Exec = x
 	case *pg_query.Node_DeallocateStmt:
-		name := strings.ToLower(n.DeallocateStmt.Name)
+		name := n.DeallocateStmt.Name
 		if n.DeallocateStmt.Isall {
 			name = ""
 		}

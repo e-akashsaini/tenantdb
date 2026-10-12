@@ -146,14 +146,28 @@ type snapshot struct {
 	path, localPath []string
 	tag, localTag   string
 	copyIn          *copyIn
+	sqlPrep         map[string]Stmt
 }
 
 func (st *state) snapshot() snapshot {
 	return snapshot{
 		queueLen: len(st.queue), inTxn: st.inTxn, txnTenant: append([]string(nil), st.txnTenant...),
 		path: st.path, localPath: st.localPath, tag: st.tag, localTag: st.localTag,
-		copyIn: st.copyIn,
+		copyIn: st.copyIn, sqlPrep: copyPrep(st.sqlPrep),
 	}
+}
+
+// copyPrep copies the SQL-level prepared statements, which a rejected message
+// may have added to or removed from.
+func copyPrep(m map[string]Stmt) map[string]Stmt {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make(map[string]Stmt, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
 }
 
 // reject undoes everything since snap. Statements the database will never
@@ -166,14 +180,15 @@ func (st *state) reject(snap snapshot) {
 	st.inTxn, st.txnTenant = snap.inTxn, snap.txnTenant
 	st.path, st.localPath, st.tag, st.localTag = snap.path, snap.localPath, snap.tag, snap.localTag
 	st.copyIn = snap.copyIn // a COPY the database never received has no rows to read
-	// Everything registered in the current batch, including this message.
-	for _, n := range st.batchParsed {
-		delete(st.prepared, n)
+	// Everything the current batch changed, including this message, goes back to
+	// what the database still holds.
+	for i := len(st.undo) - 1; i >= 0; i-- {
+		st.undo[i]()
 	}
-	for _, n := range st.batchBound {
-		delete(st.portals, n)
+	st.undo = nil
+	if st.sqlPrep = snap.sqlPrep; st.sqlPrep == nil {
+		st.sqlPrep = map[string]Stmt{}
 	}
-	st.batchParsed, st.batchBound = nil, nil
 }
 
 // gate observes one client message and decides whether it may be forwarded.

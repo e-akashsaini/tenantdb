@@ -385,9 +385,9 @@ func TestSQLLevelPrepareAndExecute(t *testing.T) {
 	before := len(h.events)
 	h.query(`DEALLOCATE q`)
 	h.reply(nil, nil, "DEALLOCATE")
-	h.query(`EXECUTE q('acme')`) // unknown to the proxy: the server will reject it
-	if len(h.events) != before {
-		t.Error("executing an unknown statement name has nothing to attribute")
+	h.query(`EXECUTE q('acme')`) // unknown to the proxy: the server will most likely reject it, but cannot be vouched for
+	if len(h.events) != before+1 || h.events[before].Source != SourceUnknown {
+		t.Error("executing a statement name the proxy cannot account for is unknown")
 	}
 }
 
