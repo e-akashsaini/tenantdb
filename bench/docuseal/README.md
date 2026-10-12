@@ -21,14 +21,14 @@ everything. Every request is real ActiveRecord traffic.
 
 Two passes of the same traffic (about 235 HTTP requests each), the second after the
 schema had been re-read and the relationships between tables verified against the
-rows the first pass created. Second pass: **4,922 statements** attributed. (The first
+rows the first pass created. Second pass: **4,923 statements** attributed. (The first
 version of the engine, before this exercise, flagged 16% of the same kind of traffic;
 the changes it drove are listed below.)
 
 | How the tenant was determined | statements |
 |---|---:|
-| shared tables, `SELECT 1`, ... (`untenanted`) | 40.2% |
-| a row looked up by a unique column, foreign key, polymorphic parent or credential (`cache`, `lookup`) | 35.9% |
+| shared tables, `SELECT 1`, ... (`untenanted`) | 37.4% |
+| a row looked up by a unique column, foreign key, polymorphic parent, credential or the parent of a child table (`cache`, `lookup`) | 38.7% |
 | the statement names the account (`explicit`) | 18.7% |
 | tenant data with no account or row filter (`scan`) | 4.3% |
 | tenant data, tenant not determined (`unknown`) | 0.3% |
@@ -53,8 +53,9 @@ statements (`template_folders ... EXISTS (SELECT ... FROM template_folders subfo
 run are no longer flagged either: a correlated `EXISTS` over a self-referencing key is now followed.
 
 Offline, `tenantdb analyze` on the Postgres log of the same pass reads the workload twice (the
-first pass finds the relationships) and gives the same answer as the live proxy: 4,922 statements
-and 229 flagged, in both.
+first pass finds the relationships) and gives the same answer as the live proxy: 4,923 statements
+and 229 flagged, in both. (Child-table support moved about 140 statements from "shared data" to "attributed
+through the parent"; the flagged count did not change.)
 
 ## What it said about running in `block` mode
 

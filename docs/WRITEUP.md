@@ -39,12 +39,12 @@ A tool whose job is to claim "this only touches acme" is dangerous if it is some
 
 DocuSeal is an open-source e-signature app (Rails 8). I ran its official image with all database traffic through tenantdb and drove it with a script: setup, login, browsing, uploading a template, creating and completing submissions through the API.
 
-On the second pass over the same traffic, 4,922 statements were attributed:
+On the second pass over the same traffic, 4,923 statements were attributed:
 
 | How the tenant was determined | Share |
 |---|---:|
-| shared tables, `SELECT 1`, ... | 40.2% |
-| a row looked up by key, foreign key, polymorphic parent or credential | 35.9% |
+| shared tables, `SELECT 1`, ... | 37.4% |
+| a row looked up by key, foreign key, polymorphic parent, credential or parent of a child table | 38.7% |
 | the statement names the account | 18.7% |
 | tenant data with no account or row filter | 4.3% |
 | tenant data, tenant not determined | 0.3% |
