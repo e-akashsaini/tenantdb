@@ -39,22 +39,22 @@ A tool whose job is to claim "this only touches acme" is dangerous if it is some
 
 DocuSeal is an open-source e-signature app (Rails 8). I ran its official image with all database traffic through tenantdb and drove it with a script: setup, login, browsing, uploading a template, creating and completing submissions through the API.
 
-On the second pass over the same traffic, 4,921 statements were attributed:
+On the second pass over the same traffic, 4,922 statements were attributed:
 
 | How the tenant was determined | Share |
 |---|---:|
 | shared tables, `SELECT 1`, ... | 40.2% |
-| a row looked up by key, foreign key, polymorphic parent or credential | 36.0% |
-| the statement names the account | 17.7% |
+| a row looked up by key, foreign key, polymorphic parent or credential | 35.9% |
+| the statement names the account | 18.7% |
 | tenant data with no account or row filter | 4.3% |
-| tenant data, tenant not determined | 1.3% |
+| tenant data, tenant not determined | 0.3% |
 | a row that does not exist | 0.5% |
 
-So **5.6% would be flagged** by block mode. What those were is more interesting than the percentage: lookups by the *other* account's id (cross-account by design), and settings read by `key` with no account filter. That second kind is exactly what an audit is for. Whether any of it is a bug depends on the app, and I did not read DocuSeal's source.
+So **4.7% would be flagged** by block mode. What those were is more interesting than the percentage: lookups by the *other* account's id (cross-account by design), and settings read by `key` with no account filter. That second kind is exactly what an audit is for. Whether any of it is a bug depends on the app, and I did not read DocuSeal's source.
 
 Run in block mode, the unmodified app stops at the first page, because its "has anyone registered yet" check reads `users` with no filter. That is the correct behaviour for a tool that refuses what it cannot attribute. It is the reason the advice is alert mode first, then exempt the roles and queries that are cross-tenant on purpose, then block.
 
-Running the real app also made the tool better. Statements like `submitters WHERE submission_id = $1` (the standard Rails child-table lookup) were wrongly labelled as reading every tenant. Polymorphic associations (`record_type`, `record_id`) were opaque. A tenant column hidden behind a view, or a lookup by API token, could not be followed. Each was fixed, and the share flagged on the same traffic fell from 16% to 5.6%.
+Running the real app also made the tool better. Statements like `submitters WHERE submission_id = $1` (the standard Rails child-table lookup) were wrongly labelled as reading every tenant. Polymorphic associations (`record_type`, `record_id`) were opaque. A tenant column hidden behind a view, or a lookup by API token, could not be followed. Each was fixed, and the share flagged on the same traffic fell from 16% to 4.7%.
 
 ## Cost
 

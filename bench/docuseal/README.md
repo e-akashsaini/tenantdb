@@ -21,39 +21,40 @@ everything. Every request is real ActiveRecord traffic.
 
 Two passes of the same traffic (about 235 HTTP requests each), the second after the
 schema had been re-read and the relationships between tables verified against the
-rows the first pass created. Second pass: **4,921 statements** attributed. (The first
+rows the first pass created. Second pass: **4,922 statements** attributed. (The first
 version of the engine, before this exercise, flagged 16% of the same kind of traffic;
 the changes it drove are listed below.)
 
 | How the tenant was determined | statements |
 |---|---:|
 | shared tables, `SELECT 1`, ... (`untenanted`) | 40.2% |
-| a row looked up by a unique column, foreign key, polymorphic parent or credential (`cache`, `lookup`) | 36.0% |
-| the statement names the account (`explicit`) | 17.7% |
+| a row looked up by a unique column, foreign key, polymorphic parent or credential (`cache`, `lookup`) | 35.9% |
+| the statement names the account (`explicit`) | 18.7% |
 | tenant data with no account or row filter (`scan`) | 4.3% |
-| tenant data, tenant not determined (`unknown`) | 1.3% |
+| tenant data, tenant not determined (`unknown`) | 0.3% |
 | a row that doesn't exist (`nomatch`) | 0.5% |
 
-So **5.6% would be flagged** by strict mode (4.3% scan + 1.3% unknown). The first pass, on an
-empty database, flags 10.3%: a relationship between two tables can only be checked against
+So **4.7% would be flagged** by strict mode (4.3% scan + 0.3% unknown). The first pass, on an
+empty database, flags 8.8%: a relationship between two tables can only be checked against
 rows, so it is not used until there are rows to check. What the second pass flags:
 
 | Flagged statements | Count | Verdict |
 |---|---:|---|
 | `account_linked_accounts WHERE linked_account_id = $1` | 129 | A lookup by the *other* account's id: cross-account by design. |
 | `encrypted_configs` / `account_configs WHERE key = $1` | 65 | Settings read by key with no account filter. These are the kind of finding an audit exists for; whether they are a bug depends on the app (I did not read DocuSeal's source). |
-| `template_folders ... EXISTS (SELECT ... FROM template_folders subfolders WHERE subfolders.parent_folder_id = ...)` | 48 | A folder tree. The relationship `parent_folder_id -> id` is found from the joins, but this demo database has one folder and no sub-folders, so there are no rows to check it against and it is not used. |
 | `search_entries WHERE record_type = 'Submission'` | 16 | A polymorphic type with no rows yet to verify the mapping against. |
 | `template_versions WHERE template_id = $1` | 16 | A foreign key that cannot be verified while the table is empty. |
 | bootstrap checks (`SELECT 1 FROM users LIMIT 1`) | 3 | The app asking whether anyone has registered. |
 
 The 152 `users JOIN access_tokens WHERE token = $1` statements of the earlier run (every API call
 authenticating) are no longer in the list: the token pins one row and the proxy asks which account it
-leads to. The two "no rows yet" lines resolve by themselves in a database that has been in use.
+leads to. The two "no rows yet" lines resolve by themselves in a database that has been in use. The 48 folder-tree
+statements (`template_folders ... EXISTS (SELECT ... FROM template_folders subfolders ...)`) of the earlier
+run are no longer flagged either: a correlated `EXISTS` over a self-referencing key is now followed.
 
 Offline, `tenantdb analyze` on the Postgres log of the same pass reads the workload twice (the
-first pass finds the relationships) and gives the same answer as the live proxy: 4,920 statements
-and 276 flagged, against 4,921 and 277 live.
+first pass finds the relationships) and gives the same answer as the live proxy: 4,922 statements
+and 229 flagged, in both.
 
 ## What it said about running in `block` mode
 

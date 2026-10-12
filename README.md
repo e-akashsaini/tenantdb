@@ -137,13 +137,13 @@ tenantdb analysis
 5747 statements read; 4947 attributed, 800 need no attribution (SET, BEGIN, DDL, ...)
 
 How tenants were determined
-  explicit           873   17.7%
-  cache             1791   36.4%
-  untenanted        1979   40.2%
-  scan               212    4.3%
-  unknown             64    1.3%
+  explicit           921   18.7%
+  cache             1774   36.0%
+  untenanted        1981   40.2%
+  scan               213    4.3%
+  unknown             16    0.3%
 
-What strict mode would flag: 276 of 4920 attributed statements (5.6%)
+What strict mode would flag: 229 of 4922 attributed statements (4.7%)
 
 Worst query shapes (statements that differ only in their literals are grouped)
    1. [scan] x129  public.account_linked_accounts
@@ -156,7 +156,7 @@ By default it warms the row cache from the database and looks up the rows a stat
 
 ### On a real Rails app
 
-[`bench/docuseal/`](bench/docuseal/README.md) runs DocuSeal (Rails 8, `account_id` on its tables) behind the proxy and drives it. 4,921 statements: 5.6% would be flagged, almost all of them cross-account lookups, global configuration reads and bootstrap checks (the authentication lookups are attributed through the token); and in `block` mode the unmodified app stops at login. Read the caveats there before quoting any number: it is one app, one account, scripted traffic.
+[`bench/docuseal/`](bench/docuseal/README.md) runs DocuSeal (Rails 8, `account_id` on its tables) behind the proxy and drives it. 4,922 statements: 4.7% would be flagged, almost all of them cross-account lookups, global configuration reads and bootstrap checks (the authentication lookups are attributed through the token); and in `block` mode the unmodified app stops at login. Read the caveats there before quoting any number: it is one app, one account, scripted traffic.
 
 ### Running your own test suite through it
 
