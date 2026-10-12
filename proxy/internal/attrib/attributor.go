@@ -1178,6 +1178,10 @@ func (a *Attributor) handle(s *proxy.Session, st *state, x Stmt, pt *portal) {
 		p.temp = &tempReg{def: x.Temp, kind: kind, tenants: ten}
 	}
 
+	// A row that points at a parent owned by another tenant breaks the assumption
+	// every foreign-key step of the analysis rests on.
+	brokenRelationship := a.checkRelationships(st, pt, ti, x)
+
 	// What this statement teaches the cache once it succeeds.
 	for _, row := range x.Inserts {
 		tv, ok := st.val(pt, row.Tenant)
@@ -1203,7 +1207,7 @@ func (a *Attributor) handle(s *proxy.Session, st *state, x Stmt, pt *portal) {
 	a.verifyHits(r.cr.hits)
 
 	sc := r.scope()
-	ev := Event{SessionID: s.ID, User: s.User, DB: s.DB, SQL: x.SQL, Scan: r.scan, Tables: a.tableNames(st, x)}
+	ev := Event{SessionID: s.ID, User: s.User, DB: s.DB, SQL: x.SQL, Scan: r.scan, Tables: a.tableNames(st, x), Conflict: brokenRelationship}
 	// A connection tag or a transaction's tenant stands in for what the statement
 	// does not say, but not for one that visibly reads beyond it.
 	ev.loose = r.cr.loose || (sound && len(r.cr.needs) > maxLookupKeys)
@@ -1275,6 +1279,39 @@ func claimEvent(ev *Event, tenants []string, cr confResult, insert bool) {
 	default:
 		ev.Source = SourceExplicit
 	}
+}
+
+// checkRelationships compares the tenant an INSERT gives a row with the owner of
+// the parent row it points at, where the cache knows that owner. A mismatch means
+// the foreign key does not tie rows to one tenant after all: it stops being
+// trusted until it has been re-checked against the data, and the statement is a
+// conflict. It reports whether any row did that.
+func (a *Attributor) checkRelationships(st *state, pt *portal, ti *TableInfo, x Stmt) bool {
+	if ti == nil || a.cat == nil || !x.Insert {
+		return false
+	}
+	broken := false
+	for _, row := range x.Inserts {
+		tv, ok := st.val(pt, row.Tenant)
+		if !ok {
+			continue
+		}
+		for _, ref := range row.Refs {
+			fk, found := a.cat.FK(ti, ref.Col)
+			if !found {
+				continue
+			}
+			rv, ok := st.val(pt, ref.Op)
+			if !ok {
+				continue
+			}
+			if owner, known := a.cache.Get(fk.ParentKey, fk.ParentCol, normVal(rv)); known && owner != tv {
+				a.cat.DistrustFK(ti, ref.Col, fk)
+				broken = true
+			}
+		}
+	}
+	return broken
 }
 
 // verifyHits re-checks a sample of the owners the cache supplied. The sampling
@@ -1575,6 +1612,11 @@ func (a *Attributor) rawInserts(x Stmt, ti *TableInfo) []InsRow {
 		for c, i := range keyIdx {
 			if i < len(row) {
 				r.Keys = append(r.Keys, KeyOp{Col: c, Op: row[i]})
+			}
+		}
+		for i, c := range ti.Cols {
+			if i < len(row) && !a.tenants[c] {
+				r.Refs = append(r.Refs, KeyOp{Col: c, Op: row[i]})
 			}
 		}
 		out = append(out, r)

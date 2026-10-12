@@ -142,6 +142,21 @@ func (c *Catalog) learnLocked(f fkCand) {
 	c.fks = next
 }
 
+// DistrustFK stops using a relationship because a row has just been written that
+// contradicts it. It stays off for fkMemoTTL, and then only returns if sampling the
+// data finds every row consistent.
+func (c *Catalog) DistrustFK(child *TableInfo, col string, ref FKRef) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	id := child.Key() + "." + col + "->" + ref.ParentKey + "." + ref.ParentCol
+	if c.fkMemo == nil {
+		c.fkMemo = map[string]fkVerdict{}
+	}
+	c.fkMemo[id] = fkVerdict{ok: false, at: time.Now()}
+	delete(c.fks[child.Key()], col)
+	delete(c.learned[child.Key()], col)
+}
+
 // mergeLearned adds the learned relationships to a freshly computed set. c.mu must be held.
 func (c *Catalog) mergeLearned(fks map[string]map[string]FKRef) map[string]map[string]FKRef {
 	for child, cols := range c.learned {

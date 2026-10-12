@@ -118,7 +118,7 @@ type fkVerdict struct {
 }
 
 const (
-	fkMemoTTL         = time.Hour
+	fkMemoTTL         = 10 * time.Minute
 	fkInconclusiveTTL = 30 * time.Second
 	fkSampleRows      = 5000
 )

@@ -60,6 +60,8 @@ type Pred struct {
 type InsRow struct {
 	Tenant Operand
 	Keys   []KeyOp
+	// Refs: every other column the row sets, to check the rows it points at.
+	Refs []KeyOp
 }
 
 type KeyOp struct {
@@ -355,6 +357,9 @@ func (e *Extractor) insertRows(s *pg_query.InsertStmt) []InsRow {
 				r.Tenant = e.operand(items.Items[i])
 			case e.isKeyish(name):
 				r.Keys = append(r.Keys, KeyOp{Col: name, Op: e.operand(items.Items[i])})
+			}
+			if !e.cols[name] {
+				r.Refs = append(r.Refs, KeyOp{Col: name, Op: e.operand(items.Items[i])})
 			}
 		}
 		if r.Tenant.Set {

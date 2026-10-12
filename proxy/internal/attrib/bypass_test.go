@@ -339,3 +339,38 @@ func TestRolledBackInsertsAreForgotten(t *testing.T) {
 		t.Errorf("a committed insert should be remembered: %+v", e)
 	}
 }
+
+// A foreign key says which parent a row points at, not that the parent has the
+// same tenant. That is checked against sample rows, so a row written afterwards
+// must not be able to talk the analysis into the wrong tenant.
+func TestAWriteThatBreaksARelationshipIsRefusedAndDistrusted(t *testing.T) {
+	h := specHarness(soundSpec(), StrictOptions{Mode: StrictBlock})
+	// customer 5 belongs to t2
+	h.a.Cache().Put("public.customers", "id", "5", "t2")
+
+	// An order for t1 pointing at t2's customer.
+	rej := h.gateQuery(`INSERT INTO orders (id, tenant_id, customer_id) VALUES (11, 't1', 5)`)
+	if rej == nil {
+		t.Fatal("an order for t1 that points at a customer of t2 was allowed")
+	}
+	h.rfq('I')
+
+	// The relationship is no longer trusted: a join through it is not enough.
+	e := func(sql string) Event {
+		h.query(sql)
+		ev := h.last(t)
+		h.rfq('I')
+		return ev
+	}
+	ev := e(`SELECT o.* FROM orders o JOIN customers c ON c.id = o.customer_id WHERE c.tenant_id = 't1'`)
+	if confinedTo(ev, "t1") {
+		t.Errorf("orders.customer_id was still trusted after a row broke it: %+v", ev)
+	}
+
+	// A consistent order is fine on a fresh attributor.
+	h2 := specHarness(soundSpec(), StrictOptions{Mode: StrictBlock})
+	h2.a.Cache().Put("public.customers", "id", "5", "t2")
+	if rej := h2.gateQuery(`INSERT INTO orders (id, tenant_id, customer_id) VALUES (12, 't2', 5)`); rej != nil {
+		t.Errorf("a consistent order was refused: %+v", rej)
+	}
+}
