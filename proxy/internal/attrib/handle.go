@@ -398,6 +398,27 @@ func (a *Attributor) parentOwner(fk FKRef, val string) (string, bool) {
 	}
 	tcol, _ := a.scopeOf(parent)
 	if tcol == "" {
+		// The parent is itself a child table: ask through its own parents.
+		refs := a.derivedOf(parent)
+		bl, isBridge := a.lk.(bridgeLookup)
+		if len(refs) == 0 || !isBridge {
+			return "", false
+		}
+		spec, found := a.chainSpec(parent, refs[0], fk.ParentCol)
+		if !found {
+			return "", false
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), a.lkTimeout)
+		defer cancel()
+		a.lookups.Add(1)
+		ts, err := bl.viaTenants(ctx, spec, val)
+		if err != nil {
+			a.lookupFailures.Add(1)
+			return "", false
+		}
+		if len(ts) == 1 {
+			return ts[0], true
+		}
 		return "", false
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), a.lkTimeout)

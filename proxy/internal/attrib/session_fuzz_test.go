@@ -39,7 +39,7 @@ func (g *sessGen) pick(xs ...string) string {
 
 // op returns one statement. kind "q" returns rows, "x" does not.
 func (g *sessGen) op() (sql, kind string) {
-	switch g.r.Intn(44) {
+	switch g.r.Intn(52) {
 	case 0, 1:
 		return "SELECT * FROM s_orders WHERE id = " + g.id(40), "q"
 	case 2:
@@ -131,24 +131,38 @@ func (g *sessGen) op() (sql, kind string) {
 			"UPDATE s_notes SET order_id = "+g.id(40)+" WHERE order_id = "+g.id(40)+" RETURNING *"), "q"
 	case 42:
 		return "DELETE FROM s_notes WHERE id = " + g.id(70) + " RETURNING *", "q"
+	case 43, 44:
+		return "SELECT * FROM s_taxes WHERE id = " + g.id(90), "q"
+	case 45:
+		return g.pick("SELECT * FROM s_taxes WHERE note_id = "+g.id(70), fmt.Sprintf("SELECT * FROM s_taxes WHERE note_id IN (%s, %s)", g.id(70), g.id(70)),
+			"SELECT * FROM s_taxes", "SELECT * FROM s_taxes WHERE rate > "+g.id(5)), "q"
+	case 46:
+		return fmt.Sprintf("SELECT t.id, t.note_id FROM s_taxes t JOIN s_notes n ON n.id = t.note_id JOIN s_orders o ON o.id = n.order_id WHERE %s",
+			g.pick("o.tenant_id = "+g.tid(), "o.id = "+g.id(40), "t.id = "+g.id(90))), "q"
+	case 47:
+		return g.pick("INSERT INTO s_taxes (id, note_id, rate) VALUES ("+g.id(120)+", "+g.id(70)+", 3) RETURNING *",
+			"UPDATE s_taxes SET note_id = "+g.id(70)+" WHERE id = "+g.id(90)+" RETURNING *",
+			"DELETE FROM s_taxes WHERE id = "+g.id(90)+" RETURNING *"), "q"
 	}
 	return "SELECT 1", "q"
 }
 
 const sessSchema = `
-DROP TABLE IF EXISTS s_notes, s_items, s_orders, s_customers CASCADE;
+DROP TABLE IF EXISTS s_taxes, s_notes, s_items, s_orders, s_customers CASCADE;
 CREATE TABLE s_customers (id bigint PRIMARY KEY, tenant_id text NOT NULL, name text);
 CREATE TABLE s_orders (id bigint PRIMARY KEY, tenant_id text NOT NULL, customer_id bigint REFERENCES s_customers(id), amount int);
 CREATE TABLE s_items (id bigint PRIMARY KEY, tenant_id text NOT NULL, order_id bigint REFERENCES s_orders(id), qty int);
 CREATE TABLE s_notes (id bigint PRIMARY KEY, order_id bigint REFERENCES s_orders(id), body text);
+CREATE TABLE s_taxes (id bigint PRIMARY KEY, note_id bigint REFERENCES s_notes(id), rate int);
 `
 
 const sessData = `
-TRUNCATE s_notes, s_items, s_orders, s_customers CASCADE;
+TRUNCATE s_taxes, s_notes, s_items, s_orders, s_customers CASCADE;
 INSERT INTO s_customers SELECT g, 't' || ((g - 1) / 4 + 1), 'c' || g FROM generate_series(1, 12) g;
 INSERT INTO s_orders SELECT g, c.tenant_id, c.id, g % 50 FROM generate_series(1, 30) g JOIN s_customers c ON c.id = (g - 1) % 12 + 1;
 INSERT INTO s_items SELECT g, o.tenant_id, o.id, g % 7 FROM generate_series(1, 60) g JOIN s_orders o ON o.id = (g - 1) % 30 + 1;
 INSERT INTO s_notes SELECT g, (g - 1) % 30 + 1, 'n' || g FROM generate_series(1, 60) g;
+INSERT INTO s_taxes SELECT g, (g - 1) % 60 + 1, g % 5 FROM generate_series(1, 90) g;
 `
 
 func TestSessionFuzzBlockMode(t *testing.T) {
@@ -175,7 +189,7 @@ func TestSessionFuzzBlockMode(t *testing.T) {
 	if _, err := admin.Exec(ctx, sessSchema); err != nil {
 		t.Fatal(err)
 	}
-	defer admin.Exec(ctx, `DROP TABLE IF EXISTS s_notes, s_items, s_orders, s_customers CASCADE`)
+	defer admin.Exec(ctx, `DROP TABLE IF EXISTS s_taxes, s_notes, s_items, s_orders, s_customers CASCADE`)
 
 	cat := NewCatalog(dsn)
 	cat.TenantColumns = []string{"tenant_id"}
@@ -299,6 +313,12 @@ func TestSessionFuzzBlockMode(t *testing.T) {
 				}
 				for j, v := range vals {
 					n := descs[j].Name
+					if n == "note_id" && strings.Contains(sql, "s_taxes") && v != nil && leak == "" {
+						var owner string
+						if admin.QueryRow(ctx, `SELECT o.tenant_id FROM s_notes n JOIN s_orders o ON o.id = n.order_id WHERE n.id = $1`, v).Scan(&owner) == nil && owner != sessMe {
+							leak = fmt.Sprintf("a tax on note %v, which belongs to %s", v, owner)
+						}
+					}
 					if n == "order_id" && strings.Contains(sql, "s_notes") && v != nil && leak == "" {
 						var owner string
 						if admin.QueryRow(ctx, `SELECT tenant_id FROM s_orders WHERE id = $1`, v).Scan(&owner) == nil && owner != sessMe {

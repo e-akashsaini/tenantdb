@@ -4,7 +4,7 @@ All notable changes. The project follows [semantic versioning](https://semver.or
 
 ## Unreleased
 
-- **Child tables.** A table with no tenant column of its own whose foreign key points at a tenant table is attributed row by row to its parent's tenant, instead of being treated as shared data that never violates. Reads and writes are confined through the key (or a join, or the table's own id via the parent); pointing a row at another parent counts as moving it between tenants. `-shared-tables` lists tables that are shared despite such a key.
+- **Child tables.** A table with no tenant column of its own whose foreign key points at a tenant table is attributed row by row to its parent's tenant, instead of being treated as shared data that never violates. Reads and writes are confined through the key (or a join, or the table's own id via the parent); pointing a row at another parent counts as moving it between tenants. `-shared-tables` lists tables that are shared despite such a key. Chains work too (a tax on a line item on an order), up to four steps.
 - An `UPDATE` with `FROM` or `WITH` now has its assigned columns read too (a tenant-moving update could slip past as "assigns nothing").
 
 ## 0.1.1 (2026-10-12)

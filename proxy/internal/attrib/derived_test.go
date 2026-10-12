@@ -10,11 +10,14 @@ import (
 func derivedSpec() catSpec {
 	sp := soundSpec()
 	sp.rows = append(sp.rows, tbl("public", "notes", 'r', "id", "order_id", "body")...)
-	sp.rows = append(sp.rows, tbl("public", "tags", 'r', "id", "label")...) // really shared
+	sp.rows = append(sp.rows, tbl("public", "tags", 'r', "id", "label")...)            // really shared
+	sp.rows = append(sp.rows, tbl("public", "taxes", 'r', "id", "note_id", "rate")...) // a child of a child
 	sp.unique["public.notes"] = []string{"id"}
 	sp.unique["public.tags"] = []string{"id"}
+	sp.unique["public.taxes"] = []string{"id"}
 	sp.derived = map[string][]DerivedRef{
 		"public.notes": {{Col: "order_id", ParentKey: "public.orders", ParentCol: "id"}},
+		"public.taxes": {{Col: "note_id", ParentKey: "public.notes", ParentCol: "id"}},
 	}
 	return sp
 }
@@ -119,5 +122,35 @@ func TestSharedTablesAreNotChildTables(t *testing.T) {
 	}
 	if rej := h.gateQuery(`SELECT * FROM countries`); rej != nil {
 		t.Errorf("a shared table was refused: %+v", rej)
+	}
+}
+
+// taxes belong to notes, which belong to orders: two steps from the tenant.
+func TestGrandchildTableTakesTheTenantOfItsGrandparent(t *testing.T) {
+	h := derivedHarness(StrictOff)
+	for _, c := range []struct {
+		name, sql string
+		tenants   []string
+	}{
+		{"through two joins", `SELECT t.* FROM taxes t JOIN notes n ON n.id = t.note_id JOIN orders o ON o.id = n.order_id WHERE o.tenant_id = 't1'`, []string{"t1"}},
+		{"through a join to the child", `SELECT t.* FROM taxes t JOIN notes n ON n.id = t.note_id WHERE n.order_id = 6`, []string{"t2"}},
+		{"through a subselect", `SELECT * FROM taxes WHERE note_id IN (SELECT id FROM notes WHERE order_id = 5)`, []string{"t1"}},
+		{"through nested subselects", `SELECT * FROM taxes WHERE note_id IN (SELECT id FROM notes WHERE order_id IN (SELECT id FROM orders WHERE tenant_id = 't2'))`, []string{"t2"}},
+	} {
+		e := h.attributed(t, c.sql)
+		if e.Source == SourceUntenanted || e.Source == SourceUnknown || !reflect.DeepEqual(e.Tenants, c.tenants) {
+			t.Errorf("%s:\n  %s\n  got %s %v, want %v", c.name, c.sql, e.Source, e.Tenants, c.tenants)
+		}
+	}
+	for _, sql := range []string{
+		`SELECT * FROM taxes`,
+		`SELECT * FROM taxes WHERE rate > 3`,
+		`SELECT * FROM taxes WHERE note_id > 3`,
+		`UPDATE taxes SET note_id = 4 WHERE id = 1`,
+	} {
+		hb := derivedHarness(StrictBlock)
+		if rej := hb.gateQuery(sql); rej == nil {
+			t.Errorf("%s\n  was allowed", sql)
+		}
 	}
 }

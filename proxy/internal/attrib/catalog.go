@@ -582,6 +582,11 @@ func (c *Catalog) loadFKs(ctx context.Context, conn *pgx.Conn) {
 	declared := map[string]bool{}
 	derived := map[string][]DerivedRef{}
 	shared := lowerSet(c.SharedTables)
+	type fkRow struct {
+		child, parent *TableInfo
+		ccol, pcol    string
+	}
+	var fkRows []fkRow
 	if rows, err := conn.Query(ctx, fkSQL); err == nil {
 		for rows.Next() {
 			var cs, ct, cc, ps, pt, pc string
@@ -591,12 +596,8 @@ func (c *Catalog) loadFKs(ctx context.Context, conn *pgx.Conn) {
 			child, parent := tables[strings.ToLower(cs+"."+ct)], tables[strings.ToLower(ps+"."+pt)]
 			declared[strings.ToLower(cs+"."+ct+"."+cc)] = true
 			add(child, strings.ToLower(cc), parent, strings.ToLower(pc), false)
-			// A table with no tenant column whose foreign key points at a tenant table
-			// belongs to the tenant of the row it points at.
-			if child != nil && parent != nil && child != parent && child.Kind == 'r' && child.Schema != "pg_temp" &&
-				tcol(child) == "" && tcol(parent) != "" && parent.IsUnique(strings.ToLower(pc)) &&
-				!shared[strings.ToLower(child.Name)] && !shared[strings.ToLower(child.Key())] {
-				derived[child.Key()] = append(derived[child.Key()], DerivedRef{Col: strings.ToLower(cc), ParentKey: parent.Key(), ParentCol: strings.ToLower(pc)})
+			if child != nil && parent != nil {
+				fkRows = append(fkRows, fkRow{child, parent, strings.ToLower(cc), strings.ToLower(pc)})
 			}
 		}
 		rows.Close()
@@ -644,6 +645,33 @@ func (c *Catalog) loadFKs(ctx context.Context, conn *pgx.Conn) {
 			out[k] = map[string]FKRef{}
 		}
 		out[k][f.ccol] = FKRef{ParentKey: f.parent.Key(), ParentCol: f.pcol}
+	}
+	// A table with no tenant column whose foreign key points at a tenant table
+	// belongs to the tenant of the row it points at; so does one whose key points at
+	// such a table (a few steps at most).
+	for pass := 0; pass < 4; pass++ {
+		changed := false
+		for _, r := range fkRows {
+			child, parent := r.child, r.parent
+			if child == parent || child.Kind != 'r' || child.Schema == "pg_temp" || tcol(child) != "" || !parent.IsUnique(r.pcol) ||
+				shared[strings.ToLower(child.Name)] || shared[strings.ToLower(child.Key())] {
+				continue
+			}
+			if tcol(parent) == "" && len(derived[parent.Key()]) == 0 {
+				continue
+			}
+			dup := false
+			for _, d := range derived[child.Key()] {
+				dup = dup || d.Col == r.ccol
+			}
+			if !dup {
+				derived[child.Key()] = append(derived[child.Key()], DerivedRef{Col: r.ccol, ParentKey: parent.Key(), ParentCol: r.pcol})
+				changed = true
+			}
+		}
+		if !changed {
+			break
+		}
 	}
 	for child, refs := range derived {
 		if out[child] == nil {

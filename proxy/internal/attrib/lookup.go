@@ -137,8 +137,16 @@ func (l *Lookup) viaTenants(ctx context.Context, s bridgeSpec, val string) ([]st
 }
 
 func (l *Lookup) viaQuery(ctx context.Context, s bridgeSpec, val string) ([]string, error) {
-	q := fmt.Sprintf("SELECT DISTINCT t.%s::text FROM %s b JOIN %s t ON t.%s = b.%s WHERE b.%s = $1 LIMIT 50",
-		s.t.quoted(s.ttenant), s.b.qualified(), s.t.qualified(), s.t.quoted(s.tjoin), s.b.quoted(s.bfk), s.b.quoted(s.bk))
+	// FROM b JOIN m1 ON m1.join = b.bfk JOIN m2 ON m2.join = m1.next ... JOIN t ON t.tjoin = mN.next
+	from := s.b.qualified() + " b"
+	prev, prevCol := "b", s.b.quoted(s.bfk)
+	for i, m := range s.mids {
+		alias := fmt.Sprintf("m%d", i+1)
+		from += fmt.Sprintf(" JOIN %s %s ON %s.%s = %s.%s", m.ti.qualified(), alias, alias, m.ti.quoted(m.join), prev, prevCol)
+		prev, prevCol = alias, m.ti.quoted(m.next)
+	}
+	from += fmt.Sprintf(" JOIN %s t ON t.%s = %s.%s", s.t.qualified(), s.t.quoted(s.tjoin), prev, prevCol)
+	q := fmt.Sprintf("SELECT DISTINCT t.%s::text FROM %s WHERE b.%s = $1 LIMIT 50", s.t.quoted(s.ttenant), from, s.b.quoted(s.bk))
 	rows, err := l.pool.Query(ctx, q, val)
 	if err != nil {
 		return nil, err

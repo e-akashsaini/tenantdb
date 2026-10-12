@@ -545,7 +545,7 @@ func (ev *confEval) identifying(o *occRes, col string) bool {
 	if o.ti == nil {
 		return ev.a.ex.keys[col] && (ev.a.cat == nil || !ev.a.cat.Loaded())
 	}
-	if _, _, _, ok := ev.a.target(o.ti, col); ok {
+	if _, _, _, ok := ev.a.target(o.ti, col); ok || derivedKey(o, col) {
 		return true
 	}
 	return o.ti.HasPolyID(col)
@@ -644,17 +644,22 @@ func (ev *confEval) selfOwners(o *occRes, col string, vals []string) (*tset, boo
 	if ev.a.lk == nil || ev.a.cat == nil {
 		return nil, false
 	}
+	return ev.chainOwners(o.ti, o.derived, col, vals)
+}
+
+// chainOwners is selfOwners for any child table: start's rows with col = each
+// value belong to the tenants their parents (through refs) belong to.
+func (ev *confEval) chainOwners(start *TableInfo, refs []DerivedRef, col string, vals []string) (*tset, bool) {
+	if ev.a.lk == nil || ev.a.cat == nil {
+		return nil, false
+	}
 	var res *tset
-	for _, d := range o.derived {
-		parent, found := ev.a.cat.TableByKey(d.ParentKey)
-		if !found {
+	for _, d := range refs {
+		spec, ok := ev.a.chainSpec(start, d, col)
+		if !ok {
 			return nil, false
 		}
-		ptc, _ := ev.a.scopeOf(parent)
-		if ptc == "" {
-			return nil, false
-		}
-		spec := bridgeSpec{b: o.ti, t: parent, bk: col, bfk: d.Col, tjoin: d.ParentCol, ttenant: ptc}
+		parent, ptc := spec.t, spec.ttenant
 		set, all := setOf(), true
 		for _, v := range vals {
 			k := ownerKey{spec.table(), col, bridgeVal(normVal(v))}
@@ -707,6 +712,15 @@ func (ev *confEval) ownersOf(o *occRes, col string, vals []string) (*tset, bool)
 	}
 	tgt, tcol, pcol, ok := a.target(o.ti, col)
 	if !ok {
+		// A child whose foreign key points at another child table: the parent rows'
+		// tenants come from the parent's own parents.
+		for _, d := range o.derived {
+			if d.Col == col {
+				if parent, found := a.cat.TableByKey(d.ParentKey); found && len(a.derivedOf(parent)) > 0 {
+					return ev.chainOwners(parent, a.derivedOf(parent), d.ParentCol, vals)
+				}
+			}
+		}
 		return nil, false
 	}
 	return ev.ownersIn(tgt, tcol, pcol, vals)
@@ -836,10 +850,25 @@ type bridgeSpec struct {
 	b, t           *TableInfo
 	bk, bfk, tjoin string
 	ttenant        string
+	// mids are the tables between b and t when the row reaches its tenant in more
+	// than one step (a line-item tax -> a line item -> an order): b.bfk joins the
+	// first one, each one joins the next, and the last joins t.tjoin.
+	mids []midHop
+}
+
+// midHop is a table on the way: it is joined on join, and next is its column
+// that points at the following table.
+type midHop struct {
+	ti         *TableInfo
+	join, next string
 }
 
 func (s bridgeSpec) table() string {
-	return "via:" + s.b.Key() + "." + s.bfk + ">" + s.t.Key() + "." + s.tjoin
+	k := "via:" + s.b.Key() + "." + s.bfk
+	for _, m := range s.mids {
+		k += ">" + m.ti.Key() + "." + m.join + "." + m.next
+	}
+	return k + ">" + s.t.Key() + "." + s.tjoin
 }
 
 // bridgeVal keeps the credential itself out of the cache and the owner sets.

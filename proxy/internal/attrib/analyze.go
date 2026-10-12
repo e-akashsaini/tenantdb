@@ -38,6 +38,33 @@ func (a *Attributor) derivedOf(ti *TableInfo) []DerivedRef {
 	return a.cat.Derived(ti)
 }
 
+// chainSpec builds the question "which tenants do the rows of ti with col = ?
+// belong to", following the foreign key ref and, if the parent is itself a child
+// table, the keys beyond it, up to a table that has a tenant column.
+func (a *Attributor) chainSpec(ti *TableInfo, ref DerivedRef, col string) (bridgeSpec, bool) {
+	if a.cat == nil {
+		return bridgeSpec{}, false
+	}
+	spec := bridgeSpec{b: ti, bk: col, bfk: ref.Col}
+	for depth := 0; depth < 4; depth++ {
+		parent, found := a.cat.TableByKey(ref.ParentKey)
+		if !found {
+			return bridgeSpec{}, false
+		}
+		if tc, _ := a.scopeOf(parent); tc != "" {
+			spec.t, spec.tjoin, spec.ttenant = parent, ref.ParentCol, tc
+			return spec, true
+		}
+		next := a.derivedOf(parent)
+		if len(next) == 0 {
+			return bridgeSpec{}, false
+		}
+		spec.mids = append(spec.mids, midHop{ti: parent, join: ref.ParentCol, next: next[0].Col})
+		ref = next[0]
+	}
+	return bridgeSpec{}, false
+}
+
 func (a *Attributor) hasTenantCol(ti *TableInfo) bool {
 	if ti == nil {
 		return false

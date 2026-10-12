@@ -204,10 +204,49 @@ func (g *dgen) remarksQuery() dquery {
 	}
 }
 
+// repliesQuery reads replies, which belong to remarks, which belong to orders:
+// two steps from the tenant.
+func (g *dgen) repliesQuery() dquery {
+	r, k, o := g.newAlias(), g.newAlias(), g.newAlias()
+	atom := func() string {
+		switch g.r.Intn(9) {
+		case 0, 1:
+			return fmt.Sprintf("%s.remark_id = %s", r, g.num(320))
+		case 2:
+			return fmt.Sprintf("%s.remark_id IN (%s, %s)", r, g.num(320), g.num(320))
+		case 3:
+			return fmt.Sprintf("%s.id = %s", r, g.num(640))
+		case 4:
+			return fmt.Sprintf("%s.body = 'r%d'", r, g.r.Intn(4))
+		case 5:
+			return fmt.Sprintf("%s.remark_id %s %s", r, g.pick(">", "<", "<>"), g.num(320))
+		case 6, 7:
+			sa := g.newAlias()
+			return fmt.Sprintf("%s.remark_id IN (SELECT %s.id FROM tdbdiff.remarks %s WHERE %s)", r, sa, sa,
+				g.pick(fmt.Sprintf("%s.order_id = %s", sa, g.num(160)), fmt.Sprintf("%s.id = %s", sa, g.num(320)), fmt.Sprintf("%s.body = 'b%d'", sa, g.r.Intn(5))))
+		}
+		sa, sb := g.newAlias(), g.newAlias()
+		return fmt.Sprintf("%s.remark_id IN (SELECT %s.id FROM tdbdiff.remarks %s WHERE %s.order_id IN (SELECT %s.id FROM tdbdiff.orders %s WHERE %s))",
+			r, sa, sa, sa, sb, sb, g.pred(sb, dTables["orders"], 1))
+	}
+	where := atom()
+	for i := g.r.Intn(3); i > 0; i-- {
+		where = fmt.Sprintf("(%s %s %s)", where, g.pick("AND", "AND", "OR"), atom())
+	}
+	return dquery{
+		sql: fmt.Sprintf("SELECT %s.* FROM tdbdiff.replies %s WHERE %s", r, r, where),
+		truth: []string{fmt.Sprintf("SELECT DISTINCT %s.tenant_id FROM tdbdiff.replies %s JOIN tdbdiff.remarks %s ON %s.id = %s.remark_id JOIN tdbdiff.orders %s ON %s.id = %s.order_id WHERE %s",
+			o, r, k, k, r, o, o, k, where)},
+		tenant: true,
+	}
+}
+
 // extraQuery generates one of the statement shapes above.
 func (g *dgen) extraQuery() dquery {
 	tid := func() string { return g.tid() }
-	switch g.r.Intn(26) {
+	switch g.r.Intn(29) {
+	case 26, 27, 28:
+		return g.repliesQuery()
 	case 23, 24, 25:
 		return g.remarksQuery()
 	case 21, 22: // EXISTS over a correlated table, through a relationship the schema does not declare

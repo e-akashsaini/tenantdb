@@ -66,6 +66,7 @@ CREATE TABLE tdbdiff.shipments (id bigint PRIMARY KEY, tenant_id text, ord bigin
 CREATE TABLE tdbdiff.folders (id bigint PRIMARY KEY, tenant_id text, up bigint, label text);
 -- a child table: no tenant column, each remark belongs to the tenant of its order
 CREATE TABLE tdbdiff.remarks (id bigint PRIMARY KEY, order_id bigint REFERENCES tdbdiff.orders(id), body text);
+CREATE TABLE tdbdiff.replies (id bigint PRIMARY KEY, remark_id bigint REFERENCES tdbdiff.remarks(id), body text);
 INSERT INTO tdbdiff.folders SELECT id, 't'||((id-1)/15), CASE WHEN id%15 = 1 THEN NULL ELSE id-1 END, 'f'||(id%5) FROM generate_series(1,60) id;
 INSERT INTO tdbdiff.shipments SELECT id, 't'||((id-1)/50), ((id-1)/50)*40 + (id%40) + 1, (ARRAY['dhl','ups'])[id%2+1] FROM generate_series(1,200) id;
 INSERT INTO tdbdiff.customers SELECT t*12+i, 't'||t, 'n'||i, 's'||(t*12+i), CASE WHEN i%2=0 THEN 'eu' ELSE 'us' END
@@ -75,6 +76,7 @@ INSERT INTO tdbdiff.orders SELECT id, 't'||((id-1)/40), ((id-1)/40)*12 + (id%12)
 INSERT INTO tdbdiff.items SELECT id, 't'||((id-1)/100), ((id-1)/100)*40 + (id%40) + 1,
   (ARRAY['a','b','c'])[id%3+1], id%7 FROM generate_series(1,400) id;
 INSERT INTO tdbdiff.remarks SELECT g, (g - 1) % 160 + 1, 'b' || (g % 5) FROM generate_series(1, 320) g;
+INSERT INTO tdbdiff.replies SELECT g, (g - 1) % 320 + 1, 'r' || (g % 4) FROM generate_series(1, 640) g;
 INSERT INTO tdbdiff.countries VALUES ('IE','Ireland'),('FR','France'),('DE','Germany');
 `
 
