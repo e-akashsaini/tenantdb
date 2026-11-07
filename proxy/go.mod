@@ -3,7 +3,7 @@ module github.com/e-akashsaini/tenantdb
 go 1.27.2
 
 require (
-	github.com/jackc/pgx/v5 v5.11.0
+	github.com/jackc/pgx/v5 v5.12.0
 	github.com/pganalyze/pg_query_go/v6 v6.2.5
 	google.golang.org/protobuf v1.36.12
 )
